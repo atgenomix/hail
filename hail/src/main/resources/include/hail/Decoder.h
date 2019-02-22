@@ -1,6 +1,6 @@
 #ifndef HAIL_DECODER_H
 #define HAIL_DECODER_H 1
-#include "lz4.h"
+#include <lz4.h>
 #include "hail/Upcalls.h"
 #include "hail/Utils.h"
 #include "hail/NativeObj.h"
