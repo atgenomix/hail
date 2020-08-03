@@ -4,6 +4,7 @@ import sun.misc.Unsafe;
 
 import java.lang.reflect.Field;
 
+@SuppressWarnings("sunapi")
 public final class Memory {
     private static final Unsafe unsafe;
 
@@ -57,17 +58,23 @@ public final class Memory {
     }
 
     public static void memcpy(byte[] dst, long dstOff, byte[] src, long srcOff, long n) {
-        unsafe.copyMemory(src, Unsafe.ARRAY_BYTE_BASE_OFFSET + srcOff, dst, Unsafe.ARRAY_BYTE_BASE_OFFSET + dstOff, n);
+        if (n > 0) {
+            unsafe.copyMemory(src, Unsafe.ARRAY_BYTE_BASE_OFFSET + srcOff, dst, Unsafe.ARRAY_BYTE_BASE_OFFSET + dstOff, n);
+        }
     }
 
     // srcOff is in doubles, n is in doubles
     public static void memcpy(byte[] dst, long dstOff, double[] src, long srcOff, long n) {
-        unsafe.copyMemory(src, Unsafe.ARRAY_DOUBLE_BASE_OFFSET + srcOff * 8, dst, Unsafe.ARRAY_BYTE_BASE_OFFSET + dstOff, n * 8);
+        if (n > 0) {
+            unsafe.copyMemory(src, Unsafe.ARRAY_DOUBLE_BASE_OFFSET + srcOff * 8, dst, Unsafe.ARRAY_BYTE_BASE_OFFSET + dstOff, n * 8);
+        }
     }
 
     // dstOff is in doubles, n is in doubles
     public static void memcpy(double[] dst, long dstOff, byte[] src, long srcOff, long n) {
-        unsafe.copyMemory(src, Unsafe.ARRAY_BYTE_BASE_OFFSET + srcOff, dst, Unsafe.ARRAY_DOUBLE_BASE_OFFSET + dstOff * 8, n * 8);
+        if (n > 0) {
+            unsafe.copyMemory(src, Unsafe.ARRAY_BYTE_BASE_OFFSET + srcOff, dst, Unsafe.ARRAY_DOUBLE_BASE_OFFSET + dstOff * 8, n * 8);
+        }
     }
     
     public static void memcpy(long dst, byte[] src, long srcOff, long n) {
@@ -76,6 +83,10 @@ public final class Memory {
 
     public static void memcpy(byte[] dst, long dstOff, long src, long n) {
         copyToArray(dst, dstOff, src, n);
+    }
+
+    public static void memset(long offset, long size, byte b) {
+        unsafe.setMemory(offset, size, b);
     }
 
     public static boolean loadBoolean(long addr) {
@@ -156,15 +167,21 @@ public final class Memory {
 
 
     public static void memcpy(long dst, long src, long n) {
-        unsafe.copyMemory(src, dst, n);
+        if (n > 0) {
+            unsafe.copyMemory(src, dst, n);
+        }
     }
 
     public static void copyToArray(byte[] dst, long dstOff, long src, long n) {
-        unsafe.copyMemory(null, src, dst, Unsafe.ARRAY_BYTE_BASE_OFFSET + dstOff, n);
+        if (n > 0) {
+            unsafe.copyMemory(null, src, dst, Unsafe.ARRAY_BYTE_BASE_OFFSET + dstOff, n);
+        }
     }
 
     public static void copyFromArray(long dst, byte[] src, long srcOff, long n) {
-        unsafe.copyMemory(src, Unsafe.ARRAY_BYTE_BASE_OFFSET + srcOff, null, dst, n);
+        if (n > 0) {
+            unsafe.copyMemory(src, Unsafe.ARRAY_BYTE_BASE_OFFSET + srcOff, null, dst, n);
+        }
     }
 
     static {

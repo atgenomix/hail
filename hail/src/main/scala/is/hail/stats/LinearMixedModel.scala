@@ -3,15 +3,14 @@ package is.hail.stats
 import breeze.linalg.{DenseMatrix => BDM, DenseVector => BDV}
 import is.hail.HailContext
 import is.hail.annotations.{BroadcastRow, Region, RegionValue, RegionValueBuilder}
-import is.hail.expr.ir.{TableLiteral, TableValue}
-import is.hail.expr.types.virtual.{TFloat64, TInt64, TStruct}
-import is.hail.expr.types.TableType
+import is.hail.expr.ir.{ExecuteContext, TableIR, TableLiteral, TableValue}
+import is.hail.types.TableType
+import is.hail.types.physical.{PCanonicalStruct, PFloat64, PInt64, PStruct}
+import is.hail.types.virtual.{TFloat64, TInt64, TStruct}
 import is.hail.linalg.RowMatrix
-import is.hail.rvd.{RVD, RVDContext, RVDPartitioner, RVDType}
+import is.hail.rvd.{RVD, RVDContext, RVDType}
 import is.hail.sparkextras.ContextRDD
-import is.hail.table.Table
 import is.hail.utils._
-import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.Row
 import org.apache.spark.storage.StorageLevel
 
@@ -19,47 +18,47 @@ case class LMMData(gamma: Double, residualSq: Double, py: BDV[Double], px: BDM[D
   ydy: Double, xdy: BDV[Double], xdx: BDM[Double], yOpt: Option[BDV[Double]], xOpt: Option[BDM[Double]])
 
 object LinearMixedModel {
-  def apply(hc: HailContext, gamma: Double, residualSq: Double, py: Array[Double], px: BDM[Double], d: Array[Double],
+  def pyApply(gamma: Double, residualSq: Double, py: Array[Double], px: BDM[Double], d: Array[Double],
     ydy: Double, xdy: Array[Double], xdx: BDM[Double],
-    yOpt: Option[Array[Double]], xOpt: Option[BDM[Double]]): LinearMixedModel = {
+    // yOpt, xOpt can be null
+    yOpt: Array[Double], xOpt: BDM[Double]): LinearMixedModel = {
 
-    new LinearMixedModel(hc,
-      LMMData(gamma, residualSq, BDV(py), px, BDV(d), ydy, BDV(xdy), xdx, yOpt.map(BDV(_)), xOpt))
+    new LinearMixedModel(
+      LMMData(gamma, residualSq, BDV(py), px, BDV(d), ydy, BDV(xdy), xdx, Option(yOpt).map(BDV(_)), Option(xOpt)))
   }
   
-  private val rowType = TStruct(
-      "idx" -> TInt64(),
-      "beta" -> TFloat64(),
-      "sigma_sq" -> TFloat64(),
-      "chi_sq" -> TFloat64(),
-      "p_value" -> TFloat64())
+  private val rowType = PCanonicalStruct(true,
+      "idx" -> PInt64(),
+      "beta" -> PFloat64(),
+      "sigma_sq" -> PFloat64(),
+      "chi_sq" -> PFloat64(),
+      "p_value" -> PFloat64())
 
-  private val tableType = TableType(rowType, FastIndexedSeq("idx"), TStruct())
+  private val tableType = TableType(rowType.virtualType, FastIndexedSeq("idx"), TStruct.empty)
 
-  def toTable(hc: HailContext, rvd: RVD): Table = {
-    new Table(hc, TableLiteral(TableValue(tableType, BroadcastRow(Row(), tableType.globalType, hc.sc), rvd)))
+  def toTableIR(ctx: ExecuteContext, rvd: RVD): TableIR = {
+    TableLiteral(TableValue(ctx, tableType, BroadcastRow.empty(ctx), rvd))
   }
 }
 
-class LinearMixedModel(hc: HailContext, lmmData: LMMData) {
-  def fit(pa_t: RowMatrix, a_t: Option[RowMatrix]): Table =
+class LinearMixedModel(lmmData: LMMData) {
+  def fit(ctx: ExecuteContext, pa_t: RowMatrix, a_t: Option[RowMatrix]): TableIR =
     if (a_t.isDefined) {
       assert(lmmData.yOpt.isDefined && lmmData.xOpt.isDefined)
-      fitLowRank(pa_t, a_t.get)
+      fitLowRank(ctx, pa_t, a_t.get)
     } else {
       assert(lmmData.yOpt.isEmpty && lmmData.xOpt.isEmpty)
-      fitFullRank(pa_t)
+      fitFullRank(ctx, pa_t)
     }
- 
-  def fitLowRank(pa_t: RowMatrix, a_t: RowMatrix): Table = {
+
+  def fitLowRank(ctx: ExecuteContext, pa_t: RowMatrix, a_t: RowMatrix): TableIR = {
     if (pa_t.nRows != a_t.nRows)
       fatal(s"pa_t and a_t must have the same number of rows, but found ${pa_t.nRows} and ${a_t.nRows}")
     else if (!(pa_t.partitionCounts() sameElements a_t.partitionCounts()))
       fatal(s"pa_t and a_t both have ${pa_t.nRows} rows, but row partitions are not aligned")
-        
-    val sc = hc.sc
-    val lmmDataBc = sc.broadcast(lmmData)
-    val rowType = LinearMixedModel.rowType.physicalType
+
+    val lmmDataBc = ctx.backend.broadcast(lmmData)
+    val rowType = LinearMixedModel.rowType
 
     val rdd = pa_t.rows.zipPartitions(a_t.rows) { case (itPAt, itAt) =>
       val LMMData(gamma, nullResidualSq, py, px, d, ydy, xdy0, xdx0, Some(y), Some(x)) = lmmDataBc.value
@@ -120,15 +119,14 @@ class LinearMixedModel(hc: HailContext, lmmData: LMMData) {
     val rvd = RVD(
       RVDType(rowType, LinearMixedModel.tableType.key),
       pa_t.partitioner(),
-      ContextRDD.weaken[RVDContext](rdd)).persist(StorageLevel.MEMORY_AND_DISK)
+      ContextRDD.weaken(rdd).toCRDDPtr).persist(ctx, StorageLevel.MEMORY_AND_DISK)
 
-    LinearMixedModel.toTable(hc, rvd)
+    LinearMixedModel.toTableIR(ctx, rvd)
   }
   
-  def fitFullRank(pa_t: RowMatrix): Table = {
-    val sc = hc.sc
-    val lmmDataBc = sc.broadcast(lmmData)
-    val rowType = LinearMixedModel.rowType.physicalType
+  def fitFullRank(ctx: ExecuteContext, pa_t: RowMatrix): TableIR = {
+    val lmmDataBc = ctx.backend.broadcast(lmmData)
+    val rowType = LinearMixedModel.rowType
     
     val rdd = pa_t.rows.mapPartitions { itPAt =>
       val LMMData(_, nullResidualSq, py, px, d, ydy, xdy0, xdx0, _, _) = lmmDataBc.value
@@ -187,8 +185,8 @@ class LinearMixedModel(hc: HailContext, lmmData: LMMData) {
     val rvd = RVD(
       RVDType(rowType, LinearMixedModel.tableType.key),
       pa_t.partitioner(),
-      ContextRDD.weaken[RVDContext](rdd)).persist(StorageLevel.MEMORY_AND_DISK)
+      ContextRDD.weaken(rdd).toCRDDPtr).persist(ctx, StorageLevel.MEMORY_AND_DISK)
 
-    LinearMixedModel.toTable(hc, rvd)
+    LinearMixedModel.toTableIR(ctx, rvd)
   }
 }

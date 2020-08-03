@@ -1,6 +1,6 @@
------
-Types
------
+--------------
+Types Overview
+--------------
 
 In Python, ``5`` is of type :obj:`int` while ``"hello"`` is of type :obj:`str`.
 Python is a dynamically-typed language, meaning that a function like:
@@ -26,6 +26,7 @@ Hail's primitive data types for boolean, numeric and string objects are:
 Hail's container types are:
 
  - :class:`.tarray` - Ordered collection of homogenous objects.
+ - :class:`.tndarray` - Ordered n-dimensional arrays of homogenous objects.
  - :class:`.tset` - Unordered collection of distinct homogenous objects.
  - :class:`.tdict` - Key-value map. Keys and values are both homogenous.
  - :class:`.ttuple` - Tuple of heterogeneous values.

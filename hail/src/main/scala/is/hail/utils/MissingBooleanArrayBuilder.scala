@@ -1,8 +1,7 @@
 package is.hail.utils
 
-import is.hail.expr.types._
 import is.hail.annotations._
-import is.hail.expr.types.virtual.{TArray, TBoolean}
+import is.hail.types.virtual.{TArray, TBoolean}
 
 import scala.collection.mutable
 
@@ -35,7 +34,7 @@ class MissingBooleanArrayBuilder extends Serializable {
     }
   }
 
-  val typ = TArray(TBoolean())
+  val typ = TArray(TBoolean)
 
   def write(rvb: RegionValueBuilder) {
     rvb.startArray(len)

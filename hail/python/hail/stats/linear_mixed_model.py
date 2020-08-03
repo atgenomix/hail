@@ -5,8 +5,8 @@ import hail as hl
 from hail.linalg import BlockMatrix
 from hail.linalg.utils import _check_dims
 from hail.table import Table
-from hail.typecheck import *
-from hail.utils.java import Env, jnone, jsome, info
+from hail.typecheck import typecheck_method, nullable, tupleof, oneof, numeric
+from hail.utils.java import Env, info
 from hail.utils.misc import plural
 
 
@@ -498,7 +498,7 @@ class LinearMixedModel(object):
             else:
                 return neg_log_reml
         except LinAlgError as e:
-            raise Exception(f'linear algebra error while solving for REML estimate') from e
+            raise Exception('linear algebra error while solving for REML estimate') from e
 
     @typecheck_method(log_gamma=nullable(numeric), bounds=tupleof(numeric), tol=float, maxiter=int)
     def fit(self, log_gamma=None, bounds=(-8.0, 8.0), tol=1e-8, maxiter=500):
@@ -585,8 +585,8 @@ class LinearMixedModel(object):
 
         # Asymptotically near MLE, nLL = a * h2^2 + b * h2 + c with a = 1 / (2 * se^2)
         # By Lagrange interpolation:
-        a = ((h2[2] * (nll[1] - nll[0]) + h2[1] * (nll[0] - nll[2]) + h2[0] * (nll[2] - nll[1])) /
-             ((h2[1] - h2[0]) * (h2[0] - h2[2]) * (h2[2] - h2[1])))
+        a = ((h2[2] * (nll[1] - nll[0]) + h2[1] * (nll[0] - nll[2]) + h2[0] * (nll[2] - nll[1]))
+             / ((h2[1] - h2[0]) * (h2[0] - h2[2]) * (h2[2] - h2[1])))
 
         return 1 / np.sqrt(2 * a)
 
@@ -727,21 +727,24 @@ class LinearMixedModel(object):
         if self._scala_model is None:
             self._set_scala_model()
 
+        backend = Env.spark_backend('LinearMixedModel.fit_alternatives')
+        jfs = backend.fs._jfs
+
         if partition_size is None:
-            block_size = Env.hail().linalg.BlockMatrix.readMetadata(Env.hc()._jhc, pa_t_path).blockSize()
+            block_size = Env.hail().linalg.BlockMatrix.readMetadata(jfs, pa_t_path).blockSize()
             partition_size = block_size
         elif partition_size <= 0:
             raise ValueError(f'partition_size must be positive, found {partition_size}')
 
-        jpa_t = Env.hail().linalg.RowMatrix.readBlockMatrix(Env.hc()._jhc, pa_t_path, jsome(partition_size))
+        jpa_t = Env.hail().linalg.RowMatrix.readBlockMatrix(jfs, pa_t_path, partition_size)
 
         if a_t_path is None:
-            maybe_ja_t = jnone()
+            maybe_ja_t = None
         else:
-            maybe_ja_t = jsome(
-                Env.hail().linalg.RowMatrix.readBlockMatrix(Env.hc()._jhc, a_t_path, jsome(partition_size)))
+            maybe_ja_t = Env.hail().linalg.RowMatrix.readBlockMatrix(jfs, a_t_path, partition_size)
 
-        return Table._from_java(self._scala_model.fit(jpa_t, maybe_ja_t))
+        return Table._from_java(backend._jbackend.pyFitLinearMixedModel(
+            self._scala_model, jpa_t, maybe_ja_t))
 
     @typecheck_method(pa=np.ndarray, a=nullable(np.ndarray), return_pandas=bool)
     def fit_alternatives_numpy(self, pa, a=None, return_pandas=False):
@@ -830,8 +833,7 @@ class LinearMixedModel(object):
         if not self._fitted:
             raise Exception("null model is not fit. Run 'fit' first.")
 
-        self._scala_model = Env.hail().stats.LinearMixedModel.apply(
-            Env.hc()._jhc,
+        self._scala_model = Env.hail().stats.LinearMixedModel.pyApply(
             self.gamma,
             self._residual_sq,
             _jarray_from_ndarray(self.py),
@@ -840,8 +842,8 @@ class LinearMixedModel(object):
             self._ydy_alt,
             _jarray_from_ndarray(self._xdy_alt),
             _breeze_from_ndarray(self._xdx_alt),
-            jsome(_jarray_from_ndarray(self.y)) if self.low_rank else jnone(),
-            jsome(_breeze_from_ndarray(self.x)) if self.low_rank else jnone()
+            _jarray_from_ndarray(self.y) if self.low_rank else None,
+            _breeze_from_ndarray(self.x) if self.low_rank else None
         )
 
     def _check_dof(self, f=None):
@@ -875,10 +877,10 @@ class LinearMixedModel(object):
         ...               [ 0.94512946, -0.97320323,  0.98294169,  1.        ]])
         >>> model, p = LinearMixedModel.from_kinship(y, x, k)
         >>> model.fit()
-        >>> model.h_sq  # doctest: +NOTEST
+        >>> model.h_sq  # doctest: +SKIP_OUTPUT_CHECK
         0.2525148830695317
 
-        >>> model.s  # doctest: +NOTEST
+        >>> model.s  # doctest: +SKIP_OUTPUT_CHECK
         array([3.83501295, 0.13540343, 0.02454114, 0.00504248])
 
         Truncate to a rank :math:`r=2` model:
@@ -888,7 +890,7 @@ class LinearMixedModel(object):
         >>> p_r = p[:r, :]
         >>> model_r = LinearMixedModel(p_r @ y, p_r @ x, s_r, y, x)
         >>> model.fit()
-        >>> model.h_sq  # doctest: +NOTEST
+        >>> model.h_sq  # doctest: +SKIP_OUTPUT_CHECK
         0.25193197591429695
 
         Notes
@@ -899,8 +901,7 @@ class LinearMixedModel(object):
         The performance of eigendecomposition depends critically on the
         number of master cores and the NumPy / SciPy configuration, viewable
         with ``np.show_config()``. For Intel machines, we recommend installing
-        the `MKL <https://anaconda.org/anaconda/mkl>`__ package for Anaconda, as
-        is done by `cloudtools <https://github.com/Nealelab/cloudtools>`__.
+        the `MKL <https://anaconda.org/anaconda/mkl>`__ package for Anaconda.
 
         `k` must be positive semi-definite; symmetry is not checked as only the
         lower triangle is used.
@@ -983,7 +984,7 @@ class LinearMixedModel(object):
         ...               [2.0, 4.0, 8.0]])
         >>> model, p = LinearMixedModel.from_random_effects(y, x, z)
         >>> model.fit()
-        >>> model.h_sq  # doctest: +NOTEST
+        >>> model.h_sq  # doctest: +SKIP_OUTPUT_CHECK
         0.38205307244271675
 
         Notes
@@ -1091,7 +1092,7 @@ class LinearMixedModel(object):
 
         if low_rank:
             assert np.all(np.isfinite(s))
-            r = np.searchsorted(-s, -max_condition_number * s[0])
+            r = int(np.searchsorted(-s, -max_condition_number * s[0]))
             if r < m:
                 info(f'from_random_effects: model rank reduced from {m} to {r} '
                      f'due to ill-condition.'
@@ -1121,8 +1122,8 @@ class LinearMixedModel(object):
     def _same(self, other, tol=1e-6, up_to_sign=True):
         def same_rows_up_to_sign(a, b, atol):
             assert a.shape[0] == b.shape[0]
-            return all(np.allclose(a[i], b[i], atol=atol) or
-                       np.allclose(-a[i], b[i], atol=atol)
+            return all(np.allclose(a[i], b[i], atol=atol)
+                       or np.allclose(-a[i], b[i], atol=atol)
                        for i in range(a.shape[0]))
 
         close = same_rows_up_to_sign if up_to_sign else np.allclose
@@ -1151,4 +1152,3 @@ class LinearMixedModel(object):
             print(f'different p_path:\n{self.p_path}\n{other.p_path}')
             same = False
         return same
-

@@ -1,13 +1,16 @@
 package is.hail.io.compress
 
-import is.hail.SparkSuite
+import is.hail.HailSuite
 import is.hail.check.Gen
 import is.hail.check.Prop.forAll
 import is.hail.utils._
 import htsjdk.samtools.util.BlockCompressedFilePointerUtil
+import is.hail.expr.ir.GenericLines
 import org.apache.commons.io.IOUtils
+import org.apache.spark.sql.Row
 import org.apache.{hadoop => hd}
 import org.testng.annotations.Test
+import is.hail.TestUtils._
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -18,7 +21,6 @@ class TestFileInputFormat extends hd.mapreduce.lib.input.TextInputFormat {
     val hConf = job.getConfiguration
 
     val splitPoints = hConf.get("bgz.test.splits").split(",").map(_.toLong)
-    println(splitPoints.toSeq)
 
     val splits = new mutable.ArrayBuffer[hd.mapreduce.InputSplit]
     val files = listStatus(job).asScala
@@ -27,8 +29,8 @@ class TestFileInputFormat extends hd.mapreduce.lib.input.TextInputFormat {
     val file = files.head
     val path = file.getPath
     val length = file.getLen
-    val fs = path.getFileSystem(hConf)
-    val blkLocations = fs.getFileBlockLocations(file, 0, length)
+    val fileSystem = path.getFileSystem(hConf)
+    val blkLocations = fileSystem.getFileBlockLocations(file, 0, length)
 
     Array.tabulate(splitPoints.length - 1) { i =>
       val s = splitPoints(i)
@@ -43,32 +45,115 @@ class TestFileInputFormat extends hd.mapreduce.lib.input.TextInputFormat {
   }
 }
 
-class BGzipCodecSuite extends SparkSuite {
+class BGzipCodecSuite extends HailSuite {
+  val uncompPath = "src/test/resources/sample.vcf"
+
+  // is actually a bgz file
+  val gzPath = "src/test/resources/sample.vcf.gz"
+
+  /*
+   * bgz.test.sample.vcf.bgz was created as follows:
+   *  - split sample.vcf into 60-line chunks: `split -l 60 sample.vcf sample.vcf.`
+   *  - move the line boundary on two chunks by 1 character in different directions
+   *  - bgzip compressed the chunks
+   *  - stripped the empty terminate block in chunks except ad and ag (the last)
+   *  - concatenated the chunks
+   */
+  val compPath = "src/test/resources/bgz.test.sample.vcf.bgz"
+
+  def compareLines(lines2: IndexedSeq[String], lines: IndexedSeq[String]): Unit = {
+    val n2 = lines2.length
+    val n = lines.length
+    assert(n2 == n)
+    var i = 0
+    while (i < lines.length) {
+      assert(lines(i) == lines2(i))
+      i += 1
+    }
+  }
+
+  @Test def testGenericLinesSimpleUncompressed() {
+    val lines = Source.fromFile(uncompPath).getLines().toFastIndexedSeq
+
+    val uncompStatus = fs.fileStatus(uncompPath)
+    var i = 0
+    while (i < 16) {
+      val lines2 = GenericLines.collect(
+        GenericLines.read(fs, Array(uncompStatus), Some(i), None, None, false, false))
+      compareLines(lines2, lines)
+      i += 1
+    }
+  }
+
+  @Test def testGenericLinesSimpleBGZ() {
+    val lines = Source.fromFile(uncompPath).getLines().toFastIndexedSeq
+
+    val compStatus = fs.fileStatus(compPath)
+    var i = 0
+    while (i < 16) {
+      val lines2 = GenericLines.collect(
+        GenericLines.read(fs, Array(compStatus), Some(i), None, None, false, false))
+      compareLines(lines2, lines)
+      i += 1
+    }
+  }
+
+  @Test def testGenericLinesSimpleGZ() {
+    val lines = Source.fromFile(uncompPath).getLines().toFastIndexedSeq
+
+    // won't split, just run once
+    val gzStatus = fs.fileStatus(gzPath)
+    val lines2 = GenericLines.collect(
+      GenericLines.read(fs, Array(gzStatus), Some(7), None, None, false, true))
+    compareLines(lines2, lines)
+  }
+
+  @Test def testGenericLinesRefuseGZ() {
+    interceptFatal("Cowardly refusing") {
+      val gzStatus = fs.fileStatus(gzPath)
+      GenericLines.read(fs, Array(gzStatus), Some(7), None, None, false, false)
+    }
+  }
+
+  @Test def testGenericLinesRandom() {
+    val lines = Source.fromFile(uncompPath).getLines().toFastIndexedSeq
+
+    val compLength = 195353
+    val compSplits = Array[Long](6566, 20290, 33438, 41165, 56691, 70278, 77419, 92522, 106310, 112477, 112505, 124593,
+      136405, 144293, 157375, 169172, 175174, 186973, 195325)
+
+    val g = for (n <- Gen.oneOfGen(
+      Gen.choose(0, 10),
+      Gen.choose(0, 100));
+      rawSplits <- Gen.buildableOfN[Array](n,
+        Gen.oneOfGen(Gen.choose(0L, compLength),
+          Gen.applyGen(Gen.oneOf[(Long) => Long](identity, _ - 1, _ + 1),
+            Gen.oneOfSeq(compSplits)))))
+      yield
+        (Array(0L, compLength) ++ rawSplits).distinct.sorted
+
+    val p = forAll(g) { splits =>
+
+      val contexts = (0 until (splits.length - 1))
+        .map { i =>
+          val end = makeVirtualOffset(splits(i + 1), 0)
+          Row(i, compPath, splits(i), end, true)
+        }
+      val lines2 = GenericLines.collect(GenericLines.read(fs, contexts, false))
+      compareLines(lines2, lines)
+      true
+    }
+    p.check()
+  }
+
   @Test def test() {
     sc.hadoopConfiguration.setLong("mapreduce.input.fileinputformat.split.minsize", 1L)
 
-    val uncompPath = "src/test/resources/sample.vcf"
-
-    /*
-     * bgz.test.sample.vcf.bgz was created as follows:
-     *  - split sample.vcf into 60-line chunks: `split -l 60 sample.vcf sample.vcf.`
-     *  - move the line boundary on two chunks by 1 character in different directions
-     *  - bgzip compressed the chunks
-     *  - stripped the empty terminate block in chunks except ad and ag (the last)
-     *  - concatenated the chunks
-     */
-    val compPath = "src/test/resources/bgz.test.sample.vcf.bgz"
-
-    val uncompHPath = new hd.fs.Path(uncompPath)
-    val compHPath = new hd.fs.Path(compPath)
-
-    val fs = uncompHPath.getFileSystem(hadoopConf)
-
-    val uncompIS = fs.open(uncompHPath)
+    val uncompIS = fs.open(uncompPath)
     val uncomp = IOUtils.toByteArray(uncompIS)
     uncompIS.close()
 
-    val decompIS = new BGzipInputStream(fs.open(compHPath))
+    val decompIS = new BGzipInputStream(fs.openNoCompression(compPath))
     val decomp = IOUtils.toByteArray(decompIS)
     decompIS.close()
 
@@ -101,7 +186,7 @@ class BGzipCodecSuite extends SparkSuite {
 
     val p = forAll(g) { splits =>
 
-      val jobConf = new hd.conf.Configuration(hadoopConf)
+      val jobConf = new hd.conf.Configuration(sc.hadoopConfiguration)
       jobConf.set("bgz.test.splits", splits.mkString(","))
       val rdd = sc.newAPIHadoopFile[hd.io.LongWritable, hd.io.Text, TestFileInputFormat](
         compPath,
@@ -129,13 +214,9 @@ class BGzipCodecSuite extends SparkSuite {
     val uncompPath = "src/test/resources/sample.vcf"
     val compPath = "src/test/resources/sample.vcf.gz"
 
-    val uncompHPath = new hd.fs.Path(uncompPath)
-    val compHPath = new hd.fs.Path(compPath)
+    using(fs.openNoCompression(uncompPath)) { uncompIS =>
+      using(new BGzipInputStream(fs.openNoCompression(compPath))) { decompIS =>
 
-    val fs = uncompHPath.getFileSystem(hadoopConf)
-    val compIS = fs.open(compHPath)
-
-    using (fs.open(uncompHPath)) { uncompIS => using (new BGzipInputStream(compIS)) { decompIS =>
       val fromEnd = 48 // arbitrary number of bytes from the end of block to attempt to seek to
       for (((cOff, nOff), uOff) <- blockStarts.zip(uncompBlockStarts);
            e <- Seq(0, 1024, maxBlockSize - fromEnd)) {

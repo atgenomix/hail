@@ -22,8 +22,8 @@ class Tests(unittest.TestCase):
             tinterval(tint32),
             tdict(tstr, tint32),
             tarray(tstr),
-            tndarray(tstr),
-            tndarray(tfloat64),
+            tndarray(tstr, 1),
+            tndarray(tfloat64, 2),
             tset(tint64),
             tlocus('GRCh37'),
             tlocus('GRCh38'),
@@ -38,6 +38,9 @@ class Tests(unittest.TestCase):
             tstruct(a=tfloat64, bb=tint32, c=tbool),
             tstruct(a=tint32, b=tint32),
             tstruct(**{'___': tint32, '_ . _': tint32}),
+            tunion(),
+            tunion(a=tint32, b=tstr),
+            tunion(**{'!@#$%^&({[': tstr}),
             ttuple(tstr, tint32),
             ttuple(tarray(tint32), tstr, tstr, tint32, tbool),
             ttuple()]
@@ -56,7 +59,7 @@ class Tests(unittest.TestCase):
 
         for i in range(len(ts)):
             for j in range(len(ts2)):
-                if (i == j):
+                if i == j:
                     self.assertEqual(ts[i], ts2[j])
                 else:
                     self.assertNotEqual(ts[i], ts2[j])
@@ -82,3 +85,57 @@ class Tests(unittest.TestCase):
             c = coercer_from_dtype(t)
             self.assertTrue(c.can_coerce(t))
             self.assertFalse(c.requires_conversion(t))
+
+    def test_nested_type_to_spark(self):
+        ht = hl.utils.range_table(10)
+        ht = ht.annotate(nested=hl.dict({"tup": hl.tuple([ht.idx])}))
+        ht.to_spark()  # should not throw exception
+
+    def test_rename_not_unique(self):
+        with self.assertRaisesRegex(ValueError, "attempted to rename 'b' and 'c' both to 'x'"):
+            hl.tstruct(a=hl.tbool, b=hl.tint32, c=hl.tint32)._rename({'b': 'x', 'c': 'x'})
+        with self.assertRaisesRegex(ValueError, "attempted to rename 'a' and 'b' both to 'a'"):
+            hl.tstruct(a=hl.tbool, b=hl.tint32)._rename({'b': 'a'})
+
+    def test_get_context(self):
+        tl1 = tlocus('GRCh37')
+        tl2 = tlocus('GRCh38')
+
+        types_and_rgs = [
+            ([
+                tint32,
+                tint64,
+                tfloat32,
+                tfloat64,
+                tstr,
+                tbool,
+                tcall,
+                tinterval(tset(tint32)),
+                tdict(tstr, tarray(tint32)),
+                tndarray(tstr, 1),
+                tstruct(),
+                tstruct(x=tint32, y=tint64, z=tarray(tset(tstr))),
+                tunion(),
+                tunion(a=tint32, b=tstr),
+                ttuple(tstr, tint32),
+                ttuple()], set()),
+            ([
+                tl1,
+                tinterval(tl1),
+                tdict(tstr, tl1),
+                tndarray(tl1, 2),
+                tinterval(tl1),
+                tset(tinterval(tl1)),
+                tstruct(a=tint32, b=tint32, c=tarray(tl1)),
+                tunion(a=tint32, b=tl1),
+                ttuple(tarray(tint32), tl1, tstr, tint32, tbool),
+            ], {"GRCh37"}),
+            ([
+                tdict(tl1, tl2),
+                ttuple(tarray(tl2), tl1, tstr, tint32, tbool),
+            ], {"GRCh37", "GRCh38"})
+        ]
+
+        for types, rgs in types_and_rgs:
+            for t in types:
+                self.assertEqual(t.get_context().references, rgs)

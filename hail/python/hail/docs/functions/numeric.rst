@@ -37,7 +37,9 @@ Numeric functions
 .. autosummary::
 
     min
+    nanmin
     max
+    nanmax
     mean
     median
     product
@@ -46,7 +48,7 @@ Numeric functions
     argmin
     argmax
     corr
-
+    binary_search
 
 .. autofunction:: abs
 .. autofunction:: approx_equal
@@ -67,7 +69,9 @@ Numeric functions
 .. autofunction:: sqrt
 .. autofunction:: sign
 .. autofunction:: min
+.. autofunction:: nanmin
 .. autofunction:: max
+.. autofunction:: nanmax
 .. autofunction:: mean
 .. autofunction:: median
 .. autofunction:: product
@@ -77,3 +81,4 @@ Numeric functions
 .. autofunction:: argmax
 .. autofunction:: corr
 .. autofunction:: uniroot
+.. autofunction:: binary_search

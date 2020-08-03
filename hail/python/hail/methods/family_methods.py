@@ -1,11 +1,11 @@
-from typing import *
+from typing import Tuple
 import hail as hl
 import hail.expr.aggregators as agg
 from hail.genetics.pedigree import Pedigree
 from hail.matrixtable import MatrixTable
 from hail.expr import expr_call, expr_float64
 from hail.table import Table
-from hail.typecheck import *
+from hail.typecheck import typecheck, numeric
 from hail.utils.java import Env
 from .misc import require_biallelic, require_col_key_str
 
@@ -62,12 +62,12 @@ def trio_matrix(dataset, pedigree, complete_trios=False) -> MatrixTable:
     """
     mt = dataset
     require_col_key_str(mt, "trio_matrix")
-    
+
     k = mt.col_key.dtype.fields[0]
     samples = mt[k].collect()
 
     pedigree = pedigree.filter_to(samples)
-    trios = pedigree.complete_trios() if complete_trios else pedigree.trios()
+    trios = pedigree.complete_trios() if complete_trios else pedigree.trios
     n_trios = len(trios)
 
     sample_idx = {}
@@ -76,8 +76,8 @@ def trio_matrix(dataset, pedigree, complete_trios=False) -> MatrixTable:
 
     trios = [hl.Struct(
         id=sample_idx[t.s],
-        pat_id=sample_idx[t.pat_id],
-        mat_id=sample_idx[t.mat_id],
+        pat_id=None if t.pat_id is None else sample_idx[t.pat_id],
+        mat_id=None if t.mat_id is None else sample_idx[t.mat_id],
         is_female=t.is_female,
         fam_id=t.fam_id) for t in trios]
     trios_type = hl.dtype('array<struct{id:int,pat_id:int,mat_id:int,is_female:bool,fam_id:str}>')
@@ -108,6 +108,7 @@ def trio_matrix(dataset, pedigree, complete_trios=False) -> MatrixTable:
     mt = mt.drop(trios_sym)
 
     return mt._unlocalize_entries(entries_sym, cols_sym, ['id'])
+
 
 @typecheck(call=expr_call,
            pedigree=Pedigree)
@@ -264,27 +265,26 @@ def mendel_errors(call, pedigree) -> Tuple[Table, Table, Table, Table]:
     ))
     ck_name = next(iter(source.col_key))
     tm = tm.filter_entries(hl.is_defined(tm.mendel_code))
-    tm = tm.rename({'id' : ck_name})
+    tm = tm.rename({'id': ck_name})
 
     entries = tm.entries()
 
     table1 = entries.select('fam_id', 'mendel_code')
 
-    fam_counts = (
-        entries
-            .group_by(pat_id=entries.father[ck_name], mat_id=entries.mother[ck_name])
-            .partition_hint(min(entries.n_partitions(), 8))
-            .aggregate(children=hl.len(hl.agg.collect_as_set(entries[ck_name])),
-                       errors=hl.agg.count_where(hl.is_defined(entries.mendel_code)),
-                       snp_errors=hl.agg.count_where(hl.is_snp(entries.alleles[0], entries.alleles[1]) &
-                                                     hl.is_defined(entries.mendel_code)))
-    )
-    table2 = tm.key_cols_by().cols()
+    t2 = tm.annotate_cols(
+        errors=hl.agg.count(),
+        snp_errors=hl.agg.count_where(hl.is_snp(tm.alleles[0], tm.alleles[1])))
+    table2 = t2.key_cols_by().cols()
     table2 = table2.select(pat_id=table2.father[ck_name],
                            mat_id=table2.mother[ck_name],
                            fam_id=table2.fam_id,
-                           **fam_counts[table2.father[ck_name], table2.mother[ck_name]])
-    table2 = table2.key_by('pat_id', 'mat_id').distinct()
+                           errors=table2.errors,
+                           snp_errors=table2.snp_errors)
+    table2 = table2.group_by('pat_id', 'mat_id').aggregate(
+        fam_id=hl.agg.take(table2.fam_id, 1)[0],
+        children=hl.int32(hl.agg.count()),
+        errors=hl.agg.sum(table2.errors),
+        snp_errors=hl.agg.sum(table2.snp_errors))
     table2 = table2.annotate(errors=hl.or_else(table2.errors, hl.int64(0)),
                              snp_errors=hl.or_else(table2.snp_errors, hl.int64(0)))
 
@@ -336,6 +336,7 @@ def mendel_errors(call, pedigree) -> Tuple[Table, Table, Table, Table]:
 
     return table1, table2, table3, table4
 
+
 @typecheck(dataset=MatrixTable,
            pedigree=Pedigree)
 def transmission_disequilibrium_test(dataset, pedigree) -> Table:
@@ -350,10 +351,10 @@ def transmission_disequilibrium_test(dataset, pedigree) -> Table:
     Examples
     --------
     Compute TDT association statistics and show the first two results:
-    
+
     >>> pedigree = hl.Pedigree.read('data/tdt_trios.fam')
     >>> tdt_table = hl.transmission_disequilibrium_test(tdt_dataset, pedigree)
-    >>> tdt_table.show(2)  # doctest: +NOTEST
+    >>> tdt_table.show(2)  # doctest: +SKIP_OUTPUT_CHECK
     +---------------+------------+-------+-------+----------+----------+
     | locus         | alleles    |     t |     u |   chi_sq |  p_value |
     +---------------+------------+-------+-------+----------+----------+
@@ -366,7 +367,7 @@ def transmission_disequilibrium_test(dataset, pedigree) -> Table:
     Export variants with p-values below 0.001:
 
     >>> tdt_table = tdt_table.filter(tdt_table.p_value < 0.001)
-    >>> tdt_table.export("output/tdt_results.tsv")
+    >>> tdt_table.export(f"output/tdt_results.tsv")
 
     Notes
     -----
@@ -457,7 +458,7 @@ def transmission_disequilibrium_test(dataset, pedigree) -> Table:
     """
 
     dataset = require_biallelic(dataset, 'transmission_disequilibrium_test')
-    dataset = dataset.annotate_rows(auto_or_x_par = dataset.locus.in_autosome() | dataset.locus.in_x_par())
+    dataset = dataset.annotate_rows(auto_or_x_par=dataset.locus.in_autosome() | dataset.locus.in_x_par())
     dataset = dataset.filter_rows(dataset.auto_or_x_par | dataset.locus.in_x_nonpar())
 
     hom_ref = 0
@@ -491,8 +492,8 @@ def transmission_disequilibrium_test(dataset, pedigree) -> Table:
     # this filter removes mendel error of het father in x_nonpar. It also avoids
     #   building and looking up config in common case that neither parent is het
     father_is_het = tri.father_entry.GT.is_het()
-    parent_is_valid_het = ((father_is_het & tri.auto_or_x_par) |
-                           (tri.mother_entry.GT.is_het() & ~father_is_het))
+    parent_is_valid_het = ((father_is_het & tri.auto_or_x_par)
+                           | (tri.mother_entry.GT.is_het() & ~father_is_het))
 
     copy_state = hl.cond(tri.auto_or_x_par | tri.is_female, 2, 1)
 
@@ -501,14 +502,15 @@ def transmission_disequilibrium_test(dataset, pedigree) -> Table:
               tri.mother_entry.GT.n_alt_alleles(),
               copy_state)
 
-    tri = tri.annotate_rows(counts = agg.filter(parent_is_valid_het, agg.array_sum(count_map.get(config))))
+    tri = tri.annotate_rows(counts=agg.filter(parent_is_valid_het, agg.array_sum(count_map.get(config))))
 
     tab = tri.rows().select('counts')
-    tab = tab.transmute(t = tab.counts[0], u = tab.counts[1])
-    tab = tab.annotate(chi_sq = ((tab.t - tab.u) ** 2) / (tab.t + tab.u))
-    tab = tab.annotate(p_value = hl.pchisqtail(tab.chi_sq, 1.0))
+    tab = tab.transmute(t=tab.counts[0], u=tab.counts[1])
+    tab = tab.annotate(chi_sq=((tab.t - tab.u) ** 2) / (tab.t + tab.u))
+    tab = tab.annotate(p_value=hl.pchisqtail(tab.chi_sq, 1.0))
 
     return tab.cache()
+
 
 @typecheck(mt=MatrixTable,
            pedigree=Pedigree,
@@ -593,20 +595,20 @@ def de_novo(mt: MatrixTable,
 
     .. math::
 
-        \mathrm{P_{\text{de novo}}} = \frac{\mathrm{P}(d\,|\,x)}{\mathrm{P}(d\,|\,x) + \mathrm{P}(m\,|\,x)}
+        \mathrm{P_{\text{de novo}}} = \frac{\mathrm{P}(d \mid x)}{\mathrm{P}(d \mid x) + \mathrm{P}(m \mid x)}
 
     Applying Bayes rule to the numerator and denominator yields
 
     .. math::
 
-        \frac{\mathrm{P}(x\,|\,d)\,\mathrm{P}(d)}{\mathrm{P}(x\,|\,d)\,\mathrm{P}(d) +
-        \mathrm{P}(x\,|\,m)\,\mathrm{P}(m)}
+        \frac{\mathrm{P}(x \mid d)\,\mathrm{P}(d)}{\mathrm{P}(x \mid d)\,\mathrm{P}(d) +
+        \mathrm{P}(x \mid m)\,\mathrm{P}(m)}
 
     The prior on de novo mutation is estimated from the rate in the literature:
 
     .. math::
 
-        \mathrm{P}(d) = \frac{1 \text{mutation}}{30,000,000\, \text{bases}}
+        \mathrm{P}(d) = \frac{1 \, \text{mutation}}{30{,}000{,}000 \, \text{bases}}
 
     The prior used for at least one alternate allele between the parents
     depends on the alternate allele frequency:
@@ -615,27 +617,31 @@ def de_novo(mt: MatrixTable,
 
         \mathrm{P}(m) = 1 - (1 - AF)^4
 
-    The likelihoods :math:`\mathrm{P}(x\,|\,d)` and :math:`\mathrm{P}(x\,|\,m)`
+    The likelihoods :math:`\mathrm{P}(x \mid d)` and :math:`\mathrm{P}(x \mid m)`
     are computed from the PL (genotype likelihood) fields using these
     factorizations:
 
     .. math::
-
-        \mathrm{P}(x = (AA, AA, AB) \,|\,d) = \Big(
-        &\mathrm{P}(x_{\mathrm{father}} = AA \,|\, \mathrm{father} = AA) \\
-        \cdot &\mathrm{P}(x_{\mathrm{mother}} = AA \,|\, \mathrm{mother} =
-        AA) \\ \cdot &\mathrm{P}(x_{\mathrm{proband}} = AB \,|\,
-        \mathrm{proband} = AB) \Big)
+        \mathrm{P}(x = (AA, AA, AB) \mid d) = \left(
+        \begin{aligned}
+                &\mathrm{P}(x_{\mathrm{father}} = AA \mid \mathrm{father} = AA) \\
+                {} \cdot {} &\mathrm{P}(x_{\mathrm{mother}} = AA \mid \mathrm{mother} = AA) \\
+                {} \cdot {} &\mathrm{P}(x_{\mathrm{proband}} = AB \mid \mathrm{proband} = AB)
+        \end{aligned}
+        \right)
 
     .. math::
-
-        \mathrm{P}(x = (AA, AA, AB) \,|\,m) = \Big( &
-        \mathrm{P}(x_{\mathrm{father}} = AA \,|\, \mathrm{father} = AB)
-        \cdot \mathrm{P}(x_{\mathrm{mother}} = AA \,|\, \mathrm{mother} =
-        AA) \\ + \, &\mathrm{P}(x_{\mathrm{father}} = AA \,|\,
-        \mathrm{father} = AA) \cdot \mathrm{P}(x_{\mathrm{mother}} = AA
-        \,|\, \mathrm{mother} = AB) \Big) \\ \cdot \,
-        &\mathrm{P}(x_{\mathrm{proband}} = AB \,|\, \mathrm{proband} = AB)
+        \begin{aligned}
+        \mathrm{P}(x = (AA, AA, AB) \mid m) = &\left(
+            \begin{aligned}
+                &\mathrm{P}(x_{\mathrm{father}} = AA \mid \mathrm{father} = AB)
+                    \cdot \mathrm{P}(x_{\mathrm{mother}} = AA \mid \mathrm{mother} = AA) \\
+                {} + {} &\mathrm{P}(x_{\mathrm{father}} = AA \mid \mathrm{father} = AA)
+                    \cdot \mathrm{P}(x_{\mathrm{mother}} = AA \mid \mathrm{mother} = AB)
+            \end{aligned}
+        \right) \\
+        &{} \cdot \mathrm{P}(x_{\mathrm{proband}} = AB \mid \mathrm{proband} = AB)
+        \end{aligned}
 
     (Technically, the second factorization assumes there is exactly (rather
     than at least) one alternate allele among the parents, which may be
@@ -652,62 +658,62 @@ def de_novo(mt: MatrixTable,
 
      - ``DR`` refers to the ratio of the read depth in the proband to the
        combined read depth in the parents.
+     - ``DP`` refers to the read depth (DP field) of the proband.
      - ``AB`` refers to the read allele balance of the proband (number of
        alternate reads divided by total reads).
      - ``AC`` refers to the count of alternate alleles across all individuals
        in the dataset at the site.
      - ``p`` refers to :math:`\mathrm{P_{\text{de novo}}}`.
-     - ``min_p`` refers to the ``min_p`` function parameter.
+     - ``min_p`` refers to the `min_p` function parameter.
 
     HIGH-quality SNV:
 
     .. code-block:: text
 
-        p > 0.99 && AB > 0.3 && DR > 0.2
-            or
-        p > 0.99 && AB > 0.3 && AC == 1
+        (p > 0.99) AND (AB > 0.3) AND (AC == 1)
+            OR
+        (p > 0.99) AND (AB > 0.3) AND (DR > 0.2)
+            OR
+        (p > 0.5) AND (AB > 0.3) AND (AC < 10) AND (DP > 10)
 
     MEDIUM-quality SNV:
 
     .. code-block:: text
 
-        p > 0.5 && AB > 0.3
-            or
-        p > 0.5 && AB > 0.2 && AC == 1
+        (p > 0.5) AND (AB > 0.3)
+            OR
+        (AC == 1)
 
     LOW-quality SNV:
 
     .. code-block:: text
 
-        p > min_p && AB > 0.2
+       (AB > 0.2)
 
     HIGH-quality indel:
 
     .. code-block:: text
 
-        p > 0.99 && AB > 0.3 && DR > 0.2
-            or
-        p > 0.99 && AB > 0.3 && AC == 1
+        (p > 0.99) AND (AB > 0.3) AND (AC == 1)
 
     MEDIUM-quality indel:
 
     .. code-block:: text
 
-        p > 0.5 && AB > 0.3
-            or
-        p > 0.5 && AB > 0.2 and AC == 1
+        (p > 0.5) AND (AB > 0.3) AND (AC < 10)
 
     LOW-quality indel:
 
     .. code-block:: text
 
-        p > min_p && AB > 0.2
+       (AB > 0.2)
 
     Additionally, de novo candidates are not considered if the proband GQ is
-    smaller than the ``min_gq`` parameter, if the proband allele balance is
-    lower than the ``min_child_ab`` parameter, if the depth ratio between the
-    proband and parents is smaller than the ``min_depth_ratio`` parameter, or if
-    the allele balance in a parent is above the ``max_parent_ab`` parameter.
+    smaller than the `min_gq` parameter, if the proband allele balance is
+    lower than the `min_child_ab` parameter, if the depth ratio between the
+    proband and parents is smaller than the `min_depth_ratio` parameter, if
+    the allele balance in a parent is above the `max_parent_ab` parameter, or
+    if the posterior probability `p` is smaller than the `min_p` parameter.
 
     Parameters
     ----------
@@ -789,33 +795,31 @@ def de_novo(mt: MatrixTable,
         def solve(p_de_novo):
             return (
                 hl.case()
-                    .when(kid.GQ < min_gq, failure)
-                    .when((kid.DP / (dad.DP + mom.DP) < min_dp_ratio) |
-                          ~(kid_ad_ratio >= min_child_ab), failure)
-                    .when((hl.sum(mom.AD) == 0) | (hl.sum(dad.AD) == 0), failure)
-                    .when((mom.AD[1] / hl.sum(mom.AD) > max_parent_ab) |
-                          (dad.AD[1] / hl.sum(dad.AD) > max_parent_ab), failure)
-                    .when(p_de_novo < min_p, failure)
-                    .when(~is_snp, hl.case()
-                          .when((p_de_novo > 0.99) & (kid_ad_ratio > 0.3) & (n_alt_alleles == 1),
-                                hl.struct(p_de_novo=p_de_novo, confidence='HIGH'))
-                          .when((p_de_novo > 0.5) & (kid_ad_ratio > 0.3) & (n_alt_alleles <= 5),
-                                hl.struct(p_de_novo=p_de_novo, confidence='MEDIUM'))
-                          .when((p_de_novo > 0.05) & (kid_ad_ratio > 0.2),
-                                hl.struct(p_de_novo=p_de_novo, confidence='LOW'))
-                          .or_missing())
-                    .default(hl.case()
-                             .when(((p_de_novo > 0.99) & (kid_ad_ratio > 0.3) & (dp_ratio > 0.2)) |
-                                   ((p_de_novo > 0.99) & (kid_ad_ratio > 0.3) & (n_alt_alleles == 1)) |
-                                   ((p_de_novo > 0.5) & (kid_ad_ratio > 0.3) & (n_alt_alleles < 10) & (kid.DP > 10)),
-                                   hl.struct(p_de_novo=p_de_novo, confidence='HIGH'))
-                             .when((p_de_novo > 0.5) & ((kid_ad_ratio > 0.3) | (n_alt_alleles == 1)),
-                                   hl.struct(p_de_novo=p_de_novo, confidence='MEDIUM'))
-                             .when((p_de_novo > 0.05) & (kid_ad_ratio > 0.2),
-                                   hl.struct(p_de_novo=p_de_novo, confidence='LOW'))
-                             .or_missing()
-                             )
-            )
+                .when(kid.GQ < min_gq, failure)
+                .when((kid.DP / (dad.DP + mom.DP) < min_dp_ratio)
+                      | ~(kid_ad_ratio >= min_child_ab), failure)
+                .when((hl.sum(mom.AD) == 0) | (hl.sum(dad.AD) == 0), failure)
+                .when((mom.AD[1] / hl.sum(mom.AD) > max_parent_ab)
+                      | (dad.AD[1] / hl.sum(dad.AD) > max_parent_ab), failure)
+                .when(p_de_novo < min_p, failure)
+                .when(~is_snp, hl.case()
+                      .when((p_de_novo > 0.99) & (kid_ad_ratio > 0.3) & (n_alt_alleles == 1),
+                            hl.struct(p_de_novo=p_de_novo, confidence='HIGH'))
+                      .when((p_de_novo > 0.5) & (kid_ad_ratio > 0.3) & (n_alt_alleles <= 5),
+                            hl.struct(p_de_novo=p_de_novo, confidence='MEDIUM'))
+                      .when(kid_ad_ratio > 0.2,
+                            hl.struct(p_de_novo=p_de_novo, confidence='LOW'))
+                      .or_missing())
+                .default(hl.case()
+                         .when(((p_de_novo > 0.99) & (kid_ad_ratio > 0.3) & (dp_ratio > 0.2))
+                               | ((p_de_novo > 0.99) & (kid_ad_ratio > 0.3) & (n_alt_alleles == 1))
+                               | ((p_de_novo > 0.5) & (kid_ad_ratio > 0.3) & (n_alt_alleles < 10) & (kid.DP > 10)),
+                               hl.struct(p_de_novo=p_de_novo, confidence='HIGH'))
+                         .when((p_de_novo > 0.5) & ((kid_ad_ratio > 0.3) | (n_alt_alleles == 1)),
+                               hl.struct(p_de_novo=p_de_novo, confidence='MEDIUM'))
+                         .when(kid_ad_ratio > 0.2,
+                               hl.struct(p_de_novo=p_de_novo, confidence='LOW'))
+                         .or_missing()))
 
         return hl.bind(solve, p_de_novo)
 
@@ -828,43 +832,40 @@ def de_novo(mt: MatrixTable,
         def solve(p_de_novo):
             return (
                 hl.case()
-                    .when(kid.GQ < min_gq, failure)
-                    .when((kid.DP / (parent.DP) < min_dp_ratio) |
-                          (kid_ad_ratio < min_child_ab), failure)
-                    .when((hl.sum(parent.AD) == 0), failure)
-                    .when(parent.AD[1] / hl.sum(parent.AD) > max_parent_ab, failure)
-                    .when(p_de_novo < min_p, failure)
-                    .when(~is_snp, hl.case()
-                          .when((p_de_novo > 0.99) & (kid_ad_ratio > 0.3) & (n_alt_alleles == 1),
-                                hl.struct(p_de_novo=p_de_novo, confidence='HIGH'))
-                          .when((p_de_novo > 0.5) & (kid_ad_ratio > 0.3) & (n_alt_alleles <= 5),
-                                hl.struct(p_de_novo=p_de_novo, confidence='MEDIUM'))
-                          .when((p_de_novo > 0.05) & (kid_ad_ratio > 0.3),
-                                hl.struct(p_de_novo=p_de_novo, confidence='LOW'))
-                          .or_missing())
-                    .default(hl.case()
-                             .when(((p_de_novo > 0.99) & (kid_ad_ratio > 0.3) & (dp_ratio > 0.2)) |
-                                   ((p_de_novo > 0.99) & (kid_ad_ratio > 0.3) & (n_alt_alleles == 1)) |
-                                   ((p_de_novo > 0.5) & (kid_ad_ratio > 0.3) & (n_alt_alleles < 10) & (kid.DP > 10)),
-                                   hl.struct(p_de_novo=p_de_novo, confidence='HIGH'))
-                             .when((p_de_novo > 0.5) & ((kid_ad_ratio > 0.3) | (n_alt_alleles == 1)),
-                                   hl.struct(p_de_novo=p_de_novo, confidence='MEDIUM'))
-                             .when((p_de_novo > 0.05) & (kid_ad_ratio > 0.2),
-                                   hl.struct(p_de_novo=p_de_novo, confidence='LOW'))
-                             .or_missing()
-                             )
-            )
+                .when(kid.GQ < min_gq, failure)
+                .when((kid.DP / (parent.DP) < min_dp_ratio)
+                      | (kid_ad_ratio < min_child_ab), failure)
+                .when((hl.sum(parent.AD) == 0), failure)
+                .when(parent.AD[1] / hl.sum(parent.AD) > max_parent_ab, failure)
+                .when(p_de_novo < min_p, failure)
+                .when(~is_snp, hl.case()
+                      .when((p_de_novo > 0.99) & (kid_ad_ratio > 0.3) & (n_alt_alleles == 1),
+                            hl.struct(p_de_novo=p_de_novo, confidence='HIGH'))
+                      .when((p_de_novo > 0.5) & (kid_ad_ratio > 0.3) & (n_alt_alleles <= 5),
+                            hl.struct(p_de_novo=p_de_novo, confidence='MEDIUM'))
+                      .when(kid_ad_ratio > 0.3,
+                            hl.struct(p_de_novo=p_de_novo, confidence='LOW'))
+                      .or_missing())
+                .default(hl.case()
+                         .when(((p_de_novo > 0.99) & (kid_ad_ratio > 0.3) & (dp_ratio > 0.2))
+                               | ((p_de_novo > 0.99) & (kid_ad_ratio > 0.3) & (n_alt_alleles == 1))
+                               | ((p_de_novo > 0.5) & (kid_ad_ratio > 0.3) & (n_alt_alleles < 10) & (kid.DP > 10)),
+                               hl.struct(p_de_novo=p_de_novo, confidence='HIGH'))
+                         .when((p_de_novo > 0.5) & ((kid_ad_ratio > 0.3) | (n_alt_alleles == 1)),
+                               hl.struct(p_de_novo=p_de_novo, confidence='MEDIUM'))
+                         .when(kid_ad_ratio > 0.2,
+                               hl.struct(p_de_novo=p_de_novo, confidence='LOW'))
+                         .or_missing()))
 
         return hl.bind(solve, p_de_novo)
 
     de_novo_call = (
         hl.case()
-            .when(~het_hom_hom | kid_ad_fail, failure)
-            .when(autosomal, hl.bind(call_auto, kid_pp, dad_pp, mom_pp, kid_ad_ratio))
-            .when(hemi_x | hemi_mt, hl.bind(call_hemi, kid_pp, mom, mom_pp, kid_ad_ratio))
-            .when(hemi_y, hl.bind(call_hemi, kid_pp, dad, dad_pp, kid_ad_ratio))
-            .or_missing()
-    )
+        .when(~het_hom_hom | kid_ad_fail, failure)
+        .when(autosomal, hl.bind(call_auto, kid_pp, dad_pp, mom_pp, kid_ad_ratio))
+        .when(hemi_x | hemi_mt, hl.bind(call_hemi, kid_pp, mom, mom_pp, kid_ad_ratio))
+        .when(hemi_y, hl.bind(call_hemi, kid_pp, dad, dad_pp, kid_ad_ratio))
+        .or_missing())
 
     tm = tm.annotate_entries(__call=de_novo_call)
     tm = tm.filter_entries(hl.is_defined(tm.__call))

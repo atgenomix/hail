@@ -1,7 +1,7 @@
 package is.hail.testUtils
 
 import is.hail.annotations.Annotation
-import is.hail.expr.types.virtual.{TArray, TLocus, TString, TStruct}
+import is.hail.types.virtual.{TArray, TLocus, TString, TStruct}
 import is.hail.variant._
 import org.apache.spark.sql.Row
 import org.json4s._
@@ -25,7 +25,7 @@ object Variant {
     start: Int,
     ref: String,
     alts: Array[String],
-    rg: RGBase): Variant = {
+    rg: ReferenceGenome): Variant = {
     rg.checkLocus(contig, start)
     Variant(contig, start, ref, alts)
   }
@@ -34,7 +34,7 @@ object Variant {
     start: Int,
     ref: String,
     alts: java.util.ArrayList[String],
-    rg: RGBase): Variant = Variant(contig, start, ref, alts.asScala.toArray, rg)
+    rg: ReferenceGenome): Variant = Variant(contig, start, ref, alts.asScala.toArray, rg)
 
   def fromLocusAlleles(a: Annotation): Variant = {
     val r = a.asInstanceOf[Row]
@@ -55,8 +55,8 @@ case class Variant(contig: String,
 
   /* The position is 1-based. Telomeres are indicated by using positions 0 or N+1, where N is the length of the
        corresponding chromosome or contig. See the VCF spec, v4.2, section 1.4.1. */
-  require(start >= 0, s"invalid variant: negative position: `${ this.toString }'")
-  require(!ref.isEmpty, s"invalid variant: empty contig: `${ this.toString }'")
+  require(start >= 0, s"invalid variant: negative position: '${ this.toString }'")
+  require(!ref.isEmpty, s"invalid variant: empty contig: '${ this.toString }'")
 
   def nAltAlleles: Int = altAlleles.length
 

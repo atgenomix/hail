@@ -1,17 +1,14 @@
 package is.hail.io
 
-import is.hail.SparkSuite
+import is.hail.HailSuite
 import is.hail.check.Gen._
-import is.hail.check.Arbitrary._
 import is.hail.check.Prop._
 import is.hail.check.Properties
-import is.hail.utils._
 import org.testng.annotations.Test
 
 import scala.language.implicitConversions
-import scala.math.Numeric.Implicits._
 
-class IndexBTreeSuite extends SparkSuite {
+class IndexBTreeSuite extends HailSuite {
 
   object Spec extends Properties("BTree") {
 
@@ -38,13 +35,13 @@ class IndexBTreeSuite extends SparkSuite {
       forAll(arraySizeGenerator) { case (depth: Int, arraySize: Int) =>
         val arrayRandomStarts = fillRandomArray(arraySize)
         val maxLong = arrayRandomStarts.takeRight(1)(0)
-        val index = tmpDir.createTempFile(prefix = "testBtree", extension = ".idx")
+        val index = ctx.createTmpPath("testBtree", "idx")
 
-        hadoopConf.delete(index, true)
-        IndexBTree.write(arrayRandomStarts, index, sc.hadoopConfiguration)
-        val btree = new IndexBTree(index, sc.hadoopConfiguration)
+        fs.delete(index, true)
+        IndexBTree.write(arrayRandomStarts, index, fs)
+        val btree = new IndexBTree(index, fs)
 
-        val indexSize = hadoopConf.getFileSize(index)
+        val indexSize = fs.getFileSize(index)
         val padding = 1024 - (arraySize % 1024)
         val numEntries = arraySize + padding + (1 until depth).map {
           math.pow(1024, _).toInt
@@ -80,12 +77,11 @@ class IndexBTreeSuite extends SparkSuite {
   @Test def oneVariant() {
     val index = Array(24.toLong)
     val fileSize = 30 //made-up value greater than index
-    val idxFile = tmpDir.createTempFile(prefix = "testBtree_1variant", extension = ".idx")
-    val hConf = sc.hadoopConfiguration
+    val idxFile = ctx.createTmpPath("testBtree_1variant", "idx")
 
-    hadoopConf.delete(idxFile, recursive = true)
-    IndexBTree.write(index, idxFile, hConf)
-    val btree = new IndexBTree(idxFile, sc.hadoopConfiguration)
+    fs.delete(idxFile, recursive = true)
+    IndexBTree.write(index, idxFile, fs)
+    val btree = new IndexBTree(idxFile, fs)
 
 
     intercept[IllegalArgumentException] {
@@ -103,9 +99,9 @@ class IndexBTreeSuite extends SparkSuite {
   @Test def zeroVariants() {
     intercept[IllegalArgumentException] {
       val index = Array[Long]()
-      val idxFile = tmpDir.createTempFile(prefix = "testBtree_0variant", extension = ".idx")
-      hadoopConf.delete(idxFile, recursive = true)
-      IndexBTree.write(index, idxFile, sc.hadoopConfiguration)
+      val idxFile = ctx.createTmpPath("testBtree_0variant", "idx")
+      fs.delete(idxFile, recursive = true)
+      IndexBTree.write(index, idxFile, fs)
     }
   }
 
@@ -125,102 +121,102 @@ class IndexBTreeSuite extends SparkSuite {
   }
 
   @Test def writeReadMultipleOfBranchingFactorDoesNotError() {
-    val idxFile = tmpDir.createTempFile(prefix = "btree")
+    val idxFile = ctx.createTmpPath("btree")
     IndexBTree.write(
       Array.tabulate(1024)(i => i),
       idxFile,
-      hadoopConf)
-    val index = new IndexBTree(idxFile, hadoopConf)
+      fs)
+    val index = new IndexBTree(idxFile, fs)
     assert(index.queryIndex(33).contains(33L))
   }
 
   @Test def queryArrayPositionAndFileOffsetIsCorrectSmallArray() {
-    val f = tmpDir.createTempFile(prefix = "btree")
+    val f = ctx.createTmpPath("btree")
     val v = Array[Long](1, 2, 3, 40, 50, 60, 70)
     val branchingFactor = 1024
-    IndexBTree.write(v, f, hadoopConf, branchingFactor = branchingFactor)
-    val bt = new IndexBTree(f, hadoopConf, branchingFactor = branchingFactor)
-    assert(bt.queryArrayPositionAndFileOffset(1) == Some(0, 1))
-    assert(bt.queryArrayPositionAndFileOffset(2) == Some(1, 2))
-    assert(bt.queryArrayPositionAndFileOffset(3) == Some(2, 3))
+    IndexBTree.write(v, f, fs, branchingFactor = branchingFactor)
+    val bt = new IndexBTree(f, fs, branchingFactor = branchingFactor)
+    assert(bt.queryArrayPositionAndFileOffset(1).contains((0, 1)))
+    assert(bt.queryArrayPositionAndFileOffset(2).contains((1, 2)))
+    assert(bt.queryArrayPositionAndFileOffset(3).contains((2, 3)))
     for (i <- 4 to 40)
-      assert(bt.queryArrayPositionAndFileOffset(i) == Some(3, 40), s"$i")
+      assert(bt.queryArrayPositionAndFileOffset(i).contains((3, 40)), s"$i")
     for (i <- 41 to 50)
-      assert(bt.queryArrayPositionAndFileOffset(i) == Some(4, 50), s"$i")
-    assert(bt.queryArrayPositionAndFileOffset(65) == Some(6, 70))
-    assert(bt.queryArrayPositionAndFileOffset(70) == Some(6, 70))
-    assert(bt.queryArrayPositionAndFileOffset(71) == None)
+      assert(bt.queryArrayPositionAndFileOffset(i).contains((4, 50)), s"$i")
+    assert(bt.queryArrayPositionAndFileOffset(65).contains((6, 70)))
+    assert(bt.queryArrayPositionAndFileOffset(70).contains((6, 70)))
+    assert(bt.queryArrayPositionAndFileOffset(71).isEmpty)
   }
 
   @Test def queryArrayPositionAndFileOffsetIsCorrectTwoLevelsArray() {
     def sqr(x: Long) = x * x
-    val f = tmpDir.createTempFile(prefix = "btree")
+    val f = ctx.createTmpPath("btree")
     val v = Array.tabulate(1025)(x => sqr(x))
     val branchingFactor = 1024
-    IndexBTree.write(v, f, hadoopConf, branchingFactor = branchingFactor)
-    val bt = new IndexBTree(f, hadoopConf, branchingFactor = branchingFactor)
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1022)) == Some(1022, sqr(1022)))
+    IndexBTree.write(v, f, fs, branchingFactor = branchingFactor)
+    val bt = new IndexBTree(f, fs, branchingFactor = branchingFactor)
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1022)).contains((1022, sqr(1022))))
 
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1022) + 1) == Some(1023, sqr(1023)))
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1023) - 1) == Some(1023, sqr(1023)))
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1023)) == Some(1023, sqr(1023)))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1022) + 1).contains((1023, sqr(1023))))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1023) - 1).contains((1023, sqr(1023))))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1023)).contains((1023, sqr(1023))))
 
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1023) + 1) == Some(1024, sqr(1024)))
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1024) - 1) == Some(1024, sqr(1024)))
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1024)) == Some(1024, sqr(1024)))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1023) + 1).contains((1024, sqr(1024))))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1024) - 1).contains((1024, sqr(1024))))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1024)).contains((1024, sqr(1024))))
 
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1024) + 1) == None)
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1024) + 1).isEmpty)
 
-    assert(bt.queryArrayPositionAndFileOffset(0) == Some(0, sqr(0)))
-    assert(bt.queryArrayPositionAndFileOffset(1) == Some(1, sqr(1)))
-    assert(bt.queryArrayPositionAndFileOffset(2) == Some(2, sqr(2)))
-    assert(bt.queryArrayPositionAndFileOffset(3) == Some(2, sqr(2)))
-    assert(bt.queryArrayPositionAndFileOffset(4) == Some(2, sqr(2)))
-    assert(bt.queryArrayPositionAndFileOffset(5) == Some(3, sqr(3)))
+    assert(bt.queryArrayPositionAndFileOffset(0).contains((0, sqr(0))))
+    assert(bt.queryArrayPositionAndFileOffset(1).contains((1, sqr(1))))
+    assert(bt.queryArrayPositionAndFileOffset(2).contains((2, sqr(2))))
+    assert(bt.queryArrayPositionAndFileOffset(3).contains((2, sqr(2))))
+    assert(bt.queryArrayPositionAndFileOffset(4).contains((2, sqr(2))))
+    assert(bt.queryArrayPositionAndFileOffset(5).contains((3, sqr(3))))
   }
 
   @Test def queryArrayPositionAndFileOffsetIsCorrectThreeLevelsArray() {
     def sqr(x: Long) = x * x
-    val f = tmpDir.createTempFile(prefix = "btree")
+    val f = ctx.createTmpPath("btree")
     val v = Array.tabulate(1024 * 1024 + 1)(x => sqr(x))
     val branchingFactor = 1024
-    IndexBTree.write(v, f, hadoopConf, branchingFactor = branchingFactor)
-    val bt = new IndexBTree(f, hadoopConf, branchingFactor = branchingFactor)
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1022)) == Some(1022, sqr(1022)))
+    IndexBTree.write(v, f, fs, branchingFactor = branchingFactor)
+    val bt = new IndexBTree(f, fs, branchingFactor = branchingFactor)
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1022)).contains((1022, sqr(1022))))
 
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1022) + 1) == Some(1023, sqr(1023)))
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1023) - 1) == Some(1023, sqr(1023)))
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1023)) == Some(1023, sqr(1023)))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1022) + 1).contains((1023, sqr(1023))))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1023) - 1).contains((1023, sqr(1023))))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1023)).contains((1023, sqr(1023))))
 
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1023) + 1) == Some(1024, sqr(1024)))
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1024) - 1) == Some(1024, sqr(1024)))
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1024)) == Some(1024, sqr(1024)))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1023) + 1).contains((1024, sqr(1024))))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1024) - 1).contains((1024, sqr(1024))))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1024)).contains((1024, sqr(1024))))
 
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1024) + 1) == Some(1025, sqr(1025)))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1024) + 1).contains((1025, sqr(1025))))
 
-    assert(bt.queryArrayPositionAndFileOffset(0) == Some(0, sqr(0)))
-    assert(bt.queryArrayPositionAndFileOffset(1) == Some(1, sqr(1)))
-    assert(bt.queryArrayPositionAndFileOffset(2) == Some(2, sqr(2)))
-    assert(bt.queryArrayPositionAndFileOffset(3) == Some(2, sqr(2)))
-    assert(bt.queryArrayPositionAndFileOffset(4) == Some(2, sqr(2)))
-    assert(bt.queryArrayPositionAndFileOffset(5) == Some(3, sqr(3)))
+    assert(bt.queryArrayPositionAndFileOffset(0).contains((0, sqr(0))))
+    assert(bt.queryArrayPositionAndFileOffset(1).contains((1, sqr(1))))
+    assert(bt.queryArrayPositionAndFileOffset(2).contains((2, sqr(2))))
+    assert(bt.queryArrayPositionAndFileOffset(3).contains((2, sqr(2))))
+    assert(bt.queryArrayPositionAndFileOffset(4).contains((2, sqr(2))))
+    assert(bt.queryArrayPositionAndFileOffset(5).contains((3, sqr(3))))
 
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1024 * 1024 - 1)) == Some(1024 * 1024 - 1, sqr(1024 * 1024 - 1)))
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1024 * 1024 - 1) + 1) == Some(1024 * 1024, sqr(1024 * 1024)))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1024 * 1024 - 1)).contains((1024 * 1024 - 1, sqr(1024 * 1024 - 1))))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1024 * 1024 - 1) + 1).contains((1024 * 1024, sqr(1024 * 1024))))
 
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1024 * 1024)) == Some(1024 * 1024, sqr(1024 * 1024)))
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1024 * 1024) - 1) == Some(1024 * 1024, sqr(1024 * 1024)))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1024 * 1024)).contains((1024 * 1024, sqr(1024 * 1024))))
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1024 * 1024) - 1).contains((1024 * 1024, sqr(1024 * 1024))))
 
-    assert(bt.queryArrayPositionAndFileOffset(sqr(1024 * 1024) + 1) == None)
+    assert(bt.queryArrayPositionAndFileOffset(sqr(1024 * 1024) + 1).isEmpty)
   }
 
   @Test def onDiskBTreeIndexToValueSmallCorrect() {
-    val f = tmpDir.createTempFile()
+    val f = ctx.createTmpPath("btree")
     val v = Array[Long](1, 2, 3, 4, 5, 6, 7)
     val branchingFactor = 3
     try {
-      IndexBTree.write(v, f, hadoopConf, branchingFactor)
-      val bt = new OnDiskBTreeIndexToValue(f, hadoopConf, branchingFactor)
+      IndexBTree.write(v, f, fs, branchingFactor)
+      val bt = new OnDiskBTreeIndexToValue(f, fs, branchingFactor)
       assert(bt.positionOfVariants(Array()) sameElements Array[Long]())
       assert(bt.positionOfVariants(Array(5)) sameElements Array(6L))
 
@@ -244,10 +240,10 @@ class IndexBTreeSuite extends SparkSuite {
       branchingFactor <- choose(2, 1024)
     } yield (indices, longs, branchingFactor)
     forAll(g) { case (indices, longs, branchingFactor) =>
-      val f = tmpDir.createTempFile()
+      val f = ctx.createTmpPath("test")
       try {
-        IndexBTree.write(longs, f, hadoopConf, branchingFactor)
-        val bt = new OnDiskBTreeIndexToValue(f, hadoopConf, branchingFactor)
+        IndexBTree.write(longs, f, fs, branchingFactor)
+        val bt = new OnDiskBTreeIndexToValue(f, fs, branchingFactor)
         val actual = bt.positionOfVariants(indices.toArray)
         val expected = indices.sorted.map(longs)
         assert(actual sameElements expected,
@@ -265,11 +261,11 @@ class IndexBTreeSuite extends SparkSuite {
   @Test def onDiskBTreeIndexToValueFourLayers() {
     val longs = Array.tabulate(3 * 3 * 3 * 3)(x => x.toLong)
     val indices = Array(0, 3, 10, 20, 26, 27, 34, 55, 79, 80)
-    val f = tmpDir.createTempFile()
+    val f = ctx.createTmpPath("btree")
     val branchingFactor = 3
     try {
-      IndexBTree.write(longs, f, hadoopConf, branchingFactor)
-      val bt = new OnDiskBTreeIndexToValue(f, hadoopConf, branchingFactor)
+      IndexBTree.write(longs, f, fs, branchingFactor)
+      val bt = new OnDiskBTreeIndexToValue(f, fs, branchingFactor)
       val expected = indices.sorted.map(longs)
       val actual = bt.positionOfVariants(indices.toArray)
       assert(actual sameElements expected,

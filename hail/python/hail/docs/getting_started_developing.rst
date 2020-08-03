@@ -1,161 +1,70 @@
 For Software Developers
 -----------------------
 
-Hail is an open-source project. We welcome contributions to the repository. If you're interested
-in contributing to Hail, you will need to build your own Hail JAR and set up the testing environment.
+Hail is an open-source project. We welcome contributions to the repository.
 
 Requirements
 ~~~~~~~~~~~~
 
-You'll need:
+- `Java 8 JDK <https://adoptopenjdk.net/index.html>`_
+  Note: it *must* be Java **8**. Hail does not support versions 9+ due to our
+  dependency on Spark.
 
-- `Java 8 JDK <http://www.oracle.com/technetwork/java/javase/downloads/jdk8-downloads-2133151.html>`_
-- `Spark 2.2.0 <https://www.apache.org/dyn/closer.lua/spark/spark-2.2.0/spark-2.2.0-bin-hadoop2.7.tgz>`_
+- The Python and non-pip installation requirements in `Getting Started <getting_started.html>`_
 
-  - Hail will work with other bug fix versions of Spark 2.2.x, but it *will not* work with Spark 1.x.x, 2.0.x, or 2.1.x.
 
-- `Anaconda for Python 3 <https://www.anaconda.com/download>`_
-
-Building a Hail JAR
-~~~~~~~~~~~~~~~~~~~
-
-To build Hail from source, you will need a C++ compiler and lz4. On a Debian-based OS like Ubuntu, a C++ compiler can be installed with apt-get::
-
-    sudo apt-get install g++
-
-On Mac OS X, a C++ compiler is provided by the Apple Xcode::
-
-    xcode-select --install
-
-To install lz4 on a Debian-based OS, run::
-    
-    sudo apt-get install liblz4-dev
-
-On Mac OS X, ensure you have Homebrew and run::
-    
-    brew install lz4
+Building Hail
+~~~~~~~~~~~~~
 
 The Hail source code is hosted `on GitHub <https://github.com/hail-is/hail>`_::
 
     git clone https://github.com/hail-is/hail.git
     cd hail/hail
 
-A Hail JAR can be built using Gradle. Note that every Hail JAR is specific to
-one version of Spark::
+By default, Hail uses pre-compiled native libraries that are compatible with
+recent Mac OS X and Debian releases. If you're not using one of these OSes, set
+the environment (or Make) variable `HAIL_COMPILE_NATIVES` to any value. This
+variable tells GNU Make to build the native libraries from source.
 
-    ./gradlew -Dspark.version=2.2.0 shadowJar
+Build and install a wheel file from source with local-mode ``pyspark``::
 
+    make install HAIL_COMPILE_NATIVES=1
 
-Environment Variables and Conda Environments
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+As above, but explicitly specifying the Scala and Spark versions::
 
-You will need to set some environment variables so that Hail can find Spark, Spark can find Hail, and Python can find Hail. Add these lines to your ``.bashrc`` or equivalent, setting ``SPARK_HOME`` to the root directory of a Spark installation and ``HAIL_HOME`` to the root of the Hail repository::
+    make install HAIL_COMPILE_NATIVES=1 SCALA_VERSION=2.11.12 SPARK_VERSION=2.4.5
 
-    export SPARK_HOME=/path/to/spark
-    export HAIL_HOME=/path/to/hail/hail
-    export PYTHONPATH="$PYTHONPATH:$HAIL_HOME/python:$SPARK_HOME/python:`echo $SPARK_HOME/python/lib/py4j*-src.zip`"
-    export SPARK_CLASSPATH=$HAIL_HOME/build/libs/hail-all-spark.jar
-    export PYSPARK_SUBMIT_ARGS="--conf spark.driver.extraClassPath=$SPARK_CLASSPATH --conf spark.executor.extraClassPath=$SPARK_CLASSPATH --driver-memory 8G pyspark-shell"
+Building the Docs and Website
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+Build without testing the documentation examples::
 
-Hail uses `conda environments <https://conda.io/docs/using/envs.html>`_ to
-manage some of hail's python dependencies. First, create a conda
-environment for hail:
+    make docs-no-test
 
-.. code-block:: bash
+Build while testing the documentation examples (significantly slower)::
 
-    conda env create -f ./python/hail/dev-environment.yml
+    make docs
 
-Activate the environment
+Serve the built website on http://localhost:8000/ ::
 
-.. code-block:: bash
-
-    source activate hail
-
-Now the shell prompt should include the name of the environment, in this case
-"hail".
-
-Now you can import hail from a python interpreter::
-
-    $ python
-    Python 3.6.5 |Anaconda, Inc.| (default, Mar 29 2018, 13:14:23)
-    [GCC 4.2.1 Compatible Clang 4.0.1 (tags/RELEASE_401/final)] on darwin
-    Type "help", "copyright", "credits" or "license" for more information.
-
-    >>> import hail as hl
-
-    >>> hl.init() # doctest: +SKIP
-    Using Spark's default log4j profile: org/apache/spark/log4j-defaults.properties
-    Setting default log level to "WARN".
-    To adjust logging level use sc.setLogLevel(newLevel). For SparkR, use setLogLevel(newLevel).
-    Running on Apache Spark version 2.2.0
-    SparkUI available at http://10.1.6.36:4041
-    Welcome to
-         __  __     <>__
-        / /_/ /__  __/ /
-       / __  / _ `/ / /
-      /_/ /_/\_,_/_/_/   version devel-9f866ba
-    NOTE: This is a beta version. Interfaces may change
-      during the beta period. We also recommend pulling
-      the latest changes weekly.
-
-    >>>
-
-
-When you are finished developing hail, disable the environment
-
-.. code-block:: bash
-
-    source deactivate hail
-
-The ``dev-environment.yml`` file may change without warning; therefore, after
-pulling new changes from a remote repository, we always recommend updating the
-conda environment
-
-.. code-block:: bash
-
-    conda env update hail -f ./python/hail/dev-environment.yml
-
-
-Building the Docs
-~~~~~~~~~~~~~~~~~
-
-Within the "hail" environment, run the ``makeDocs`` gradle task:
-
-.. code-block:: bash
-
-    ./gradlew makeDocs
-
-The generated docs are located at ``./build/www/docs/0.2/index.html``.
+    (cd build/www && python3 -m http.server)
 
 
 Running the tests
 ~~~~~~~~~~~~~~~~~
 
-Several Hail tests have additional dependencies:
+Install development dependencies::
 
- - `PLINK 1.9 <http://www.cog-genomics.org/plink2>`_
+    make install-dev-deps
 
- - `QCTOOL 1.4 <http://www.well.ox.ac.uk/~gav/qctool>`_
+A couple Hail tests compare to PLINK 1.9 (not PLINK 2.0 [ignore the confusing
+URL]):
 
- - `R 3.3.4 <http://www.r-project.org/>`_ with CRAN packages ``jsonlite``, ``SKAT`` and ``logistf``,
-   as well as `pcrelate <https://www.rdocumentation.org/packages/GENESIS/versions/2.2.2/topics/pcrelate>`__
-   from the `GENESIS <https://bioconductor.org/packages/release/bioc/html/GENESIS.html>`__ *Bioconductor* package.
-   These can be installed within R using:
+ - `PLINK 1.9 <https://www.cog-genomics.org/plink2>`_
 
-   .. code-block:: R
+Execute every Hail test using at most 8 parallel threads::
 
-      install.packages(c("jsonlite", "SKAT", "logistf"))
-      source("https://bioconductor.org/biocLite.R")
-      biocLite("GENESIS")
-      biocLite("SNPRelate")
-      biocLite("GWASTools")
-
-To execute all Hail tests, run:
-
-.. code-block:: bash
-
-    ./gradlew -Dspark.version=${SPARK_VERSION} -Dspark.home=${SPARK_HOME} test
+    make -j8 test
 
 Contributing
 ~~~~~~~~~~~~
@@ -170,7 +79,5 @@ Keep in mind the following principles when submitting a pull request:
 - Before submitting your PR, you should rebase onto the latest master.
 - PRs must pass all tests before being merged. See the section above on `Running the tests`_ locally.
 - PRs require a review before being merged. We will assign someone from our dev team to review your PR.
-- Code in PRs should be formatted according to the style in ``code_style.xml``.
-  This file can be loaded into Intellij to automatically format your code.
 - When you make a PR, include a short message that describes the purpose of the
   PR and any necessary context for the changes you are making.

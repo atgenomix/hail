@@ -1,78 +1,55 @@
 package is.hail.expr.ir.functions
 
 import is.hail.annotations.Region
-import is.hail.asm4s._
-import is.hail.expr.ir.EmitMethodBuilder
-import is.hail.expr.types._
-import is.hail.expr.types.physical.PArray
-import is.hail.expr.types.virtual.{TArray, TFloat64, TInt32}
-import is.hail.utils._
-import is.hail.variant.Genotype
+import is.hail.asm4s.{coerce => _, _}
+import is.hail.types.{coerce => _, _}
+import is.hail.expr.ir._
+import is.hail.types.physical.{PArray, PCode, PFloat64, PIndexableCode, PInt32, PType}
+import is.hail.types.virtual.{TArray, TFloat64, TInt32, Type}
 
 object GenotypeFunctions extends RegistryFunctions {
 
   def registerAll() {
-    registerCode("gqFromPL", TArray(tv("N", "int32")), TInt32()) { (mb, pl: Code[Long]) =>
-      val region = getRegion(mb)
-      val tPL = PArray(tv("N").t.physicalType)
-      val m = mb.newLocal[Int]("m")
-      val m2 = mb.newLocal[Int]("m2")
-      val len = mb.newLocal[Int]("len")
-      val pli = mb.newLocal[Int]("pli")
-      val i = mb.newLocal[Int]("i")
-      Code(
-        m := 99,
-        m2 := 99,
-        len := tPL.loadLength(region, pl),
-        i := 0,
-        Code.whileLoop(i < len,
-          tPL.isElementDefined(region, pl, i).mux(
-            Code._empty,
-            Code._fatal("PL cannot have missing elements.")),
-          pli := region.loadInt(tPL.loadElement(region, pl, i)),
-          (pli < m).mux(
-            Code(m2 := m, m := pli),
-            (pli < m2).mux(
-              m2 := pli,
-              Code._empty)),
-          i := i + 1
-        ),
+    registerPCode1("gqFromPL", TArray(tv("N", "int32")), TInt32, (_: Type, _: PType) => PInt32())
+    { case (r, rt, _pl: PIndexableCode) =>
+      val code = EmitCodeBuilder.scopedCode(r.mb) { cb =>
+        val pl = _pl.memoize(cb, "plv")
+        val m = cb.newLocal[Int]("m", 99)
+        val m2 = cb.newLocal[Int]("m2", 99)
+        val i = cb.newLocal[Int]("i", 0)
+
+        cb.whileLoop(i < pl.loadLength(), {
+          val value = pl.loadElement(cb, i)
+            .handle(cb, cb += Code._fatal[Unit]("PL cannot have missing elements."))
+          val pli = cb.newLocal[Int]("pli", value.tcode[Int])
+          cb.ifx(pli < m, {
+            cb.assign(m2, m)
+            cb.assign(m, pli)
+          }, {
+            cb.ifx(pli < m2,
+              cb.assign(m2, pli))
+          })
+          cb.assign(i, i + 1)
+        })
         m2 - m
-      )
+      }
+      PCode(rt, code)
     }
 
-    registerCode("dosage", TArray(tv("N", "float64")), TFloat64()) { (mb, gpOff: Code[Long]) =>
-      def getRegion(mb: EmitMethodBuilder): Code[Region] = mb.getArg[Region](1)
-      val pArray = TArray(tv("N").t).physicalType
-      val gp = mb.newLocal[Long]
-      val region = getRegion(mb)
-      val len = pArray.loadLength(region, gp)
+    registerIEmitCode1("dosage", TArray(tv("N", "float64")), TFloat64,  (_: Type, _: PType) => PFloat64()
+    ) { case (cb, r, rt, gp) =>
+      gp.flatMap(cb) { case (gpc: PIndexableCode) =>
+        val gpv = gpc.memoize(cb, "dosage_gp")
 
-      Code(
-        gp := gpOff,
-        len.cne(3).mux(
-          Code._fatal(const("length of gp array must be 3, got ").concat(len.toS)),
-          region.loadDouble(pArray.elementOffset(gp, 3, 1)) +
-            region.loadDouble(pArray.elementOffset(gp, 3, 2)) * 2.0))
-    }
+        cb.ifx(gpv.loadLength().cne(3),
+          cb._fatal(const("length of gp array must be 3, got ").concat(gpv.loadLength().toS)))
 
-    // FIXME: remove when SkatSuite is moved to Python
-    // the pl_dosage function in Python is implemented in Python
-    registerCode("plDosage", TArray(tv("N", "int32")), TFloat64()) { (mb, plOff: Code[Long]) =>
-      def getRegion(mb: EmitMethodBuilder): Code[Region] = mb.getArg[Region](1)
-      val pArray = TArray(tv("N").t).physicalType
-      val pl = mb.newLocal[Long]
-      val region = getRegion(mb)
-      val len = pArray.loadLength(region, pl)
-
-      Code(
-        pl := plOff,
-        len.cne(3).mux(
-          Code._fatal(const("length of pl array must be 3, got ").concat(len.toS)),
-          Code.invokeScalaObject[Int, Int, Int, Double](Genotype.getClass, "plToDosage",
-            region.loadInt(pArray.elementOffset(pl, 3, 0)),
-            region.loadInt(pArray.elementOffset(pl, 3, 1)),
-            region.loadInt(pArray.elementOffset(pl, 3, 2)))))
+        gpv.loadElement(cb, 1).flatMap(cb) { (_1: PCode) =>
+          gpv.loadElement(cb, 2).map(cb) { (_2: PCode) =>
+            PCode(rt, _1.tcode[Double] + _2.tcode[Double] * 2.0)
+          }
+        }
+      }
     }
   }
 }

@@ -1,24 +1,25 @@
 import os
 import threading
 import time
-
 import requests
 from werkzeug.serving import make_server
 from flask import Response
 
+from hailtop.utils import retry_response_returning_functions
+
 
 class ServerThread(threading.Thread):
-    def __init__(self, app, host=None, port=5869):
+    def __init__(self, app):
         super().__init__()
 
         @app.route('/ping', methods=['GET'])
         def ping():
             return Response(status=200)
 
-        self.host = host or os.environ.get('POD_IP', '127.0.0.1')
-        self.port = port
+        self.host = os.environ['HAIL_BATCH_WORKER_IP']
+        self.port = os.environ['HAIL_BATCH_WORKER_PORT']
         self.app = app
-        self.server = make_server(self.host, self.port, app)
+        self.server = make_server('0.0.0.0', 5000, app)
         self.context = app.app_context()
         self.context.push()
 
@@ -31,7 +32,8 @@ class ServerThread(threading.Thread):
         up = False
         while not up:
             try:
-                requests.get(ping_url)
+                retry_response_returning_functions(
+                    requests.get, ping_url)
                 up = True
             except requests.exceptions.ConnectionError:
                 time.sleep(0.01)

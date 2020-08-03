@@ -1,21 +1,21 @@
 package is.hail.expr.ir
 
 import is.hail.asm4s._
-import is.hail.expr.types.physical.PType
-import is.hail.expr.types.virtual.Type
+import is.hail.types.physical.{PType, PCode}
+import is.hail.types.virtual.Type
 
 import scala.reflect.ClassTag
 
-class StagedArrayBuilder(val elt: PType, mb: MethodBuilder, len: Code[Int]) {
+class StagedArrayBuilder(val elt: PType, mb: EmitMethodBuilder[_], len: Code[Int]) {
 
   val ti: TypeInfo[_] = typeToTypeInfo(elt)
 
-  val ref: Settable[Any] = coerce[Any](ti match {
-    case BooleanInfo => mb.newLazyField[BooleanArrayBuilder]("zab")(Code.newInstance[BooleanArrayBuilder, Int](len))
-    case IntInfo => mb.newLazyField[IntArrayBuilder]("iab")(Code.newInstance[IntArrayBuilder, Int](len))
-    case LongInfo => mb.newLazyField[LongArrayBuilder]("jab")(Code.newInstance[LongArrayBuilder, Int](len))
-    case FloatInfo => mb.newLazyField[FloatArrayBuilder]("fab")(Code.newInstance[FloatArrayBuilder, Int](len))
-    case DoubleInfo => mb.newLazyField[DoubleArrayBuilder]("dab")(Code.newInstance[DoubleArrayBuilder, Int](len))
+  val ref: Value[Any] = coerce[Any](ti match {
+    case BooleanInfo => mb.genLazyFieldThisRef[BooleanArrayBuilder](Code.newInstance[BooleanArrayBuilder, Int](len), "zab")
+    case IntInfo => mb.genLazyFieldThisRef[IntArrayBuilder](Code.newInstance[IntArrayBuilder, Int](len), "iab")
+    case LongInfo => mb.genLazyFieldThisRef[LongArrayBuilder](Code.newInstance[LongArrayBuilder, Int](len), "jab")
+    case FloatInfo => mb.genLazyFieldThisRef[FloatArrayBuilder](Code.newInstance[FloatArrayBuilder, Int](len), "fab")
+    case DoubleInfo => mb.genLazyFieldThisRef[DoubleArrayBuilder](Code.newInstance[DoubleArrayBuilder, Int](len), "dab")
     case ti => throw new RuntimeException(s"unsupported typeinfo found: $ti")
   })
 
@@ -76,7 +76,19 @@ class StagedArrayBuilder(val elt: PType, mb: MethodBuilder, len: Code[Int]) {
 
   def setSize(n: Code[Int]): Code[Unit] = coerce[MissingArrayBuilder](ref).invoke[Int, Unit]("setSize", n)
 
+  def ensureCapacity(n: Code[Int]): Code[Unit] = coerce[MissingArrayBuilder](ref).invoke[Int, Unit]("ensureCapacity", n)
+
   def clear: Code[Unit] = coerce[MissingArrayBuilder](ref).invoke[Unit]("clear")
+
+  def applyEV(mb: EmitMethodBuilder[_], i: Code[Int]): EmitValue =
+    new EmitValue {
+      def pt: PType = elt
+
+      def get: EmitCode = {
+        val t = mb.newLocal[Int]("sab_applyEV_i")
+        EmitCode(t := i, isMissing(t), PCode(elt, apply(t)))
+      }
+    }
 }
 
 sealed abstract class MissingArrayBuilder(initialCapacity: Int) {
@@ -144,7 +156,6 @@ class IntArrayBuilder(initialCapacity: Int) extends MissingArrayBuilder(initialC
     b(i) = x
     missing(i) = false
   }
-
 
   def sort(ordering: AsmFunction2[Int, Int, Boolean]): Unit = {
     var newend = 0
@@ -406,4 +417,46 @@ class BooleanArrayBuilder(initialCapacity: Int) extends MissingArrayBuilder(init
       i += 1
     }
   }
+}
+
+class ByteArrayArrayBuilder(initialCapacity: Int) {
+
+  var size_ : Int = 0
+  private var b: Array[Array[Byte]] = new Array[Array[Byte]](initialCapacity)
+
+  def size: Int = size_
+
+  def setSize(n: Int) {
+    require(n >= 0 && n <= size)
+    size_ = n
+  }
+
+  def apply(i: Int): Array[Byte] = {
+    require(i >= 0 && i < size)
+    b(i)
+  }
+
+  def ensureCapacity(n: Int): Unit = {
+    if (b.length < n) {
+      val newCapacity = (b.length * 2).max(n)
+      val newb = new Array[Array[Byte]](newCapacity)
+      Array.copy(b, 0, newb, 0, size_)
+      b = newb
+    }
+  }
+
+  def add(x: Array[Byte]): Unit = {
+    ensureCapacity(size_ + 1)
+    b(size_) = x
+    size_ += 1
+  }
+
+  def update(i: Int, x: Array[Byte]): Unit = {
+    require(i >= 0 && i < size)
+    b(i) = x
+  }
+
+  def clear() {  size_ = 0 }
+
+  def result(): Array[Array[Byte]] = b.slice(0, size_)
 }

@@ -1,43 +1,37 @@
 package is.hail.expr.ir
 
+import is.hail.ExecStrategy
 import is.hail.TestUtils._
 import is.hail.expr.ir.TestUtils._
+import is.hail.types.virtual.TFloat64
+import is.hail.utils.FastIndexedSeq
 import org.testng.annotations.{DataProvider, Test}
 import org.scalatest.testng.TestNGSuite
 
 class GenotypeFunctionsSuite extends TestNGSuite {
 
+  implicit val execStrats = ExecStrategy.javaOnly
+
   @DataProvider(name="gps")
   def gpData(): Array[Array[Any]] = Array(
-    Array(IndexedSeq(1.0, 0.0, 0.0), 0.0),
-    Array(IndexedSeq(0.0, 1.0, 0.0), 1.0),
-    Array(IndexedSeq(0.0, 0.0, 1.0), 2.0),
-    Array(IndexedSeq(0.5, 0.5, 0.0), 0.5),
-    Array(IndexedSeq(0.0, 0.5, 0.5), 1.5))
-
-  @DataProvider(name="pls")
-  def plData(): Array[Array[Any]] = Array(
-    Array(IndexedSeq(0, 20, 100), 0.009900990296049406),
-    Array(IndexedSeq(20, 0, 100), 0.9900990100009803),
-    Array(IndexedSeq(20, 100, 0), 1.980198019704931))
+    Array(FastIndexedSeq(1.0, 0.0, 0.0), 0.0),
+    Array(FastIndexedSeq(0.0, 1.0, 0.0), 1.0),
+    Array(FastIndexedSeq(0.0, 0.0, 1.0), 2.0),
+    Array(FastIndexedSeq(0.5, 0.5, 0.0), 0.5),
+    Array(FastIndexedSeq(0.0, 0.5, 0.5), 1.5),
+    Array(null, null),
+    Array(FastIndexedSeq(null, null, null), null),
+    Array(FastIndexedSeq(null, 0.5, 0.5), 1.5),
+    Array(FastIndexedSeq(0.0, null, 1.0), null),
+    Array(FastIndexedSeq(0.0, 0.5, null), null))
 
   @Test(dataProvider="gps")
   def testDosage(gp: IndexedSeq[java.lang.Double], expected: java.lang.Double) {
-    assertEvalsTo(invoke("dosage", toIRDoubleArray(gp)), expected)
+    assertEvalsTo(invoke("dosage", TFloat64, toIRDoubleArray(gp)), expected)
   }
 
-  @Test(dataProvider="pls")
-  def testPLDosage(pl: IndexedSeq[Integer], expected: java.lang.Double) {
-    assertEvalsTo(invoke("plDosage", toIRArray(pl)), expected)
-  }
-
-  def testDosageLength() {
-    assertFatal(invoke("dosage", IRDoubleArray(1.0, 1.5)), "length")
-    assertFatal(invoke("dosage", IRDoubleArray(1.0, 1.5, 0.0, 0.0)), "length")
-  }
-
-  def testPLDosageLength() {
-    assertFatal(invoke("plDosage", IRArray(1, 2)), "length")
-    assertFatal(invoke("plDosage", IRArray(1, 2, 0, 0)), "length")
+  @Test def testDosageLength() {
+    assertFatal(invoke("dosage", TFloat64, IRDoubleArray(1.0, 1.5)), "length")
+    assertFatal(invoke("dosage", TFloat64, IRDoubleArray(1.0, 1.5, 0.0, 0.0)), "length")
   }
 }

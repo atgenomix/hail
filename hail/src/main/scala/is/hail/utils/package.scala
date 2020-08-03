@@ -3,8 +3,12 @@ package is.hail
 import java.io._
 import java.lang.reflect.Method
 import java.net.{URI, URLClassLoader}
-import java.util.zip.Inflater
+import java.security.SecureRandom
+import java.text.SimpleDateFormat
+import java.util.{Base64, Date}
+import java.util.zip.{Deflater, Inflater}
 
+import is.hail.annotations.ExtendedOrdering
 import is.hail.check.Gen
 import org.apache.commons.io.output.TeeOutputStream
 import org.apache.commons.lang3.StringUtils
@@ -13,15 +17,62 @@ import org.apache.hadoop.mapred.FileSplit
 import org.apache.hadoop.mapreduce.lib.input.{FileSplit => NewFileSplit}
 import org.apache.log4j.Level
 import org.apache.spark.{Partition, TaskContext}
-import org.json4s.JsonAST.JArray
+import org.json4s.JsonAST.{JArray, JString}
 import org.json4s.jackson.Serialization
 import org.json4s.reflect.TypeInfo
-import org.json4s.{Extraction, Formats, NoTypeHints, Serializer}
+import org.json4s.{Extraction, Formats, JObject, NoTypeHints, Serializer}
 
 import scala.collection.generic.CanBuildFrom
 import scala.collection.{GenTraversableOnce, TraversableOnce, mutable}
 import scala.language.{higherKinds, implicitConversions}
 import scala.reflect.ClassTag
+import is.hail.io.fs.FS
+
+package utils {
+  trait Truncatable {
+    def truncate: String
+
+    def strings: (String, String)
+  }
+
+  sealed trait FlattenOrNull[C[_] >: Null] {
+    def apply[T >: Null](b: mutable.Builder[T, C[T]], it: Iterable[Iterable[T]]): C[T] = {
+      for (elt <- it) {
+        if (elt == null)
+          return null
+        b ++= elt
+      }
+      b.result()
+    }
+  }
+
+  sealed trait AnyFailAllFail[C[_]] {
+    def apply[T](ts: TraversableOnce[Option[T]])(implicit cbf: CanBuildFrom[Nothing, T, C[T]]): Option[C[T]] = {
+      val b = cbf()
+      for (t <- ts) {
+        if (t.isEmpty)
+          return None
+        else
+          b += t.get
+      }
+      Some(b.result())
+    }
+  }
+
+  sealed trait MapAccumulate[C[_], U] {
+    def apply[T, S](a: Iterable[T], z: S)(f: (T, S) => (U, S))
+      (implicit uct: ClassTag[U], cbf: CanBuildFrom[Nothing, U, C[U]]): C[U] = {
+      val b = cbf()
+      var acc = z
+      for ((x, i) <- a.zipWithIndex) {
+        val (y, newAcc) = f(x, acc)
+        b += y
+        acc = newAcc
+      }
+      b.result()
+    }
+  }
+}
 
 package object utils extends Logging
   with richUtils.Implicits
@@ -33,15 +84,33 @@ package object utils extends Logging
   def getStderrAndLogOutputStream[T](implicit tct: ClassTag[T]): OutputStream =
     new TeeOutputStream(new LoggerOutputStream(log, Level.ERROR), System.err)
 
-  trait Truncatable {
-    def truncate: String
-
-    def strings: (String, String)
-  }
-
   def format(s: String, substitutions: Any*): String = {
     substitutions.zipWithIndex.foldLeft(s) { case (str, (value, i)) =>
       str.replace(s"@${ i + 1 }", value.toString)
+    }
+  }
+
+  def checkGzippedFile(fs: FS,
+    input: String,
+    forceGZ: Boolean,
+    gzAsBGZ: Boolean,
+    maxSizeMB: Int = 128) {
+    if (!forceGZ && !gzAsBGZ)
+      fatal(
+        s"""Cannot load file '$input'
+           |  .gz cannot be loaded in parallel. Is the file actually *block* gzipped?
+           |  If the file is actually block gzipped (even though its extension is .gz),
+           |  use the 'force_bgz' argument to treat all .gz file extensions as .bgz.
+           |  If you are sure that you want to load a non-block-gzipped file serially
+           |  on one core, use the 'force' argument.""".stripMargin)
+    else if (!gzAsBGZ) {
+      val fileSize = fs.getFileSize(input)
+      if (fileSize > 1024 * 1024 * maxSizeMB)
+        warn(
+          s"""file '$input' is ${ readableBytes(fileSize) }
+             |  It will be loaded serially (on one core) due to usage of the 'force' argument.
+             |  If it is actually block-gzipped, either rename to .bgz or use the 'force_bgz'
+             |  argument.""".stripMargin)
     }
   }
 
@@ -59,8 +128,15 @@ package object utils extends Logging
 
   def triangle(n: Int): Int = (n * (n + 1)) / 2
 
-  def treeAggDepth(hc: HailContext, nPartitions: Int): Int =
-    (math.log(nPartitions) / math.log(hc.branchingFactor) + 0.5).toInt.max(1)
+  def treeAggDepth(nPartitions: Int, branchingFactor: Int): Int = {
+    require(nPartitions >= 0)
+    require(branchingFactor > 0)
+
+    if (nPartitions == 0)
+      return 1
+
+    math.ceil(math.log(nPartitions) / math.log(branchingFactor)).toInt
+  }
 
   def simpleAssert(p: Boolean) {
     if (!p) throw new AssertionError
@@ -205,7 +281,7 @@ package object utils extends Logging
 
     fname match {
       case partRegex(i) => i.toInt
-      case _ => throw new PathIOException(s"invalid partition file `$fname'")
+      case _ => throw new PathIOException(s"invalid partition file '$fname'")
     }
   }
 
@@ -225,35 +301,11 @@ package object utils extends Logging
 
   def uriPath(uri: String): String = new URI(uri).getPath
 
-  sealed trait FlattenOrNull[C[_] >: Null] {
-    def apply[T >: Null](b: mutable.Builder[T, C[T]], it: Iterable[Iterable[T]]): C[T] = {
-      for (elt <- it) {
-        if (elt == null)
-          return null
-        b ++= elt
-      }
-      b.result()
-    }
-  }
-
   // NB: can't use Nothing here because it is not a super type of Null
   private object flattenOrNullInstance extends FlattenOrNull[Array]
 
   def flattenOrNull[C[_] >: Null] =
     flattenOrNullInstance.asInstanceOf[FlattenOrNull[C]]
-
-  sealed trait AnyFailAllFail[C[_]] {
-    def apply[T](ts: TraversableOnce[Option[T]])(implicit cbf: CanBuildFrom[Nothing, T, C[T]]): Option[C[T]] = {
-      val b = cbf()
-      for (t <- ts) {
-        if (t.isEmpty)
-          return None
-        else
-          b += t.get
-      }
-      Some(b.result())
-    }
-  }
 
   private object anyFailAllFailInstance extends AnyFailAllFail[Nothing]
 
@@ -261,20 +313,6 @@ package object utils extends Logging
     anyFailAllFailInstance.asInstanceOf[AnyFailAllFail[C]]
 
   def uninitialized[T]: T = null.asInstanceOf[T]
-
-  sealed trait MapAccumulate[C[_], U] {
-    def apply[T, S](a: Iterable[T], z: S)(f: (T, S) => (U, S))
-      (implicit uct: ClassTag[U], cbf: CanBuildFrom[Nothing, U, C[U]]): C[U] = {
-      val b = cbf()
-      var acc = z
-      for ((x, i) <- a.zipWithIndex) {
-        val (y, newAcc) = f(x, acc)
-        b += y
-        acc = newAcc
-      }
-      b.result()
-    }
-  }
 
   private object mapAccumulateInstance extends MapAccumulate[Nothing, Nothing]
 
@@ -415,25 +453,6 @@ package object utils extends Logging
 
   val defaultJSONFormats: Formats = Serialization.formats(NoTypeHints) + GenericIndexedSeqSerializer
 
-  def splitWarning(leftSplit: Boolean, left: String, rightSplit: Boolean, right: String) {
-    val msg =
-      """Merge behavior may not be as expected, as all alternate alleles are
-        |  part of the variant key.  See `annotatevariants' documentation for
-        |  more information.""".stripMargin
-    (leftSplit, rightSplit) match {
-      case (true, true) =>
-      case (false, false) => warn(
-        s"""annotating an unsplit $left from an unsplit $right
-           |  $msg""".stripMargin)
-      case (true, false) => warn(
-        s"""annotating a biallelic (split) $left from an unsplit $right
-           |  $msg""".stripMargin)
-      case (false, true) => warn(
-        s"""annotating an unsplit $left from a biallelic (split) $right
-           |  $msg""".stripMargin)
-    }
-  }
-
   def box(i: Int): java.lang.Integer = i
 
   def box(l: Long): java.lang.Long = l
@@ -467,7 +486,7 @@ package object utils extends Logging
 
   def loadFromResource[T](file: String)(reader: (InputStream) => T): T = {
     val resourceStream = Thread.currentThread().getContextClassLoader.getResourceAsStream(file)
-    assert(resourceStream != null, s"Error while locating file `$file'")
+    assert(resourceStream != null, s"Error while locating file '$file'")
 
     try
       reader(resourceStream)
@@ -541,17 +560,19 @@ package object utils extends Logging
       1 + digitsNeeded(i / 10)
   }
 
-  def partFile(d: Int, i: Int): String = {
+  def partFile(numDigits: Int, i: Int): String = {
     val is = i.toString
-    assert(is.length <= d)
-    "part-" + StringUtils.leftPad(is, d, "0")
+    assert(is.length <= numDigits)
+    "part-" + StringUtils.leftPad(is, numDigits, "0")
   }
 
-  def partFile(d: Int, i: Int, ctx: TaskContext): String = {
+  def partSuffix(ctx: TaskContext): String = {
     val rng = new java.security.SecureRandom()
     val fileUUID = new java.util.UUID(rng.nextLong(), rng.nextLong())
-    s"${ partFile(d, i) }-${ ctx.stageId() }-${ ctx.partitionId() }-${ ctx.attemptNumber() }-$fileUUID"
+    s"${ ctx.stageId() }-${ ctx.partitionId() }-${ ctx.attemptNumber() }-$fileUUID"
   }
+
+  def partFile(d: Int, i: Int, ctx: TaskContext): String = s"${ partFile(d, i) }-${ partSuffix(ctx) }"
 
   def mangle(strs: Array[String], formatter: Int => String = "_%d".format(_)): (Array[String], Array[(String, String)]) = {
     val b = new ArrayBuilder[String]
@@ -583,19 +604,76 @@ package object utils extends Logging
   def optMatch[T, S](a: T)(pf: PartialFunction[T, S]): Option[S] = lift(pf)(a)
 
   def using[R <: AutoCloseable, T](r: R)(consume: (R) => T): T = {
+    var caught = false
     try {
       consume(r)
+    } catch {
+      case original: Exception =>
+        caught = true
+        try {
+          r.close()
+          throw original
+        } catch {
+          case duringClose: Exception =>
+            if (original == duringClose) {
+              log.info(s"""The exact same exception object, ${original}, was thrown by both
+                          |the consumer and the close method. I will throw the original.""".stripMargin)
+              throw original
+            } else {
+              duringClose.addSuppressed(original)
+              throw duringClose
+            }
+        }
     } finally {
-      r.close()
+      if (!caught) {
+        r.close()
+      }
     }
   }
 
-  def point[T]()(implicit t: Pointed[T]): T = t.point
+  def singletonElement[T](it: Iterator[T]): T = {
+    val x = it.next()
+    assert(!it.hasNext)
+    x
+  }
+
+  // return partition of the ith item
+  def itemPartition(i: Int, n: Int, k: Int): Int = {
+    assert(n >= 0)
+    assert(k > 0)
+    assert(i >= 0 && i < n)
+    val minItemsPerPartition = n / k
+    val r = n % k
+    if (r == 0)
+      i / minItemsPerPartition
+    else {
+      val maxItemsPerPartition = minItemsPerPartition + 1
+      val crossover = maxItemsPerPartition * r
+      if (i < crossover)
+        i / maxItemsPerPartition
+      else
+        r + ((i - crossover) / minItemsPerPartition)
+    }
+  }
 
   def partition(n: Int, k: Int): Array[Int] = {
     if (k == 0) {
       assert(n == 0)
       return Array.empty[Int]
+    }
+
+    assert(n >= 0)
+    assert(k > 0)
+    val parts = Array.tabulate(k)(i => (n - i + k - 1) / k)
+    assert(parts.sum == n)
+    assert(parts.max - parts.min <= 1)
+    parts
+  }
+
+  def partition(n: Long, k: Int): Array[Long] = {
+    if (k == 0) {
+      assert(n == 0)
+      return Array.empty[Long]
     }
 
     assert(n >= 0)
@@ -622,6 +700,32 @@ package object utils extends Logging
       "\\" + s
     else
       s
+  }
+
+  def ordMax[T](left: T, right: T, ord: ExtendedOrdering): T = {
+    if (ord.gt(left, right))
+      left
+    else
+      right
+  }
+
+  def ordMin[T](left: T, right: T, ord: ExtendedOrdering): T = {
+    if (ord.lt(left, right))
+      left
+    else
+      right
+  }
+
+  def makeJavaMap[K, V](x: TraversableOnce[(K, V)]): java.util.HashMap[K, V] = {
+    val m = new java.util.HashMap[K, V]
+    x.foreach { case (k, v) => m.put(k, v) }
+    m
+  }
+
+  def makeJavaSet[K](x: TraversableOnce[K]): java.util.HashSet[K] = {
+    val m = new java.util.HashSet[K]
+    x.foreach(m.add)
+    m
   }
 
   def toMapFast[T, K, V](
@@ -655,26 +759,6 @@ package object utils extends Logging
     }
   }
 
-  def getHeadPartitionCounts(original: IndexedSeq[Long], n: Long): IndexedSeq[Long] = {
-    val scan = original.scanLeft(0L)(_ + _).tail
-    if (scan(scan.length - 1) < n)
-      original
-    else {
-      val (lastSum, lastIdx) = scan.iterator.zipWithIndex.filter { case (sum, _) => sum >= n }.next()
-      val ab = new ArrayBuilder[Long](0)
-      var i = 0
-      while (i < lastIdx) {
-        ab += original(i)
-        i += 1
-      }
-      if (lastIdx == 0)
-        ab += n
-      else
-        ab += n - scan(lastIdx - 1)
-      ab.result()
-    }
-  }
-
   def dumpClassLoader(cl: ClassLoader) {
     System.err.println(s"ClassLoader ${ cl.getClass.getCanonicalName }:")
     cl match {
@@ -686,6 +770,125 @@ package object utils extends Logging
     val parent = cl.getParent
     if (parent != null)
       dumpClassLoader(parent)
+  }
+
+  def writeNativeFileReadMe(fs: FS, path: String): Unit = {
+    val dateFormat = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss")
+
+    using(new OutputStreamWriter(fs.create(path + "/README.txt"))) { out =>
+      out.write(
+        s"""This folder comprises a Hail (www.hail.is) native Table or MatrixTable.
+           |  Written with version ${ HailContext.get.version }
+           |  Created at ${ dateFormat.format(new Date()) }""".stripMargin)
+    }
+  }
+
+  def compress(bb: ArrayBuilder[Byte], input: Array[Byte]): Int = {
+    val compressor = new Deflater()
+    compressor.setInput(input)
+    compressor.finish()
+    val buffer = new Array[Byte](1024)
+    var compressedLength = 0
+    while (!compressor.finished()) {
+      val nCompressedBytes = compressor.deflate(buffer)
+      bb ++= (buffer, nCompressedBytes)
+      compressedLength += nCompressedBytes
+    }
+    compressedLength
+  }
+
+  def unwrappedApply[U, T](f: (U, T) => T): (U, Seq[T]) => T = if (f == null) null else { (s, ts) =>
+    f(s, ts(0))
+  }
+
+  def unwrappedApply[U, T](f: (U, T, T) => T): (U, Seq[T]) => T = if (f == null) null else { (s, ts) =>
+    val Seq(t1, t2) = ts
+    f(s, t1, t2)
+  }
+
+  def unwrappedApply[U, T](f: (U, T, T, T) => T): (U, Seq[T]) => T = if (f == null) null else { (s, ts) =>
+    val Seq(t1, t2, t3) = ts
+    f(s, t1, t2, t3)
+  }
+
+  def unwrappedApply[U, T](f: (U, T, T, T, T) => T): (U, Seq[T]) => T = if (f == null) null else { (s, ts) =>
+    val Seq(t1, t2, t3, t4) = ts
+    f(s, t1, t2, t3, t4)
+  }
+
+  def unwrappedApply[U, T](f: (U, T, T, T, T, T) => T): (U, Seq[T]) => T = if (f == null) null else { (s, ts) =>
+    val Seq(t1, t2, t3, t4, t5) = ts
+    f(s, t1, t2, t3, t4, t5)
+  }
+
+  def unwrappedApply[U, T](f: (U, T, T, T, T, T, T) => T): (U, Seq[T]) => T = if (f == null) null else { (s, ts) =>
+    val Seq(arg1, arg2, arg3, arg4, arg5, arg6) = ts
+    f(s, arg1, arg2, arg3, arg4, arg5, arg6)
+  }
+
+  def drainInputStreamToOutputStream(
+    is: InputStream,
+    os: OutputStream
+  ): Unit = {
+    val buffer = new Array[Byte](1024)
+    var length = is.read(buffer)
+    while (length != -1) {
+      os.write(buffer, 0, length);
+      length = is.read(buffer)
+    }
+  }
+
+  def isJavaIdentifier(id: String): Boolean = {
+    if (!java.lang.Character.isJavaIdentifierStart(id.head))
+      return false
+
+    var i = 1
+    while (i < id.length) {
+      if (!java.lang.Character.isJavaIdentifierPart(id(i)))
+        return false
+      i += 1
+    }
+
+    true
+  }
+
+  def commonPrefix[T](left: IndexedSeq[T], right: IndexedSeq[T]): IndexedSeq[T] = {
+    var i = 0
+    while (i < left.length && i < right.length && left(i) == right(i))
+      i += 1
+    if (i == left.length)
+      left
+    else if (i == right.length)
+      right
+    else
+      left.take(i)
+  }
+
+  def decomposeWithName(v: Any, name: String)(implicit formats: Formats): JObject = {
+    val jo = Extraction.decompose(v).asInstanceOf[JObject]
+    jo.merge(JObject("name" -> JString(name)))
+  }
+
+  def makeVirtualOffset(fileOffset: Long, blockOffset: Int): Long = {
+    assert(fileOffset >= 0)
+    assert(blockOffset >= 0)
+    assert(blockOffset < 64 * 1024)
+    (fileOffset << 16) | blockOffset
+  }
+
+  def virtualOffsetBlockOffset(offset: Long): Int = {
+    (offset & 0xFFFF).toInt
+  }
+
+  def virtualOffsetCompressedOffset(offset: Long): Long = {
+    offset >> 16
+  }
+
+  def tokenUrlSafe(n: Int): String = {
+    val bytes = new Array[Byte](32)
+    val random = new SecureRandom()
+    random.nextBytes(bytes)
+    Base64.getUrlEncoder.encodeToString(bytes)
   }
 }
 

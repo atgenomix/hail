@@ -1,15 +1,13 @@
 package is.hail.rvd
 
-import is.hail.annotations.UnsafeIndexedSeq
-import is.hail.expr.types._
-import is.hail.expr.types.virtual.{TInt32, TStruct}
-import is.hail.utils.Interval
+import is.hail.types.virtual.{TInt32, TStruct}
+import is.hail.utils.{FastIndexedSeq, Interval}
 import org.apache.spark.sql.Row
 import org.scalatest.testng.TestNGSuite
 import org.testng.annotations.Test
 
 class RVDPartitionerSuite extends TestNGSuite {
-  val kType = TStruct(("A", TInt32()), ("B", TInt32()), ("C", TInt32()))
+  val kType = TStruct(("A", TInt32), ("B", TInt32), ("C", TInt32))
   val partitioner =
     new RVDPartitioner(kType,
       Array(
@@ -19,7 +17,7 @@ class RVDPartitionerSuite extends TestNGSuite {
     )
 
   @Test def testExtendKey() {
-    val p = new RVDPartitioner(TStruct(("A", TInt32()), ("B", TInt32())),
+    val p = new RVDPartitioner(TStruct(("A", TInt32), ("B", TInt32)),
       Array(
         Interval(Row(1, 0), Row(4, 3), true, true),
         Interval(Row(4, 3), Row(4, 3), true, true),
@@ -138,18 +136,18 @@ class RVDPartitionerSuite extends TestNGSuite {
     val intervals1 = Array(Interval(Row(), Row(), true, true))
     val intervals5 = Array.fill(5)(Interval(Row(), Row(), true, true))
 
-    val p5 = RVDPartitioner.generate(IndexedSeq(), TStruct.empty(), intervals5)
+    val p5 = RVDPartitioner.generate(FastIndexedSeq(), TStruct.empty, intervals5)
     assert(p5.rangeBounds sameElements intervals1)
 
-    val p1 = RVDPartitioner.generate(IndexedSeq(), TStruct.empty(), intervals1)
+    val p1 = RVDPartitioner.generate(FastIndexedSeq(), TStruct.empty, intervals1)
     assert(p1.rangeBounds sameElements intervals1)
 
-    val p0 = RVDPartitioner.generate(IndexedSeq(), TStruct.empty(), IndexedSeq())
+    val p0 = RVDPartitioner.generate(FastIndexedSeq(), TStruct.empty, FastIndexedSeq())
     assert(p0.rangeBounds.isEmpty)
   }
 
   @Test def testIntersect() {
-    val kType = TStruct(("key", TInt32()))
+    val kType = TStruct(("key", TInt32))
     val left =
       new RVDPartitioner(kType,
         Array(

@@ -14,7 +14,7 @@ import scala.language.implicitConversions
 object Locus {
   val simpleContigs: Seq[String] = (1 to 22).map(_.toString) ++ Seq("X", "Y", "MT")
 
-  def apply(contig: String, position: Int, rg: RGBase): Locus = {
+  def apply(contig: String, position: Int, rg: ReferenceGenome): Locus = {
     rg.checkLocus(contig, position)
     Locus(contig, position)
   }
@@ -40,61 +40,59 @@ object Locus {
     pos <- Gen.choose(1, length)
   } yield Locus(contig, pos)
 
-  def parse(str: String, rg: RGBase): Locus = {
+  def parse(str: String, rg: ReferenceGenome): Locus = {
     val elts = str.split(":")
     val size = elts.length
     if (size < 2)
-      fatal(s"Invalid string for Locus. Expecting contig:pos -- found `$str'.")
+      fatal(s"Invalid string for Locus. Expecting contig:pos -- found '$str'.")
 
     val contig = elts.take(size - 1).mkString(":")
     Locus(contig, elts(size - 1).toInt, rg)
   }
 
-  def parseInterval(str: String, rg: RGBase): Interval = Parser.parseLocusInterval(str, rg)
+  def parseInterval(str: String, rg: ReferenceGenome, invalidMissing: Boolean = false): Interval =
+    Parser.parseLocusInterval(str, rg, invalidMissing)
 
-  def parseIntervals(arr: Array[String], rg: RGBase): Array[Interval] = arr.map(parseInterval(_, rg))
+  def parseIntervals(arr: Array[String], rg: ReferenceGenome, invalidMissing: Boolean): Array[Interval] = arr.map(parseInterval(_, rg, invalidMissing))
 
-  def parseIntervals(arr: java.util.ArrayList[String], rg: RGBase): Array[Interval] = parseIntervals(arr.asScala.toArray, rg)
+  def parseIntervals(arr: java.util.List[String], rg: ReferenceGenome, invalidMissing: Boolean = false): Array[Interval] = parseIntervals(arr.asScala.toArray, rg, invalidMissing)
 
-  def makeInterval(contig: String, start: Int, end: Int, includesStart: Boolean, includesEnd: Boolean, rgBase: RGBase): Interval = {
+  def makeInterval(contig: String, start: Int, end: Int, includesStart: Boolean, includesEnd: Boolean,
+    rgBase: ReferenceGenome, invalidMissing: Boolean = false): Interval = {
     val rg = rgBase.asInstanceOf[ReferenceGenome]
-    val i = rg.normalizeLocusInterval(Interval(Locus(contig, start), Locus(contig, end), includesStart, includesEnd))
-    rg.checkLocusInterval(i)
-    i
+    rg.toLocusInterval(Interval(Locus(contig, start), Locus(contig, end), includesStart, includesEnd), invalidMissing)
   }
 }
 
 case class Locus(contig: String, position: Int) {
-  def compare(that: Locus, rg: ReferenceGenome): Int = rg.compare(this, that)
-
   def toRow: Row = Row(contig, position)
 
   def toJSON: JValue = JObject(
     ("contig", JString(contig)),
     ("position", JInt(position)))
 
-  def copyChecked(rg: RGBase, contig: String = contig, position: Int = position): Locus = {
+  def copyChecked(rg: ReferenceGenome, contig: String = contig, position: Int = position): Locus = {
     rg.checkLocus(contig, position)
     Locus(contig, position)
   }
 
-  def isAutosomalOrPseudoAutosomal(rg: RGBase): Boolean = isAutosomal(rg) || inXPar(rg) || inYPar(rg)
+  def isAutosomalOrPseudoAutosomal(rg: ReferenceGenome): Boolean = isAutosomal(rg) || inXPar(rg) || inYPar(rg)
 
-  def isAutosomal(rg: RGBase): Boolean = !(inX(rg) || inY(rg) || isMitochondrial(rg))
+  def isAutosomal(rg: ReferenceGenome): Boolean = !(inX(rg) || inY(rg) || isMitochondrial(rg))
 
-  def isMitochondrial(rg: RGBase): Boolean = rg.isMitochondrial(contig)
+  def isMitochondrial(rg: ReferenceGenome): Boolean = rg.isMitochondrial(contig)
 
-  def inXPar(rg: RGBase): Boolean = rg.inXPar(this)
+  def inXPar(rg: ReferenceGenome): Boolean = rg.inXPar(this)
 
-  def inYPar(rg: RGBase): Boolean = rg.inYPar(this)
+  def inYPar(rg: ReferenceGenome): Boolean = rg.inYPar(this)
 
-  def inXNonPar(rg: RGBase): Boolean = inX(rg) && !inXPar(rg)
+  def inXNonPar(rg: ReferenceGenome): Boolean = inX(rg) && !inXPar(rg)
 
-  def inYNonPar(rg: RGBase): Boolean = inY(rg) && !inYPar(rg)
+  def inYNonPar(rg: ReferenceGenome): Boolean = inY(rg) && !inYPar(rg)
 
-  private def inX(rg: RGBase): Boolean = rg.inX(contig)
+  private def inX(rg: ReferenceGenome): Boolean = rg.inX(contig)
 
-  private def inY(rg: RGBase): Boolean = rg.inY(contig)
+  private def inY(rg: ReferenceGenome): Boolean = rg.inY(contig)
 
   override def toString: String = s"$contig:$position"
 }

@@ -3,65 +3,65 @@ package is.hail.io.vcf
 import is.hail
 import is.hail.HailContext
 import is.hail.annotations.Region
-import is.hail.expr.ir.MatrixValue
-import is.hail.expr.types.physical._
-import is.hail.expr.types.virtual._
+import is.hail.expr.ir.{ExecuteContext, MatrixValue}
+import is.hail.types.physical._
+import is.hail.types.virtual._
 import is.hail.io.{VCFAttributes, VCFFieldAttributes, VCFMetadata}
 import is.hail.utils._
-import is.hail.variant.{Call, MatrixTable, RegionValueVariant}
+import is.hail.variant.{Call, RegionValueVariant}
 
 import scala.io.Source
 
 object ExportVCF {
   def infoNumber(t: Type): String = t match {
-    case TBoolean(_) => "0"
-    case TArray(_, _) => "."
-    case TSet(_, _) => "."
+    case TBoolean => "0"
+    case TArray(_) => "."
+    case TSet(_) => "."
     case _ => "1"
   }
 
-  def strVCF(sb: StringBuilder, elementType: PType, m: Region, offset: Long) {
+  def strVCF(sb: StringBuilder, elementType: PType, offset: Long) {
     elementType match {
       case PInt32(_) =>
-        val x = m.loadInt(offset)
+        val x = Region.loadInt(offset)
         sb.append(x)
       case PInt64(_) =>
-        val x = m.loadLong(offset)
+        val x = Region.loadLong(offset)
         if (x > Int.MaxValue || x < Int.MinValue)
           fatal(s"Cannot convert Long to Int if value is greater than Int.MaxValue (2^31 - 1) " +
             s"or less than Int.MinValue (-2^31). Found $x.")
         sb.append(x)
       case PFloat32(_) =>
-        val x = m.loadFloat(offset)
+        val x = Region.loadFloat(offset)
         if (x.isNaN)
           sb += '.'
         else
-          sb.append(x.formatted("%.5e"))
+          sb.append(x.formatted("%.6g"))
       case PFloat64(_) =>
-        val x = m.loadDouble(offset)
+        val x = Region.loadDouble(offset)
         if (x.isNaN)
           sb += '.'
         else
-          sb.append(x.formatted("%.5e"))
-      case PString(_) =>
-        sb.append(PString.loadString(m, offset))
-      case PCall(_) =>
-        val c = m.loadInt(offset)
+          sb.append(x.formatted("%.6g"))
+      case t@PCanonicalString(_) =>
+        sb.append(t.loadString(offset))
+      case _: PCall =>
+        val c = Region.loadInt(offset)
         Call.vcfString(c, sb)
       case _ =>
         fatal(s"VCF does not support type $elementType")
     }
   }
-  
-  def iterableVCF(sb: StringBuilder, t: PContainer, m: Region, length: Int, offset: Long, delim: Char) {
+
+  def iterableVCF(sb: StringBuilder, t: PContainer, length: Int, offset: Long, delim: Char) {
     if (length > 0) {
       var i = 0
       while (i < length) {
         if (i > 0)
           sb += delim
-        if (t.isElementDefined(m, offset, i)) {
-          val eOffset = t.loadElement(m, offset, length, i)
-          strVCF(sb, t.elementType, m, eOffset)
+        if (t.isElementDefined(offset, i)) {
+          val eOffset = t.loadElement(offset, length, i)
+          strVCF(sb, t.elementType, eOffset)
         } else
           sb += '.'
         i += 1
@@ -70,10 +70,10 @@ object ExportVCF {
       sb += '.'
   }
 
-  def emitInfo(sb: StringBuilder, f: PField, m: Region, offset: Long, wroteLast: Boolean): Boolean = {
+  def emitInfo(sb: StringBuilder, f: PField, offset: Long, wroteLast: Boolean): Boolean = {
     f.typ match {
-      case it: PContainer if !it.elementType.virtualType.isOfType(TBoolean()) =>
-        val length = it.loadLength(m, offset)
+      case it: PContainer if it.elementType.virtualType != TBoolean =>
+        val length = it.loadLength(offset)
         if (length == 0)
           wroteLast
         else {
@@ -81,11 +81,11 @@ object ExportVCF {
             sb += ';'
           sb.append(f.name)
           sb += '='
-          iterableVCF(sb, it, m, length, offset, ',')
+          iterableVCF(sb, it, length, offset, ',')
           true
         }
       case PBoolean(_) =>
-        if (m.loadBoolean(offset)) {
+        if (Region.loadBoolean(offset)) {
           if (wroteLast)
             sb += ';'
           sb.append(f.name)
@@ -97,80 +97,80 @@ object ExportVCF {
           sb += ';'
         sb.append(f.name)
         sb += '='
-        strVCF(sb, t, m, offset)
+        strVCF(sb, t, offset)
         true
     }
   }
 
   def infoType(t: Type): Option[String] = t match {
-    case _: TInt32 | _: TInt64 => Some("Integer")
-    case _: TFloat64 | _: TFloat32 => Some("Float")
-    case _: TString => Some("String")
-    case _: TBoolean => Some("Flag")
+    case TInt32 | TInt64 => Some("Integer")
+    case TFloat64 | TFloat32 => Some("Float")
+    case TString => Some("String")
+    case TBoolean => Some("Flag")
     case _ => None
   }
 
   def infoType(f: Field): String = {
     val tOption = f.typ match {
-      case TArray(TBoolean(_), _) | TSet(TBoolean(_), _) => None
-      case TArray(elt, _) => infoType(elt)
-      case TSet(elt, _) => infoType(elt)
+      case TArray(TBoolean) | TSet(TBoolean) => None
+      case TArray(elt) => infoType(elt)
+      case TSet(elt) => infoType(elt)
       case t => infoType(t)
     }
     tOption match {
       case Some(s) => s
-      case _ => fatal(s"INFO field '${ f.name }': VCF does not support type `${ f.typ }'.")
+      case _ => fatal(s"INFO field '${ f.name }': VCF does not support type '${ f.typ }'.")
     }
   }
 
   def formatType(t: Type): Option[String] = t match {
-    case _: TInt32 | _: TInt64 => Some("Integer")
-    case _: TFloat64 | _: TFloat32 => Some("Float")
-    case _: TString => Some("String")
-    case _: TCall => Some("String")
+    case TInt32 | TInt64 => Some("Integer")
+    case TFloat64 | TFloat32 => Some("Float")
+    case TString => Some("String")
+    case TCall => Some("String")
     case _ => None
   }
 
   def formatType(fieldName: String, t: Type): String = {
     val tOption = t match {
-      case TArray(elt, _) => formatType(elt)
-      case TSet(elt, _) => formatType(elt)
+      case TArray(elt) => formatType(elt)
+      case TSet(elt) => formatType(elt)
       case _ => formatType(t)
     }
 
     tOption match {
       case Some(s) => s
-      case _ => fatal(s"FORMAT field '$fieldName': VCF does not support type `$t'.")
+      case _ => fatal(s"FORMAT field '$fieldName': VCF does not support type '$t'.")
     }
   }
 
   def validFormatType(typ: Type): Boolean = {
     typ match {
-      case _: TString => true
-      case _: TFloat64 => true
-      case _: TFloat32 => true
-      case _: TInt32 => true
-      case _: TInt64 => true
-      case _: TCall => true
+      case TString => true
+      case TFloat64 => true
+      case TFloat32 => true
+      case TInt32 => true
+      case TInt64 => true
+      case TCall => true
       case _ => false
     }
   }
-  
+
   def checkFormatSignature(tg: TStruct) {
     tg.fields.foreach { fd =>
       val valid = fd.typ match {
-        case it: TIterable => validFormatType(it.elementType)
+        case it: TContainer => validFormatType(it.elementType)
         case t => validFormatType(t)
       }
       if (!valid)
         fatal(s"Invalid type for format field '${ fd.name }'. Found '${ fd.typ }'.")
     }
   }
-  
-  def emitGenotype(sb: StringBuilder, formatFieldOrder: Array[Int], tg: PStruct, m: Region, offset: Long, fieldDefined: Array[Boolean], missingFormat: String) {
+
+  def emitGenotype(sb: StringBuilder, formatFieldOrder: Array[Int], tg: PStruct, offset: Long, fieldDefined: Array[Boolean], missingFormat: String) {
     var i = 0
     while (i < formatFieldOrder.length) {
-      fieldDefined(i) = tg.isFieldDefined(m, offset, formatFieldOrder(i))
+      fieldDefined(i) = tg.isFieldDefined(offset, formatFieldOrder(i))
       i += 1
     }
 
@@ -187,20 +187,20 @@ object ExportVCF {
           sb += ':'
         val j = formatFieldOrder(i)
         val fIsDefined = fieldDefined(i)
-        val fOffset = tg.loadField(m, offset, j)
+        val fOffset = tg.loadField(offset, j)
 
         tg.fields(j).typ match {
           case it: PContainer =>
             val pt = it
             if (fIsDefined) {
-              val fLength = pt.loadLength(m, fOffset)
-              iterableVCF(sb, pt, m, fLength, fOffset, ',')
+              val fLength = pt.loadLength(fOffset)
+              iterableVCF(sb, pt, fLength, fOffset, ',')
             } else
               sb += '.'
           case t =>
             if (fIsDefined)
-              strVCF(sb, t, m, fOffset)
-            else if (t.virtualType.isOfType(TCall()))
+              strVCF(sb, t, fOffset)
+            else if (t.virtualType == TCall)
               sb.append("./.")
             else
               sb += '.'
@@ -216,27 +216,16 @@ object ExportVCF {
   def getAttributes(k1: String, k2: String, attributes: Option[VCFMetadata]): Option[VCFFieldAttributes] =
     getAttributes(k1, attributes).flatMap(_.get(k2))
 
-  def getAttributes(k1: String, k2: String, k3: String, attributes: Option[VCFMetadata]): Option[String] =
-    getAttributes(k1, k2, attributes).flatMap(_.get(k3))
-
-  def apply(mt: MatrixTable, path: String, append: Option[String] = None,
-    exportType: Int = ExportType.CONCATENATED, metadata: Option[VCFMetadata] = None) {
-    ExportVCF(mt.value, path, append, exportType, metadata)
-  }
-
-  def apply(mv: MatrixValue, path: String, append: Option[String],
-    exportType: Int, metadata: Option[VCFMetadata]) {
+  def apply(ctx: ExecuteContext, mv: MatrixValue, path: String, append: Option[String],
+    exportType: String, metadata: Option[VCFMetadata]) {
+    val fs = ctx.fs
 
     mv.typ.requireColKeyString()
     mv.typ.requireRowKeyVariant()
 
     val typ = mv.typ
 
-    val tg = typ.entryType match {
-      case t: TStruct => t.physicalType
-      case t =>
-        fatal(s"export_vcf requires g to have type TStruct, found $t")
-    }
+    val tg = mv.entryPType
 
     checkFormatSignature(tg.virtualType)
 
@@ -246,21 +235,21 @@ object ExportVCF {
     }
     val formatFieldString = formatFieldOrder.map(i => tg.fields(i).name).mkString(":")
 
-    val missingFormatStr = if (typ.entryType.size > 0 && typ.entryType.types(formatFieldOrder(0)).isInstanceOf[TCall])
+    val missingFormatStr = if (typ.entryType.size > 0 && typ.entryType.types(formatFieldOrder(0)) == TCall)
       "./."
     else "."
 
     val tinfo =
       if (typ.rowType.hasField("info")) {
         typ.rowType.field("info").typ match {
-          case t: TStruct => t.asInstanceOf[TStruct].physicalType
+          case _: TStruct => mv.rvRowPType.field("info").typ.asInstanceOf[PStruct]
           case t =>
             warn(s"export_vcf found row field 'info' of type $t, but expected type 'Struct'. Emitting no INFO fields.")
-            PStruct.empty()
+            PCanonicalStruct.empty()
         }
       } else {
         warn(s"export_vcf found no row field 'info'. Emitting no INFO fields.")
-        PStruct.empty()
+        PCanonicalStruct.empty()
       }
 
     val rg = mv.referenceGenome
@@ -312,7 +301,7 @@ object ExportVCF {
       }
 
       append.foreach { f =>
-        mv.sparkContext.hadoopConfiguration.readFile(f) { s =>
+        using(fs.open(f)) { s =>
           Source.fromInputStream(s)
             .getLines()
             .filterNot(_.isEmpty)
@@ -361,77 +350,81 @@ object ExportVCF {
         case None => (false, 0)
       }
     }
-    val filtersType = TSet(TString())
-    val filtersPType = filtersType.physicalType
+    val filtersType = TSet(TString)
+    val filtersPType = if (typ.rowType.hasField("filters"))
+      mv.rvRowPType.field("filters").typ.asInstanceOf[PSet]
+    else null
 
-    val (idExists, idIdx) = lookupVAField("rsid", "ID", Some(TString()))
-    val (qualExists, qualIdx) = lookupVAField("qual", "QUAL", Some(TFloat64()))
+    val (idExists, idIdx) = lookupVAField("rsid", "ID", Some(TString))
+    val (qualExists, qualIdx) = lookupVAField("qual", "QUAL", Some(TFloat64))
     val (filtersExists, filtersIdx) = lookupVAField("filters", "FILTERS", Some(filtersType))
     val (infoExists, infoIdx) = lookupVAField("info", "INFO", None)
-    
-    val fullRowType = typ.rvRowType.physicalType
-    val localEntriesIndex = typ.entriesIdx
-    val localEntriesType = typ.entryArrayType.physicalType
 
-    mv.rvd.mapPartitions { it =>
+    val fullRowType = mv.rvRowPType
+    val localEntriesIndex = mv.entriesIdx
+    val localEntriesType = mv.entryArrayPType
+
+    mv.rvd.mapPartitions { (_, it) =>
       val sb = new StringBuilder
-      var m: Region = null
 
       val formatDefinedArray = new Array[Boolean](formatFieldOrder.length)
 
       val rvv = new RegionValueVariant(fullRowType)
-      it.map { rv =>
+      it.map { ptr =>
         sb.clear()
 
-        m = rv.region
-        rvv.setRegion(rv)
+        rvv.set(ptr)
 
         sb.append(rvv.contig())
         sb += '\t'
         sb.append(rvv.position())
         sb += '\t'
 
-        if (idExists && fullRowType.isFieldDefined(rv, idIdx)) {
-          val idOffset = fullRowType.loadField(rv, idIdx)
-          sb.append(PString.loadString(m, idOffset))
+        if (idExists && fullRowType.isFieldDefined(ptr, idIdx)) {
+          val idOffset = fullRowType.loadField(ptr, idIdx)
+          sb.append(fullRowType.types(idIdx).asInstanceOf[PString].loadString(idOffset))
         } else
           sb += '.'
 
         sb += '\t'
         sb.append(rvv.alleles()(0))
         sb += '\t'
-        rvv.alleles().tail.foreachBetween(aa =>
-          sb.append(aa))(sb += ',')
+        if (rvv.alleles().length > 1) {
+          rvv.alleles().tail.foreachBetween(aa =>
+            sb.append(aa))(sb += ',')
+        } else {
+          sb += '.'
+        }
         sb += '\t'
 
-        if (qualExists && fullRowType.isFieldDefined(rv, qualIdx)) {
-          val qualOffset = fullRowType.loadField(rv, qualIdx)
-          sb.append(m.loadDouble(qualOffset).formatted("%.2f"))
+        if (qualExists && fullRowType.isFieldDefined(ptr, qualIdx)) {
+          val qualOffset = fullRowType.loadField(ptr, qualIdx)
+          sb.append(Region.loadDouble(qualOffset).formatted("%.2f"))
         } else
           sb += '.'
 
         sb += '\t'
 
-        if (filtersExists && fullRowType.isFieldDefined(rv, filtersIdx)) {
-          val filtersOffset = fullRowType.loadField(rv, filtersIdx)
-          val filtersLength = filtersPType.loadLength(m, filtersOffset)
+        if (filtersExists && fullRowType.isFieldDefined(ptr, filtersIdx)) {
+          val filtersOffset = fullRowType.loadField(ptr, filtersIdx)
+          val filtersLength = filtersPType.loadLength(filtersOffset)
           if (filtersLength == 0)
             sb.append("PASS")
           else
-            iterableVCF(sb, filtersPType, m, filtersLength, filtersOffset, ';')
+            iterableVCF(sb, filtersPType, filtersLength, filtersOffset, ';')
         } else
           sb += '.'
 
         sb += '\t'
 
         var wroteAnyInfo: Boolean = false
-        if (infoExists && fullRowType.isFieldDefined(rv, infoIdx)) {
+        if (infoExists && fullRowType.isFieldDefined(ptr, infoIdx)) {
           var wrote: Boolean = false
-          val infoOffset = fullRowType.loadField(rv, infoIdx)
+          val infoOffset = fullRowType.loadField(ptr, infoIdx)
           var i = 0
           while (i < tinfo.size) {
-            if (tinfo.isFieldDefined(m, infoOffset, i)) {
-              wrote = emitInfo(sb, tinfo.fields(i), m, tinfo.loadField(m, infoOffset, i), wrote)
+            if (tinfo.isFieldDefined(infoOffset, i)) {
+              wrote = emitInfo(sb, tinfo.fields(i), tinfo.loadField(infoOffset, i), wrote)
               wroteAnyInfo = wroteAnyInfo || wrote
             }
             i += 1
@@ -444,21 +437,21 @@ object ExportVCF {
           sb += '\t'
           sb.append(formatFieldString)
 
-          val gsOffset = fullRowType.loadField(rv, localEntriesIndex)
+          val gsOffset = fullRowType.loadField(ptr, localEntriesIndex)
           var i = 0
           while (i < localNSamples) {
             sb += '\t'
-            if (localEntriesType.isElementDefined(m, gsOffset, i))
-              emitGenotype(sb, formatFieldOrder, tg, m, localEntriesType.loadElement(m, gsOffset, localNSamples, i), formatDefinedArray, missingFormatStr)
+            if (localEntriesType.isElementDefined(gsOffset, i))
+              emitGenotype(sb, formatFieldOrder, tg, localEntriesType.loadElement(gsOffset, localNSamples, i), formatDefinedArray, missingFormatStr)
             else
               sb.append(missingFormatStr)
 
             i += 1
           }
         }
-        
+
         sb.result()
       }
-    }.writeTable(path, HailContext.get.tmpDir, Some(header), exportType = exportType)
+    }.writeTable(ctx, path, Some(header), exportType = exportType)
   }
 }

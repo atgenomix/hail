@@ -1,42 +1,49 @@
 package is.hail.expr.ir
 
+import is.hail.HailContext
 import is.hail.utils._
 
 object Optimize {
-  private def optimize(ir0: BaseIR, noisy: Boolean, canGenerateLiterals: Boolean): BaseIR = {
+  def apply[T <: BaseIR](ctx: ExecuteContext, ir: T): T =
+    Optimize(ir, false, "direct", ctx)
+
+  def apply[T <: BaseIR](ir0: T, noisy: Boolean, context: String, ctx: ExecuteContext): T = {
     if (noisy)
-      log.info("optimize: before:\n" + Pretty(ir0, elideLiterals = true))
+      log.info(s"optimize $context: before: IR size ${ IRSize(ir0) }: \n" + Pretty(ir0, elideLiterals = true))
 
     var ir = ir0
-    ir = FoldConstants(ir, canGenerateLiterals = canGenerateLiterals)
-    ir = Simplify(ir)
-    ir = PruneDeadFields(ir)
-    ir = Simplify(ir)
+    var last: BaseIR = null
+    var iter = 0
+    val maxIter = HailContext.get.optimizerIterations
+
+    def runOpt(f: BaseIR => BaseIR, iter: Int, optContext: String): Unit = {
+      ir = ctx.timer.time(optContext)(f(ir).asInstanceOf[T])
+    }
+
+    ctx.timer.time("Optimize") {
+      while (iter < maxIter && ir != last) {
+        last = ir
+        runOpt(FoldConstants(ctx, _), iter, "FoldConstants")
+        runOpt(ExtractIntervalFilters(_), iter, "ExtractIntervalFilters")
+        runOpt(Simplify(_), iter, "Simplify")
+        runOpt(ForwardLets(_), iter, "ForwardLets")
+        runOpt(ForwardRelationalLets(_), iter, "ForwardRelationalLets")
+        runOpt(PruneDeadFields(_), iter, "PruneDeadFields")
+
+        iter += 1
+      }
+    }
 
     if (ir.typ != ir0.typ)
-      fatal(s"optimization changed type!\n  before: ${ ir0.typ }\n  after:  ${ ir.typ }" +
-        s"\n  Before IR:\n  ----------\n${ Pretty(ir0) }\n  After IR:\n  ---------\n${ Pretty(ir) }")
+      throw new RuntimeException(s"optimization changed type!" +
+        s"\n  before: ${ ir0.typ.parsableString() }" +
+        s"\n  after:  ${ ir.typ.parsableString() }" +
+        s"\n  Before IR:\n  ----------\n${ Pretty(ir0) }" +
+        s"\n  After IR:\n  ---------\n${ Pretty(ir) }")
 
     if (noisy)
-      log.info("optimize: after:\n" + Pretty(ir, elideLiterals = true))
+      log.info(s"optimize $context: after: IR size ${ IRSize(ir) }:\n" + Pretty(ir, elideLiterals = true))
 
     ir
   }
-
-  def apply(ir: TableIR, noisy: Boolean, canGenerateLiterals: Boolean): TableIR =
-    optimize(ir, noisy, canGenerateLiterals).asInstanceOf[TableIR]
-
-  def apply(ir: TableIR): TableIR = apply(ir, true, true)
-
-  def apply(ir: MatrixIR, noisy: Boolean, canGenerateLiterals: Boolean): MatrixIR =
-   optimize(ir, noisy, canGenerateLiterals).asInstanceOf[MatrixIR]
-
-  def apply(ir: MatrixIR): MatrixIR = apply(ir, true, true)
-
-  def apply(ir: BlockMatrixIR): BlockMatrixIR = ir //Currently no BlockMatrixIR that can be optimized
-
-  def apply(ir: IR, noisy: Boolean, canGenerateLiterals: Boolean): IR =
-    optimize(ir, noisy, canGenerateLiterals).asInstanceOf[IR]
-
-  def apply(ir: IR): IR = apply(ir, true, true)
 }

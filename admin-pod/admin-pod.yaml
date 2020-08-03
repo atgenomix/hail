@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admin-pod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: admin-pod
+  template:
+    metadata:
+      labels:
+        app: admin-pod
+    spec:
+      nodeSelector:
+        preemptible: "true"
+      tolerations:
+       - key: preemptible
+         value: "true"
+      containers:
+       - name: admin-pod
+         command:
+          - bash
+          - -c
+          - |
+              ln -s /ssl-config/ssl-config.curlrc $HOME/.curlrc
+              ln -s /sql-config/sql-config.cnf $HOME/.my.cnf
+              while true; do sleep 1000; done
+         image: {{ service_base_image.image }}
+         volumeMounts:
+          - name: deploy-config
+            mountPath: /deploy-config
+            readOnly: true
+          - name: sql-config
+            mountPath: /sql-config
+            readOnly: true
+          - name: ssl-config-admin-pod
+            mountPath: /ssl-config
+            readOnly: true
+      volumes:
+       - name: deploy-config
+         secret:
+           secretName: deploy-config
+       - name: sql-config
+         secret:
+           secretName: database-server-config
+       - name: ssl-config-admin-pod
+         secret:
+           optional: false
+           secretName: ssl-config-admin-pod

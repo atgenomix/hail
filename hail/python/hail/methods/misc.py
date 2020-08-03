@@ -1,15 +1,17 @@
-from typing import *
+from typing import Union
 
 import hail as hl
-from hail.expr.expressions import *
-from hail.expr.types import *
+from hail.expr import Expression, \
+    expr_numeric, expr_array, expr_interval, expr_any, \
+    construct_expr, construct_variable
+from hail.expr.types import ttuple, tlocus, tarray, tstr, tstruct
 from hail.matrixtable import MatrixTable
 from hail.table import Table
-from hail.typecheck import *
+from hail.typecheck import typecheck, nullable, func_spec, oneof
 from hail.utils import Interval, Struct, new_temp_file
 from hail.utils.misc import plural
-from hail.utils.java import Env, joption, info
-from hail.ir import *
+from hail.utils.java import Env, info
+from hail import ir
 
 
 @typecheck(i=Expression,
@@ -92,6 +94,9 @@ def maximal_independent_set(i, j, keep=True, tie_breaker=None, keyed=True) -> Ta
     When multiple nodes have the same degree, this algorithm will order the
     nodes according to ``tie_breaker`` and remove the *largest* node.
 
+    If `keyed` is ``False``, then a node may appear twice in the resulting
+    table.
+
     Parameters
     ----------
     i : :class:`.Expression`
@@ -132,9 +137,9 @@ def maximal_independent_set(i, j, keep=True, tie_breaker=None, keyed=True) -> Ta
 
     if tie_breaker:
         wrapped_node_t = ttuple(node_t)
-        l = construct_variable('l', wrapped_node_t)
-        r = construct_variable('r', wrapped_node_t)
-        tie_breaker_expr = hl.int64(tie_breaker(l[0], r[0]))
+        left = construct_variable('l', wrapped_node_t)
+        right = construct_variable('r', wrapped_node_t)
+        tie_breaker_expr = hl.float64(tie_breaker(left[0], right[0]))
         t, _ = source._process_joins(i, j, tie_breaker_expr)
         tie_breaker_str = str(tie_breaker_expr._ir)
     else:
@@ -146,21 +151,20 @@ def maximal_independent_set(i, j, keep=True, tie_breaker=None, keyed=True) -> Ta
     edges.write(edges_path)
     edges = hl.read_table(edges_path)
 
-    mis_nodes = Env.hail().utils.Graph.maximalIndependentSet(
-        edges._jt.collect(),
-        node_t._parsable_string(),
-        joption(tie_breaker_str))
+    mis_nodes = construct_expr(
+        ir.JavaIR(Env.hail().utils.Graph.pyMaximalIndependentSet(
+            Env.spark_backend('maximal_independent_set')._to_java_value_ir(edges.collect(_localize=False)._ir),
+            node_t._parsable_string(),
+            tie_breaker_str)),
+        hl.tset(node_t))
 
-    nodes = edges.select(node = [edges.__i, edges.__j])
+    nodes = edges.select(node=[edges.__i, edges.__j])
     nodes = nodes.explode(nodes.node)
-    # avoid serializing `mis_nodes` from java to python and back to java
-    nodes = Table._from_java(
-        nodes._jt.annotateGlobal(
-            mis_nodes, hl.tset(node_t)._parsable_string(), 'mis_nodes'))
+    nodes = nodes.annotate_globals(mis_nodes=mis_nodes)
     nodes = nodes.filter(nodes.mis_nodes.contains(nodes.node), keep)
     nodes = nodes.select_globals()
     if keyed:
-        return nodes.key_by('node')
+        return nodes.key_by('node').distinct()
     return nodes
 
 
@@ -169,14 +173,16 @@ def require_col_key_str(dataset: MatrixTable, method: str):
         raise ValueError(f"Method '{method}' requires column key to be one field of type 'str', found "
                          f"{list(str(x.dtype) for x in dataset.col_key.values())}")
 
+
 def require_table_key_variant(ht, method):
-    if (list(ht.key) != ['locus', 'alleles'] or
-            not isinstance(ht['locus'].dtype, tlocus) or
-            not ht['alleles'].dtype == tarray(tstr)):
+    if (list(ht.key) != ['locus', 'alleles']
+            or not isinstance(ht['locus'].dtype, tlocus)
+            or not ht['alleles'].dtype == tarray(tstr)):
         raise ValueError("Method '{}' requires key to be two fields 'locus' (type 'locus<any>') and "
                          "'alleles' (type 'array<str>')\n"
                          "  Found:{}".format(method, ''.join(
-            "\n    '{}': {}".format(k, str(ht[k].dtype)) for k in ht.key)))
+                             "\n    '{}': {}".format(k, str(ht[k].dtype)) for k in ht.key)))
+
 
 def require_row_key_variant(dataset, method):
     if isinstance(dataset, Table):
@@ -184,25 +190,26 @@ def require_row_key_variant(dataset, method):
     else:
         assert isinstance(dataset, MatrixTable)
         key = dataset.row_key
-    if (list(key) != ['locus', 'alleles'] or
-            not isinstance(dataset['locus'].dtype, tlocus) or
-            not dataset['alleles'].dtype == tarray(tstr)):
+    if (list(key) != ['locus', 'alleles']
+            or not isinstance(dataset['locus'].dtype, tlocus)
+            or not dataset['alleles'].dtype == tarray(tstr)):
         raise ValueError("Method '{}' requires row key to be two fields 'locus' (type 'locus<any>') and "
                          "'alleles' (type 'array<str>')\n"
                          "  Found:{}".format(method, ''.join(
-            "\n    '{}': {}".format(k, str(dataset[k].dtype)) for k in key)))
+                             "\n    '{}': {}".format(k, str(dataset[k].dtype)) for k in key)))
 
 
 def require_row_key_variant_w_struct_locus(dataset, method):
-    if (list(dataset.row_key) != ['locus', 'alleles'] or
-            not dataset['alleles'].dtype == tarray(tstr) or
-            (not isinstance(dataset['locus'].dtype, tlocus) and
-                     dataset['locus'].dtype != hl.dtype('struct{contig: str, position: int32}'))):
+    if (list(dataset.row_key) != ['locus', 'alleles']
+        or not dataset['alleles'].dtype == tarray(tstr)
+        or (not isinstance(dataset['locus'].dtype, tlocus)
+            and dataset['locus'].dtype != hl.dtype('struct{contig: str, position: int32}'))):
         raise ValueError("Method '{}' requires row key to be two fields 'locus'"
                          " (type 'locus<any>' or 'struct{{contig: str, position: int32}}') and "
                          "'alleles' (type 'array<str>')\n"
                          "  Found:{}".format(method, ''.join(
-            "\n    '{}': {}".format(k, str(dataset[k].dtype)) for k in dataset.row_key)))
+                             "\n    '{}': {}".format(k, str(dataset[k].dtype)) for k in dataset.row_key)))
+
 
 def require_first_key_field_locus(dataset, method):
     if isinstance(dataset, Table):
@@ -210,11 +217,11 @@ def require_first_key_field_locus(dataset, method):
     else:
         assert isinstance(dataset, MatrixTable)
         key = dataset.row_key
-    if (len(key) == 0 or
-            not isinstance(key[0].dtype, tlocus)):
+    if (len(key) == 0
+            or not isinstance(key[0].dtype, tlocus)):
         raise ValueError("Method '{}' requires first key field of type 'locus<any>'.\n"
                          "  Found:{}".format(method, ''.join(
-            "\n    '{}': {}".format(k, str(dataset[k].dtype)) for k in key)))
+                             "\n    '{}': {}".format(k, str(dataset[k].dtype)) for k in key)))
 
 
 @typecheck(table=Table, method=str)
@@ -229,8 +236,8 @@ def require_biallelic(dataset, method) -> MatrixTable:
     return dataset._select_rows(method,
                                 hl.case()
                                 .when(dataset.alleles.length() == 2, dataset._rvrow)
-                                .or_error(f"'{method}' expects biallelic variants ('alleles' field of length 2), found " +
-                                        hl.str(dataset.locus) + ", " + hl.str(dataset.alleles)))
+                                .or_error(f"'{method}' expects biallelic variants ('alleles' field of length 2), found "
+                                          + hl.str(dataset.locus) + ", " + hl.str(dataset.alleles)))
 
 
 @typecheck(dataset=MatrixTable, name=str)
@@ -274,7 +281,9 @@ def rename_duplicates(dataset, name='unique_id') -> MatrixTable:
     mapping = []
     new_ids = []
 
-    fmt = lambda s, i: '{}_{}'.format(s, i)
+    def fmt(s, i):
+        return '{}_{}'.format(s, i)
+
     for s in ids:
         s_ = s
         i = 0
@@ -288,11 +297,10 @@ def rename_duplicates(dataset, name='unique_id') -> MatrixTable:
         new_ids.append(s_)
 
     if mapping:
-        info(f'Renamed {len(mapping)} duplicate {plural("sample ID", len(mapping))}. Mangled IDs as follows:' +
-             ''.join(f'\n  "{pre}" => "{post}"' for pre, post in mapping))
+        info(f'Renamed {len(mapping)} duplicate {plural("sample ID", len(mapping))}. Mangled IDs as follows:'
+             + ''.join(f'\n  "{pre}" => "{post}"' for pre, post in mapping))
     else:
         info('No duplicate sample IDs found.')
-    uid = Env.get_uid()
     return dataset.annotate_cols(**{name: hl.literal(new_ids)[hl.int(hl.scan.count())]})
 
 
@@ -316,7 +324,7 @@ def filter_intervals(ds, intervals, keep=True) -> Union[Table, MatrixTable]:
 
     Notes
     -----
-    Based on the ``keep`` argument, this method will either restrict to points
+    Based on the `keep` argument, this method will either restrict to points
     in the supplied interval ranges, or remove all rows in those ranges.
 
     When ``keep=True``, partitions that don't overlap any supplied interval
@@ -360,91 +368,30 @@ def filter_intervals(ds, intervals, keep=True) -> Union[Table, MatrixTable]:
 
     if point_type == k_type[0]:
         needs_wrapper = True
-        point_type = hl.tstruct(foo=point_type)
+        k_name = k_type.fields[0]
+        point_type = hl.tstruct(**{k_name: k_type[k_name]})
     elif isinstance(point_type, tstruct) and is_struct_prefix(point_type, k_type):
         needs_wrapper = False
     else:
-        raise TypeError("The point type is incompatible with key type of the dataset ('{}', '{}')".format(repr(point_type), repr(k_type)))
+        raise TypeError(
+            "The point type is incompatible with key type of the dataset ('{}', '{}')".format(repr(point_type),
+                                                                                              repr(k_type)))
 
     def wrap_input(interval):
         if interval is None:
             raise TypeError("'filter_intervals' does not allow missing values in 'intervals'.")
         elif needs_wrapper:
-            return Interval(Struct(foo=interval.start),
-                            Struct(foo=interval.end),
+            return Interval(Struct(**{k_name: interval.start}),
+                            Struct(**{k_name: interval.end}),
                             interval.includes_start,
                             interval.includes_end)
         else:
             return interval
 
-    intervals_type = intervals.dtype
     intervals = hl.eval(intervals)
-    intervals = hl.tarray(hl.tinterval(point_type))._convert_to_json([wrap_input(i) for i in intervals])
+    intervals = [wrap_input(i) for i in intervals]
 
     if isinstance(ds, MatrixTable):
-        config = {
-            'name': 'MatrixFilterIntervals',
-            'keyType': point_type._parsable_string(),
-            'intervals': intervals,
-            'keep': keep
-        }
-        return MatrixTable(MatrixToMatrixApply(ds._mir, config))
+        return MatrixTable(ir.MatrixFilterIntervals(ds._mir, intervals, point_type, keep))
     else:
-        config = {
-            'name': 'TableFilterIntervals',
-            'keyType': point_type._parsable_string(),
-            'intervals': intervals,
-            'keep': keep
-        }
-        return Table(TableToTableApply(ds._tir, config))
-
-
-@typecheck(mt=MatrixTable, bp_window_size=int)
-def window_by_locus(mt: MatrixTable, bp_window_size: int) -> MatrixTable:
-    """Collect arrays of row and entry values from preceding loci.
-
-    .. include:: ../_templates/req_tlocus.rst
-
-    .. include:: ../_templates/experimental.rst
-
-    Examples
-    --------
-    >>> ds_result = hl.window_by_locus(ds, 3)
-
-    Notes
-    -----
-    This method groups each row (variant) with the previous rows in a window of
-    `bp_window_size` base pairs, putting the row values from the previous
-    variants into `prev_rows` (row field of type ``array<struct>``) and entry
-    values from those variants into `prev_entries` (entry field of type
-    ``array<struct>``).
-
-    The `bp_window_size` argument is inclusive; if `base_pairs` is 2 and the
-    loci are
-
-    .. code-block:: text
-
-        1:100
-        1:100
-        1:102
-        1:102
-        1:103
-        2:100
-        2:101
-
-    then the size of `prev_rows` is 0, 1, 2, 3, 2, 0, and 1, respectively (and
-    same for the size of prev_entries).
-
-    Parameters
-    ----------
-    mt : :class:`.MatrixTable`
-        Input dataset.
-    bp_window_size : :obj:`int`
-        Base pairs to include in the backwards window (inclusive).
-
-    Returns
-    -------
-    :class:`.MatrixTable`
-    """
-    require_first_key_field_locus(mt, 'window_by_locus')
-    return MatrixTable(hl.ir.MatrixToMatrixApply(mt._mir, {'name': 'WindowByLocus', 'basePairs': bp_window_size}))
+        return Table(ir.TableFilterIntervals(ds._tir, intervals, point_type, keep))

@@ -3,21 +3,16 @@ package is.hail.utils.richUtils
 import java.io.InputStream
 
 import breeze.linalg.DenseMatrix
-import is.hail.annotations.aggregators.RegionValueAggregator
 import is.hail.annotations.{JoinedRegionValue, Region, RegionValue, RegionValueBuilder}
-import is.hail.asm4s.Code
-import is.hail.io.RichContextRDDRegionValue
+import is.hail.asm4s.{Code, Value}
+import is.hail.io.{InputBuffer, OutputBuffer, RichContextRDDRegionValue, RichContextRDDLong}
 import is.hail.rvd.RVDContext
-import is.hail.io.{InputBuffer, RichContextRDDRegionValue}
 import is.hail.sparkextras._
-import is.hail.utils.{ArrayBuilder, HailIterator, JSONWriter, MultiArray2, Truncatable, WithContext}
-import org.apache.hadoop
+import is.hail.utils.{IntPacker, HailIterator, MultiArray2, Truncatable, WithContext}
 import org.apache.spark.SparkContext
-import org.apache.spark.mllib.linalg.distributed.{IndexedRow, IndexedRowMatrix}
+import org.apache.spark.mllib.linalg.distributed.IndexedRowMatrix
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{Row, SQLContext}
-import org.apache.spark.storage.StorageLevel
-import org.json4s.JValue
+import org.apache.spark.sql.Row
 
 import scala.collection.{TraversableOnce, mutable}
 import scala.language.implicitConversions
@@ -37,11 +32,6 @@ trait Implicits {
 
   implicit def toRichEnumeration[T <: Enumeration](e: T): RichEnumeration[T] = new RichEnumeration(e)
 
-  implicit def toRichHadoopConfiguration(hConf: hadoop.conf.Configuration): RichHadoopConfiguration =
-    new RichHadoopConfiguration(hConf)
-
-  implicit def toRichInt(i: Int): RichInt = new RichInt(i)
-
   implicit def toRichIndexedRowMatrix(irm: IndexedRowMatrix): RichIndexedRowMatrix = new RichIndexedRowMatrix(irm)
 
   implicit def toRichIntPairTraversableOnce[V](t: TraversableOnce[(Int, V)]): RichIntPairTraversableOnce[V] =
@@ -55,9 +45,9 @@ trait Implicits {
 
   implicit def toRichIterator[T](it: Iterator[T]): RichIterator[T] = new RichIterator[T](it)
 
-  implicit def toRichRowIterator(it: Iterator[Row]): RichRowIterator = new RichRowIterator(it)
+  implicit def toRichIteratorLong(it: Iterator[Long]): RichIteratorLong = new RichIteratorLong(it)
 
-  implicit def toRichLong(l: Long): RichLong = new RichLong(l)
+  implicit def toRichRowIterator(it: Iterator[Row]): RichRowIterator = new RichRowIterator(it)
 
   implicit def toRichMap[K, V](m: Map[K, V]): RichMap[K, V] = new RichMap(m)
 
@@ -80,9 +70,9 @@ trait Implicits {
 
   implicit def toRichRDD[T](r: RDD[T])(implicit tct: ClassTag[T]): RichRDD[T] = new RichRDD(r)
 
-  implicit def toRichContextRDDRegionValue(r: ContextRDD[RVDContext, RegionValue]): RichContextRDDRegionValue = new RichContextRDDRegionValue(r)
+  implicit def toRichContextRDDRegionValue(r: ContextRDD[RegionValue]): RichContextRDDRegionValue = new RichContextRDDRegionValue(r)
 
-  implicit def toRichRDDByteArray(r: RDD[Array[Byte]]): RichRDDByteArray = new RichRDDByteArray(r)
+  implicit def toRichContextRDDLong(r: ContextRDD[Long]): RichContextRDDLong = new RichContextRDDLong(r)
 
   implicit def toRichRegex(r: Regex): RichRegex = new RichRegex(r)
 
@@ -93,8 +83,6 @@ trait Implicits {
   implicit def toRichString(str: String): RichString = new RichString(str)
 
   implicit def toRichStringBuilder(sb: mutable.StringBuilder): RichStringBuilder = new RichStringBuilder(sb)
-
-  implicit def toRichStorageLevel(sl: StorageLevel): RichStorageLevel = new RichStorageLevel(sl)
 
   implicit def toTruncatable(s: String): Truncatable = s.truncatable()
 
@@ -112,17 +100,31 @@ trait Implicits {
   implicit def toRichJoinedRegionValue(jrv: JoinedRegionValue): RichJoinedRegionValue =
     new RichJoinedRegionValue(jrv)
 
+  implicit def valueToRichCodeRegion(r: Value[Region]): RichCodeRegion = new RichCodeRegion(r)
+
   implicit def toRichCodeRegion(r: Code[Region]): RichCodeRegion = new RichCodeRegion(r)
 
   implicit def toRichCodeRegionValueBuilder(rvb: Code[RegionValueBuilder]): RichCodeRegionValueBuilder = new RichCodeRegionValueBuilder(rvb)
 
-  implicit def toRichCodeRegionValueAggregator(rva: Code[RegionValueAggregator]): RichCodeRegionValueAggregator = new RichCodeRegionValueAggregator(rva)
-
   implicit def toRichPartialKleisliOptionFunction[A, B](x: PartialFunction[A, Option[B]]): RichPartialKleisliOptionFunction[A, B] = new RichPartialKleisliOptionFunction(x)
 
-  implicit def toContextPairRDDFunctions[C <: AutoCloseable, K: ClassTag, V: ClassTag](x: ContextRDD[C, (K, V)]): ContextPairRDDFunctions[C, K, V] = new ContextPairRDDFunctions(x)
+  implicit def toContextPairRDDFunctions[K: ClassTag, V: ClassTag](x: ContextRDD[(K, V)]): ContextPairRDDFunctions[K, V] = new ContextPairRDDFunctions(x)
 
-  implicit def toRichContextRDD[T: ClassTag](x: ContextRDD[RVDContext, T]): RichContextRDD[T] = new RichContextRDD(x)
+  implicit def toRichContextRDD[T: ClassTag](x: ContextRDD[T]): RichContextRDD[T] = new RichContextRDD(x)
 
-  implicit def toRichCodeInputBuffer(in: Code[InputBuffer]): RichCodeInputBuffer = new RichCodeInputBuffer(in)
+  implicit def toRichContextRDDRow(x: ContextRDD[Row]): RichContextRDDRow = new RichContextRDDRow(x)
+
+  implicit def valueToRichCodeInputBuffer(in: Value[InputBuffer]): RichCodeInputBuffer = new RichCodeInputBuffer(in)
+
+  implicit def valueToRichCodeOutputBuffer(out: Value[OutputBuffer]): RichCodeOutputBuffer = new RichCodeOutputBuffer(out)
+
+  implicit def toRichCodeArray[T](cs: IndexedSeq[Code[T]]): RichCodeIndexedSeq[T] = new RichCodeIndexedSeq[T](cs)
+
+  implicit def valueToRichCodeArray[T](cs: IndexedSeq[Value[T]]): RichCodeIndexedSeq[T] = new RichCodeIndexedSeq[T](cs.map(_.get))
+
+  implicit def toRichCodeIterator[T](it: Code[Iterator[T]]): RichCodeIterator[T] = new RichCodeIterator[T](it)
+
+  implicit def valueToRichCodeIterator[T](it: Value[Iterator[T]]): RichCodeIterator[T] = new RichCodeIterator[T](it)
+
+  implicit def toRichCodeIntPacker(p: Code[IntPacker]): RichCodeIntPacker = new RichCodeIntPacker(p)
 }

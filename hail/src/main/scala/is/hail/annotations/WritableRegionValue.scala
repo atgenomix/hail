@@ -3,15 +3,20 @@ package is.hail.annotations
 import java.io.{ObjectInputStream, ObjectOutputStream}
 
 import scala.collection.generic.Growable
-import scala.collection.mutable.ArrayBuffer
-import is.hail.expr.types._
-import is.hail.expr.types.physical.{PBaseStruct, PStruct, PType}
+import scala.collection.mutable.{ArrayBuffer, PriorityQueue}
+import is.hail.types.physical.{PStruct, PType}
 import is.hail.rvd.RVDContext
 import sun.reflect.generics.reflectiveObjects.NotImplementedException
 
 object WritableRegionValue {
   def apply(t: PType, initial: RegionValue, region: Region): WritableRegionValue =
     WritableRegionValue(t, initial.region, initial.offset, region)
+
+  def apply(t: PType, initialOffset: Long, targetRegion: Region): WritableRegionValue = {
+    val wrv = WritableRegionValue(t, targetRegion)
+    wrv.set(initialOffset, deepCopy = true)
+    wrv
+  }
 
   def apply(t: PType, initialRegion: Region, initialOffset: Long, targetRegion: Region): WritableRegionValue = {
     val wrv = WritableRegionValue(t, targetRegion)
@@ -34,6 +39,14 @@ class WritableRegionValue private (
   def offset: Long = value.offset
 
   def setSelect(fromT: PStruct, fromFieldIdx: Array[Int], fromRV: RegionValue) {
+    setSelect(fromT, fromFieldIdx, fromRV.region, fromRV.offset)
+  }
+
+  def setSelect(fromT: PStruct, fromFieldIdx: Array[Int], fromRegion: Region, fromOffset: Long) {
+    setSelect(fromT, fromFieldIdx, fromOffset, region.ne(fromRegion))
+  }
+
+  def setSelect(fromT: PStruct, fromFieldIdx: Array[Int], fromOffset: Long, deepCopy: Boolean) {
     (t: @unchecked) match {
       case t: PStruct =>
         region.clear()
@@ -41,7 +54,7 @@ class WritableRegionValue private (
         rvb.startStruct()
         var i = 0
         while (i < t.size) {
-          rvb.addField(fromT, fromRV, fromFieldIdx(i))
+          rvb.addField(fromT, fromOffset, fromFieldIdx(i), deepCopy)
           i += 1
         }
         rvb.endStruct()
@@ -52,9 +65,13 @@ class WritableRegionValue private (
   def set(rv: RegionValue): Unit = set(rv.region, rv.offset)
 
   def set(fromRegion: Region, fromOffset: Long) {
+    set(fromOffset, region.ne(fromRegion))
+  }
+
+  def set(fromOffset: Long, deepCopy: Boolean) {
     region.clear()
     rvb.start(t)
-    rvb.addRegionValue(t, fromRegion, fromOffset)
+    rvb.addRegionValue(t, fromOffset, deepCopy)
     value.setOffset(rvb.end())
   }
 
@@ -67,6 +84,39 @@ class WritableRegionValue private (
   private def readObject(s: ObjectInputStream): Unit = {
     throw new NotImplementedException()
   }
+}
+
+class RegionValuePriorityQueue(val t: PType, ctx: RVDContext, ord: Ordering[RegionValue])
+  extends Iterable[RegionValue]
+{
+  private val queue = new PriorityQueue[RegionValue]()(ord)
+  private val rvb = new RegionValueBuilder(null)
+
+  override def nonEmpty: Boolean = queue.nonEmpty
+
+  def empty: Boolean = queue.nonEmpty
+
+  override def head: RegionValue = queue.head
+
+  def enqueue(rv: RegionValue) {
+    val region = ctx.freshRegion()
+    rvb.set(region)
+    rvb.start(t)
+    rvb.addRegionValue(t, rv)
+    queue.enqueue(RegionValue(region, rvb.end()))
+  }
+
+  def +=(rv: RegionValue): this.type = {
+    enqueue(rv)
+    this
+  }
+
+  def dequeue() {
+    val popped = queue.dequeue()
+    popped.region.close()
+  }
+
+  def iterator: Iterator[RegionValue] = queue.iterator
 }
 
 class RegionValueArrayBuffer(val t: PType, region: Region)

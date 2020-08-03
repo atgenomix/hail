@@ -2,6 +2,8 @@ package is.hail.utils
 
 import java.io.InputStream
 
+import is.hail.io.fs.Seekable
+
 class ByteTrackingInputStream(base: InputStream) extends InputStream {
   var bytesRead = 0L
 
@@ -29,4 +31,13 @@ class ByteTrackingInputStream(base: InputStream) extends InputStream {
   }
 
   override def close(): Unit = base.close()
+
+  def seek(offset: Long): Unit = {
+    base match {
+      case base: Seekable =>
+        base.seek(offset)
+      case base: org.apache.hadoop.fs.Seekable =>
+        base.seek(offset)
+    }
+  }
 }

@@ -1,8 +1,7 @@
 package is.hail.utils
 
-import is.hail.expr.types._
 import is.hail.annotations._
-import is.hail.expr.types.virtual.{TArray, TInt64}
+import is.hail.types.virtual.{TArray, TInt64}
 
 import scala.collection.mutable
 
@@ -37,7 +36,7 @@ class MissingLongArrayBuilder extends Serializable {
     }
   }
 
-  val typ = TArray(TInt64())
+  val typ = TArray(TInt64)
   
   def write(rvb: RegionValueBuilder) {
     rvb.startArray(len)

@@ -61,6 +61,7 @@ class Tests(unittest.TestCase):
         self.assertTrue(ds.annotate_rows(target=interval_list2[ds.locus].target).rows()
                         ._same(ds.annotate_rows(target=bed2[ds.locus].target).rows()))
 
+    @skip_unless_spark_backend()
     def test_maximal_independent_set(self):
         # prefer to remove nodes with higher index
         t = hl.utils.range_table(10)
@@ -76,6 +77,7 @@ class Tests(unittest.TestCase):
         self.assertRaises(ValueError, lambda: hl.maximal_independent_set(graph.i, hl.utils.range_table(10).idx, True))
         self.assertRaises(ValueError, lambda: hl.maximal_independent_set(hl.literal(1), hl.literal(2), True))
 
+    @skip_unless_spark_backend()
     def test_maximal_independent_set2(self):
         edges = [(0, 4), (0, 1), (0, 2), (1, 5), (1, 3), (2, 3), (2, 6),
                  (3, 7), (4, 5), (4, 6), (5, 7), (6, 7)]
@@ -91,6 +93,7 @@ class Tests(unittest.TestCase):
         non_maximal_indep_sets = [{0, 7}, {6, 1}]
         self.assertTrue(mis in non_maximal_indep_sets or mis in maximal_indep_sets)
 
+    @skip_unless_spark_backend()
     def test_maximal_independent_set3(self):
         is_case = {"A", "C", "E", "G", "H"}
         edges = [("A", "B"), ("C", "D"), ("E", "F"), ("G", "H")]
@@ -112,6 +115,7 @@ class Tests(unittest.TestCase):
         self.assertTrue(mis.all(mis.node.is_case))
         self.assertTrue(set([row.id for row in mis.select(mis.node.id).collect()]) in expected_sets)
 
+    @skip_unless_spark_backend()
     def test_maximal_independent_set_types(self):
         ht = hl.utils.range_table(10)
         ht = ht.annotate(i=hl.struct(a='1', b=hl.rand_norm(0, 1)),
@@ -119,6 +123,13 @@ class Tests(unittest.TestCase):
         ht = ht.annotate(ii=hl.struct(id=ht.i, rank=hl.rand_norm(0, 1)),
                          jj=hl.struct(id=ht.j, rank=hl.rand_norm(0, 1)))
         hl.maximal_independent_set(ht.ii, ht.jj).count()
+
+    @skip_unless_spark_backend()
+    def test_maximal_independent_set_on_floats(self):
+        t = hl.utils.range_table(1).annotate(l = hl.struct(s="a", x=3.0), r = hl.struct(s="b", x=2.82))
+        expected = [hl.Struct(node=hl.Struct(s="a", x=3.0))]
+        actual = hl.maximal_independent_set(t.l, t.r, keep=False, tie_breaker=lambda l,r: l.x - r.x).collect()
+        assert actual == expected
 
     def test_matrix_filter_intervals(self):
         ds = hl.import_vcf(resource('sample.vcf'), min_partitions=20)
@@ -173,25 +184,6 @@ class Tests(unittest.TestCase):
                                  hl.Struct(locus=hl.Locus('20', 10644700), alleles=['A', 'T']))]
         self.assertEqual(hl.filter_intervals(ds, intervals).count_rows(), 3)
 
-    def test_window_by_locus(self):
-        mt = hl.utils.range_matrix_table(100, 2, n_partitions=10)
-        mt = mt.annotate_rows(locus=hl.locus('1', mt.row_idx + 1))
-        mt = mt.key_rows_by('locus')
-        mt = mt.annotate_entries(e_row_idx=mt.row_idx, e_col_idx=mt.col_idx)
-        mt = hl.window_by_locus(mt, 5).cache()
-
-        self.assertEqual(mt.count_rows(), 100)
-
-        rows = mt.rows()
-        self.assertTrue(rows.all((rows.row_idx < 5) | (rows.prev_rows.length() == 5)))
-        self.assertTrue(rows.all(hl.all(lambda x: (rows.row_idx - 1 - x[0]) == x[1].row_idx,
-                                        hl.zip_with_index(rows.prev_rows))))
-
-        entries = mt.entries()
-        self.assertTrue(entries.all(hl.all(lambda x: x.e_col_idx == entries.col_idx, entries.prev_entries)))
-        self.assertTrue(entries.all(hl.all(lambda x: entries.row_idx - 1 - x[0] == x[1].e_row_idx,
-                                           hl.zip_with_index(entries.prev_entries))))
-
     def test_summarize_variants(self):
         mt = hl.utils.range_matrix_table(3, 3)
         variants = hl.literal({0: hl.Struct(locus=hl.Locus('1', 1), alleles=['A', 'T', 'C']),
@@ -208,3 +200,11 @@ class Tests(unittest.TestCase):
         mt = hl.import_vcf(resource('sample2.vcf'))  # has multiallelics
         with self.assertRaises(hl.utils.FatalError):
             hl.methods.misc.require_biallelic(mt, '')._force_count_rows()
+
+    def test_lambda_gc(self):
+        N = 5000000
+        ht = hl.utils.range_table(N).annotate(x = hl.scan.count() / N, x2 = (hl.scan.count() / N) ** 1.5)
+        lgc = hl.lambda_gc(ht.x)
+        lgc2 = hl.lambda_gc(ht.x2)
+        self.assertAlmostEqual(lgc, 1, places=1)  # approximate, 1 place is safe
+        self.assertAlmostEqual(lgc2, 1.89, places=1)  # approximate, 1 place is safe

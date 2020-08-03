@@ -22,6 +22,7 @@ class Tests(unittest.TestCase):
         col_filter = col_lengths > 0
         return np.copy(a[:, np.squeeze(col_filter)] / col_lengths[col_filter])
 
+    @skip_unless_spark_backend()
     def test_linear_mixed_model_fastlmm(self):
         # FastLMM Test data is from all.bed, all.bim, all.fam, cov.txt, pheno_10_causals.txt:
         #   https://github.com/MicrosoftGenomics/FaST-LMM/tree/master/tests/datasets/synth
@@ -75,7 +76,7 @@ class Tests(unittest.TestCase):
         assert np.isclose(model.h_sq, h2_fastlmm)
 
         h2_std_error = 0.13770773  # hard coded having checked against plot
-        assert np.isclose(model.h_sq_standard_error, h2_std_error)
+        assert np.isclose(model.h_sq_standard_error, h2_std_error, 1e-03)
 
         h_sq_norm_lkhd = model.h_sq_normalized_lkhd()[1:-1]
         argmax = int(100 * h2_fastlmm)
@@ -96,7 +97,7 @@ class Tests(unittest.TestCase):
         assert np.allclose(res['beta'], beta_fastlmm)
         assert np.allclose(res['p_value'], pval_hail)
 
-        pa_t_path = utils.new_temp_file(suffix='bm')
+        pa_t_path = utils.new_temp_file(extension='bm')
         BlockMatrix.from_numpy(pa.T).write(pa_t_path, force_row_major=True)
 
         res = model.fit_alternatives(pa_t_path).to_pandas()
@@ -127,10 +128,10 @@ class Tests(unittest.TestCase):
         assert np.allclose(res['beta'], beta_fastlmm)
         assert np.allclose(res['p_value'], pval_hail)
 
-        a_t_path = utils.new_temp_file(suffix='bm')
+        a_t_path = utils.new_temp_file(extension='bm')
         BlockMatrix.from_numpy(a.T).write(a_t_path, force_row_major=True)
 
-        pa_t_path = utils.new_temp_file(suffix='bm')
+        pa_t_path = utils.new_temp_file(extension='bm')
         BlockMatrix.from_numpy(pa.T).write(pa_t_path, force_row_major=True)
 
         res = model.fit_alternatives(pa_t_path, a_t_path).to_pandas()
@@ -176,6 +177,7 @@ class Tests(unittest.TestCase):
         assert np.isclose(model.h_sq, h2_fastlmm)
         assert np.isclose(model.h_sq_standard_error, h2_std_error)
 
+    @skip_unless_spark_backend()
     def test_linear_mixed_model_math(self):
         gamma = 2.0  # testing at fixed value of gamma
         n, f, m = 4, 2, 3
@@ -263,6 +265,7 @@ class Tests(unittest.TestCase):
         self.assertAlmostEqual(stats.beta, beta1[0])
         self.assertAlmostEqual(stats.chi_sq, chi_sq)
 
+    @skip_unless_spark_backend()
     def test_linear_mixed_model_function(self):
         n, f, m = 4, 2, 3
         y = np.array([0.0, 1.0, 8.0, 9.0])
@@ -314,6 +317,7 @@ class Tests(unittest.TestCase):
         assert model0._same(model)
         assert np.allclose(p0, p.to_numpy())
 
+    @skip_unless_spark_backend()
     def test_linear_mixed_regression_full_rank(self):
         x_table = hl.import_table(resource('fastlmmCov.txt'), no_header=True, impute=True).key_by('f1')
         y_table = hl.import_table(resource('fastlmmPheno.txt'), no_header=True, impute=True, delimiter=' ').key_by('f1')
@@ -343,6 +347,7 @@ class Tests(unittest.TestCase):
         assert np.allclose(ht.beta.collect(), beta_fastlmm)
         assert np.allclose(ht.p_value.collect(), pval_hail)
 
+    @skip_unless_spark_backend()
     def test_linear_mixed_regression_low_rank(self):
         x_table = hl.import_table(resource('fastlmmCov.txt'), no_header=True, impute=True).key_by('f1')
         y_table = hl.import_table(resource('fastlmmPheno.txt'), no_header=True, impute=True, delimiter=' ').key_by('f1')
@@ -372,6 +377,7 @@ class Tests(unittest.TestCase):
         assert np.allclose(ht.beta.collect(), beta_hail)
         assert np.allclose(ht.p_value.collect(), pval_hail)
 
+    @skip_unless_spark_backend()
     def test_linear_mixed_regression_pass_through(self):
         x_table = hl.import_table(resource('fastlmmCov.txt'), no_header=True, impute=True).key_by('f1')
         y_table = hl.import_table(resource('fastlmmPheno.txt'), no_header=True, impute=True, delimiter=' ').key_by('f1')

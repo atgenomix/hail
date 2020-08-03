@@ -3,8 +3,9 @@ package is.hail.utils.richUtils
 import java.io.PrintWriter
 
 import is.hail.annotations.{Region, RegionValue, RegionValueBuilder}
-import is.hail.expr.types.physical.PStruct
-import is.hail.expr.types.virtual.TStruct
+import is.hail.types.physical.PStruct
+import is.hail.types.virtual.TStruct
+import is.hail.rvd.RVDContext
 
 import scala.collection.JavaConverters._
 import scala.io.Source
@@ -12,6 +13,13 @@ import is.hail.utils.{FlipbookIterator, StagingIterator, StateMachine}
 import org.apache.spark.sql.Row
 
 import scala.reflect.ClassTag
+
+class RichIteratorLong(val it: Iterator[Long]) extends AnyVal {
+  def toIteratorRV(region: Region): Iterator[RegionValue] = {
+    val rv = RegionValue(region)
+    it.map(ptr => { rv.setOffset(ptr); rv })
+  }
+}
 
 class RichIterator[T](val it: Iterator[T]) extends AnyVal {
   def toStagingIterator: StagingIterator[T] = {
@@ -40,18 +48,17 @@ class RichIterator[T](val it: Iterator[T]) extends AnyVal {
   def pipe(pb: ProcessBuilder,
     printHeader: (String => Unit) => Unit,
     printElement: (String => Unit, T) => Unit,
-    printFooter: (String => Unit) => Unit): (Iterator[String], Process) = {
+    printFooter: (String => Unit) => Unit): (Iterator[String], StringBuilder, Process) = {
 
     val command = pb.command().asScala.mkString(" ")
 
     val proc = pb.start()
 
-    // Start a thread to print the process's stderr to ours
+    val error = new StringBuilder()
+    // Start a thread capture the process stderr
     new Thread("stderr reader for " + command) {
       override def run() {
-        for (line <- Source.fromInputStream(proc.getErrorStream).getLines) {
-          System.err.println(line)
-        }
+        Source.fromInputStream(proc.getErrorStream).addString(error)
       }
     }.start()
 
@@ -67,8 +74,10 @@ class RichIterator[T](val it: Iterator[T]) extends AnyVal {
       }
     }.start()
 
-    // Return an iterator that read lines from the process's stdout
-    (Source.fromInputStream(proc.getInputStream).getLines(), proc)
+    // Return an iterator that reads lines from the process's stdout,
+    // a StringBuilder that captures standard error that should not be read
+    // from or written to until waiting for the process, and the process itself
+    (Source.fromInputStream(proc.getInputStream).getLines(), error, proc)
   }
 
   def trueGroupedIterator(groupSize: Int): Iterator[Iterator[T]] =
@@ -103,17 +112,17 @@ class RichIterator[T](val it: Iterator[T]) extends AnyVal {
   def toFastSeq(implicit tct: ClassTag[T]): Seq[T] = toFastIndexedSeq
 
   def toFastIndexedSeq(implicit tct: ClassTag[T]): IndexedSeq[T] = it.toArray[T]
+
+  def headOption: Option[T] = if (it.isEmpty) None else Some(it.next())
 }
 
 class RichRowIterator(val it: Iterator[Row]) extends AnyVal {
-  def toRegionValueIterator(region: Region, rowTyp: PStruct): Iterator[RegionValue] = {
+  def copyToRegion(region: Region, rowTyp: PStruct): Iterator[Long] = {
     val rvb = new RegionValueBuilder(region)
-    val rv = RegionValue(region)
     it.map { row =>
       rvb.start(rowTyp)
       rvb.addAnnotation(rowTyp.virtualType, row)
-      rv.setOffset(rvb.end())
-      rv
+      rvb.end()
     }
   }
 }

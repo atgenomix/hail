@@ -1,13 +1,10 @@
 package is.hail.utils
 
-import org.testng.annotations.Test
+import org.scalatest.Matchers._
 import org.scalatest._
-import Matchers._
-import is.hail.expr.types._
-import is.hail.table.Table
-import org.apache.spark.sql.Row
+import org.testng.annotations.Test
+
 import scala.collection.mutable
-import is.hail.SparkSuite
 
 
 class GraphSuite {
@@ -100,7 +97,7 @@ class GraphSuite {
   @Test def tieBreakingOfBipartiteGraphWorks() {
     val g = mkGraph(for (i <- 0 until 10) yield (i, i + 10))
     // prefer to remove big numbers
-    val actual = maximalIndependentSet(g, Some((l: Int, r: Int) => (l - r).toLong))
+    val actual = maximalIndependentSet(g, Some((l: Int, r: Int) => (l - r).toDouble))
 
     assert(isIndependentSet(actual, g))
     assert(actual.length == 10)
@@ -111,7 +108,7 @@ class GraphSuite {
   @Test def tieBreakingInLongCycleWorks() {
     val g = mkGraph(0 -> 1, 1 -> 2, 2 -> 3, 3 -> 4, 4 -> 5, 5 -> 6, 6 -> 0)
     // prefers to remove small numbers
-    val actual = maximalIndependentSet(g, Some((l: Int, r: Int) => (r - l).toLong))
+    val actual = maximalIndependentSet(g, Some((l: Int, r: Int) => (r - l).toDouble))
 
     assert(isIndependentSet(actual, g))
     assert(actual.length == 3)

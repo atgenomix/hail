@@ -1,0 +1,6 @@
+/python/dist/
+/python/benchmark_hail.egg-info/
+*.whl
+/requirements.txt
+image_sha
+pushed_image

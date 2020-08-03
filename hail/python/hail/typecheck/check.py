@@ -9,7 +9,8 @@ class TypecheckFailure(Exception):
     pass
 
 
-identity = lambda x: x
+def identity(x):
+    return x
 
 
 def extract(t):
@@ -36,6 +37,31 @@ class TypeChecker(object):
 
     def format(self, arg):
         return f"{extract(type(arg))}: {arg}"
+
+
+class DeferredChecker(TypeChecker):
+    def __init__(self, f):
+        super().__init__()
+        self.f = f
+        self._tc = None
+
+    @property
+    def tc(self):
+        if self._tc is None:
+            t = self.f()
+            if isinstance(t, type):
+                self._tc = LiteralChecker(t)
+            elif isinstance(t, TypeChecker):
+                self._tc = t
+            else:
+                raise RuntimeError("deferred typechecker must return 'type' or 'TypeChecker', found '%s'" % type(t))
+        return self._tc
+
+    def check(self, x, caller, param):
+        return self.tc.check(x, caller, param)
+
+    def expects(self):
+        return self.tc.expects()
 
 
 class MultipleTypeChecker(TypeChecker):
@@ -166,6 +192,26 @@ class SizedTupleChecker(TypeChecker):
         return 'tuple[' + ','.join(["{}".format(ec.expects()) for ec in self.ec]) + ']'
 
 
+class SliceChecker(TypeChecker):
+    def __init__(self, start_checker, stop_checker, step_checker):
+        self.startc = start_checker
+        self.stopc = stop_checker
+        self.stepc = step_checker
+        super(SliceChecker, self).__init__()
+
+    def check(self, x, caller, param):
+        if not isinstance(x, slice):
+            raise TypecheckFailure
+        start_ = self.startc.check(x.start, caller, param)
+        stop_ = self.stopc.check(x.stop, caller, param)
+        step_ = self.stepc.check(x.step, caller, param)
+
+        return slice(start_, stop_, step_)
+
+    def expects(self):
+        return f'slice[{self.startc.expects()}, {self.stopc.expects()}, {self.stepc.expects()}]'
+
+
 class LinkedListChecker(TypeChecker):
     def __init__(self, type):
         self.type = type
@@ -216,8 +262,7 @@ class LiteralChecker(TypeChecker):
     def check(self, x, caller, param):
         if isinstance(x, self.t):
             return x
-        else:
-            raise TypecheckFailure
+        raise TypecheckFailure
 
     def expects(self):
         return extract(self.t)
@@ -342,10 +387,12 @@ class FunctionChecker(TypeChecker):
 def only(t):
     if isinstance(t, type):
         return LiteralChecker(t)
+    elif callable(t):
+        return DeferredChecker(t)
     elif isinstance(t, TypeChecker):
         return t
     else:
-        raise RuntimeError("invalid typecheck signature: expected 'type' or 'TypeChecker', found '%s'" % type(t))
+        raise RuntimeError("invalid typecheck signature: expected 'type', 'lambda', or 'TypeChecker', found '%s'" % type(t))
 
 
 def exactly(v, reference_equality=False):
@@ -376,6 +423,10 @@ def sized_tupleof(*args):
     return SizedTupleChecker(*[only(x) for x in args])
 
 
+def sliceof(startt, stopt, stept):
+    return SliceChecker(only(startt), only(stopt), only(stept))
+
+
 def linked_list(t):
     return LinkedListChecker(t)
 
@@ -391,7 +442,9 @@ def dictof(k, v):
 def func_spec(n, tc):
     return FunctionChecker(n, only(tc))
 
+
 anyfunc = AnyFuncChecker()
+
 
 def transformed(*tcs):
     fs = []
@@ -507,11 +560,11 @@ def check_all(f, args, kwargs, checks, is_method):
             except TypecheckFailure as e:
                 raise TypeError("{fname}: parameter '{argname}': "
                                 "expected {expected}, found {found}".format(
-                    fname=name,
-                    argname=arg_name,
-                    expected=checker.expects(),
-                    found=checker.format(arg)
-                )) from e
+                                    fname=name,
+                                    argname=arg_name,
+                                    expected=checker.expects(),
+                                    found=checker.format(arg)
+                                )) from e
         elif param.kind == param.VAR_POSITIONAL:
             # consume the rest of the positional arguments
             varargs = args[i:]
@@ -521,13 +574,13 @@ def check_all(f, args, kwargs, checks, is_method):
                 except TypecheckFailure as e:
                     raise TypeError("{fname}: parameter '*{argname}' (arg {idx} of {tot}): "
                                     "expected {expected}, found {found}".format(
-                        fname=name,
-                        argname=arg_name,
-                        idx=j,
-                        tot=len(varargs),
-                        expected=checker.expects(),
-                        found=checker.format(arg)
-                    )) from e
+                                        fname=name,
+                                        argname=arg_name,
+                                        idx=j,
+                                        tot=len(varargs),
+                                        expected=checker.expects(),
+                                        found=checker.format(arg)
+                                    )) from e
         else:
             assert param.kind == param.VAR_KEYWORD
             # kwargs now holds all variable kwargs
@@ -537,10 +590,10 @@ def check_all(f, args, kwargs, checks, is_method):
                 except TypecheckFailure as e:
                     raise TypeError("{fname}: keyword argument '{argname}': "
                                     "expected {expected}, found {found}".format(
-                        fname=name,
-                        argname=kwarg_name,
-                        expected=checker.expects(),
-                        found=checker.format(arg))) from e
+                                        fname=name,
+                                        argname=kwarg_name,
+                                        expected=checker.expects(),
+                                        found=checker.format(arg))) from e
     return args_, kwargs_
 
 

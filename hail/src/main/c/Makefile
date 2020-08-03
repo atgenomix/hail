@@ -1,5 +1,5 @@
 MAKEFLAGS += --no-builtin-rules
-.PHONY: all clean debug prebuilt test
+.PHONY: all clean debug prebuilt test reset-prebuilt
 .SUFFIXES:
 .DEFAULT_GOAL := all
 
@@ -23,7 +23,7 @@ LIBSIMDPP := libsimdpp-2.1
 CATCH_HEADER_LOCATION := ../resources/include/catch.hpp
 
 # If you want to add a new cpp file, like foo.cpp, to the library, add foo to
-# this list
+# this list. Remember to rerun make prebuilt.
 OBJECTS := \
   davies \
   ibs \
@@ -39,6 +39,7 @@ OBJECTS := \
   PartitionIterators \
   Region \
   Upcalls \
+  FS \
 
 BUILD_OBJECTS := $(OBJECTS:%=$(BUILD)/%.o)
 
@@ -160,15 +161,14 @@ $(BUILD)/functional-tests: ibs.cpp test.cpp $(LIBSIMDPP)
 
 $(BUILD)/unit-tests: $(BUILD_OBJECTS) $(TEST_OBJECTS)
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -ldl -o $(BUILD)/unit-tests $(BUILD_OBJECTS) $(TEST_OBJECTS)
+	$(CXX) $(CXXFLAGS) -o $(BUILD)/unit-tests $(BUILD_OBJECTS) $(TEST_OBJECTS) -ldl
 
-$(PREBUILT)/$(LIBBOOT): $(LIBBOOT)
-	cp -p -f $< $@
+prebuilt: $(LIBBOOT) $(LIBHAIL)
+	cp -p -f $^ $(PREBUILT)/$(dir $<)
 
-$(PREBUILT)/$(LIBHAIL): $(LIBHAIL)
-	cp -p -f $< $@
-
-prebuilt: $(PREBUILT)/$(LIBBOOT) $(PREBUILT)/$(LIBHAIL)
+reset-prebuilt:
+	git checkout HEAD -- $(PREBUILT)/$(LIBBOOT)
+	git checkout HEAD -- $(PREBUILT)/$(LIBHAIL)
 
 test: $(BUILD)/functional-tests $(BUILD)/unit-tests
 	./$(BUILD)/unit-tests -w NoAssertions -s -d yes -# --use-colour yes -r xml -o $(BUILD)/cxx-test.xml; \
@@ -190,7 +190,7 @@ benchmark: $(BUILD)/unit-tests
 			esac
 
 clean:
-	-rm -rf $(BUILD) $(LIBSIMDPP) $(LIBBOOT) $(LIBHAIL)
+	-rm -rf $(BUILD) $(LIBSIMDPP) lib
 
 # We take all headers files visible to dynamic-generated code, together with
 # the output of "$(CXX) --version", to give a checksum $(ALL_HEADER_CKSUM)
@@ -217,9 +217,9 @@ $(LIBSIMDPP): $(LIBSIMDPP).tar.gz
 	tar -xzf $<
 
 $(LIBBOOT): $(BUILD)/NativeBoot.o
-	@mkdir -p $(basename $(LIBBOOT))
+	@mkdir -p $(dir $(LIBBOOT))
 	$(CXX) $(LIBFLAGS) $(LIBDIRS) $(CXXFLAGS) $(BUILD)/NativeBoot.o -o $@
 
 $(LIBHAIL): $(BUILD_OBJECTS)
-	@mkdir -p $(basename $(LIBHAIL))
+	@mkdir -p $(dir $(LIBHAIL))
 	$(CXX) $(LIBFLAGS) $(LIBDIRS) $(CXXFLAGS) $(BUILD_OBJECTS) -o $@

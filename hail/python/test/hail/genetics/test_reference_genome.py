@@ -49,6 +49,7 @@ class Tests(unittest.TestCase):
                                               resource("fake_reference.fasta.fai"),
                                               mt_contigs=["b", "c"], x_contigs=["a"])
         self.assertTrue(gr4.has_sequence())
+        self.assertEqual(gr4._sequence_files, (resource("fake_reference.fasta"), resource("fake_reference.fasta.fai")))
         self.assertTrue(gr4.x_contigs == ["a"])
 
         t = hl.import_table(resource("fake_reference.tsv"), impute=True)
@@ -63,6 +64,7 @@ class Tests(unittest.TestCase):
         gr4.add_sequence(resource("fake_reference.fasta"),
                          resource("fake_reference.fasta.fai"))
         assert gr4.has_sequence()
+        self.assertEqual(gr4._sequence_files, (resource("fake_reference.fasta"), resource("fake_reference.fasta.fai")))
 
     def test_reference_genome_liftover(self):
         grch37 = hl.get_reference('GRCh37')
@@ -71,11 +73,14 @@ class Tests(unittest.TestCase):
         self.assertTrue(not grch37.has_liftover('GRCh38') and not grch38.has_liftover('GRCh37'))
         grch37.add_liftover(resource('grch37_to_grch38_chr20.over.chain.gz'), 'GRCh38')
         grch38.add_liftover(resource('grch38_to_grch37_chr20.over.chain.gz'), 'GRCh37')
-        self.assertTrue(grch37.has_liftover('GRCh38') and grch38.has_liftover('GRCh37'))
+        assert grch37.has_liftover('GRCh38')
+        assert grch38.has_liftover('GRCh37')
+        self.assertEquals(grch37._liftovers, {'GRCh38': resource('grch37_to_grch38_chr20.over.chain.gz')})
+        self.assertEquals(grch38._liftovers, {'GRCh37': resource('grch38_to_grch37_chr20.over.chain.gz')})
 
         ds = hl.import_vcf(resource('sample.vcf'))
         t = ds.annotate_rows(liftover=hl.liftover(hl.liftover(ds.locus, 'GRCh38'), 'GRCh37')).rows()
-        self.assertTrue(t.all(t.locus == t.liftover))
+        assert t.all(t.locus == t.liftover)
 
         null_locus = hl.null(hl.tlocus('GRCh38'))
 
@@ -135,3 +140,33 @@ class Tests(unittest.TestCase):
             hl.eval(hl.liftover(hl.parse_locus_interval('1:10000-10000', reference_genome='GRCh37'), 'GRCh38'))
 
         grch37.remove_liftover("GRCh38")
+
+    def test_read_custom_reference_genome(self):
+        # this test doesn't behave properly if these reference genomes are already defined in scope.
+        available_rgs = set(hl.ReferenceGenome._references.keys())
+        self.assertTrue('test_rg_0' not in available_rgs)
+        self.assertTrue('test_rg_1' not in available_rgs)
+        self.assertTrue('test_rg_2' not in available_rgs)
+
+        def assert_rg_loaded_correctly(name):
+            rg = hl.get_reference(name)
+            self.assertEqual(rg.contigs, ["1", "X", "Y", "MT"])
+            self.assertEqual(rg.lengths, {"1": 5, "X": 4, "Y": 3, "MT": 2})
+            self.assertEqual(rg.x_contigs, ["X"])
+            self.assertEqual(rg.y_contigs, ["Y"])
+            self.assertEqual(rg.mt_contigs, ["MT"])
+            self.assertEqual(rg.par, [hl.Interval(start=hl.Locus("X", 2, name), end=hl.Locus("X", 4, name))])
+
+
+        self.assertEqual(hl.read_table(resource('custom_references.t')).count(), 14)
+        assert_rg_loaded_correctly('test_rg_0')
+        assert_rg_loaded_correctly('test_rg_1')
+
+        # loading different reference genome with same name should fail
+        # (different `test_rg_o` definition)
+        with self.assertRaises(FatalError):
+            hl.read_matrix_table(resource('custom_references_2.t')).count()
+
+        self.assertEqual(hl.read_matrix_table(resource('custom_references.mt')).count_rows(), 14)
+        assert_rg_loaded_correctly('test_rg_1')
+        assert_rg_loaded_correctly('test_rg_2')

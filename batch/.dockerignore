@@ -1,5 +1,7 @@
-batch.log
-logs
-*~
-*.pyc
+**/*.log
+**/*.pyc
+**/*~
 **/__pycache__
+.pytest_cache/
+build
+dist

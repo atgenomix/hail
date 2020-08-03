@@ -1,78 +1,146 @@
 package is.hail.io.bgen
 
+import is.hail.HailContext
 import is.hail.annotations._
-import is.hail.asm4s.AsmFunction4
-import is.hail.expr.types._
-import is.hail.expr.types.physical.PStruct
-import is.hail.expr.types.virtual.{TStruct, Type}
-import is.hail.io.HadoopFSDataBinaryReader
+import is.hail.asm4s.{AsmFunction4, AsmFunction5}
+import is.hail.backend.BroadcastValue
+import is.hail.backend.spark.SparkBackend
+import is.hail.expr.ir.{ExecuteContext, PruneDeadFields}
+import is.hail.types._
+import is.hail.types.encoded.{EArray, EBaseStruct, EBinaryOptional, EBinaryRequired, EField, EInt32Optional, EInt32Required, EInt64Required}
+import is.hail.types.physical.{PArray, PCall, PCanonicalArray, PCanonicalCall, PCanonicalLocus, PCanonicalString, PCanonicalStruct, PFloat64Required, PInt32, PInt64, PLocus, PString, PStruct}
+import is.hail.types.virtual.{Field, TArray, TInt64, TLocus, TString, TStruct, Type}
+import is.hail.io.fs.FS
+import is.hail.io.{AbstractTypedCodecSpec, BlockingBufferSpec, HadoopFSDataBinaryReader, LEB128BufferSpec, LZ4HCBlockBufferSpec, StreamBlockBufferSpec, TypedCodecSpec}
 import is.hail.io.index.{IndexReader, IndexReaderBuilder, LeafChild}
 import is.hail.rvd._
 import is.hail.sparkextras._
+import is.hail.utils.FastIndexedSeq
 import is.hail.variant.ReferenceGenome
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.Row
 import org.apache.spark.{OneToOneDependency, Partition, SparkContext, TaskContext}
 
 import scala.language.reflectiveCalls
 
-sealed trait EntriesSetting
-final case object NoEntries extends EntriesSetting
-final case class EntriesWithFields (
-  gt: Boolean,
-  gp: Boolean,
-  dosage: Boolean
-) extends EntriesSetting
+object BgenSettings {
+  def indexKeyType(rg: Option[ReferenceGenome]): TStruct = TStruct(
+    "locus" -> rg.map(TLocus(_)).getOrElse(TLocus.representation),
+    "alleles" -> TArray(TString))
+  val indexAnnotationType: Type = TStruct.empty
 
-sealed case class RowFields (
-  varid: Boolean,
-  rsid: Boolean,
-  offset: Boolean,
-  fileIdx: Boolean
-)
+  def indexCodecSpecs(rg: Option[ReferenceGenome]): (AbstractTypedCodecSpec, AbstractTypedCodecSpec) = {
+    val bufferSpec = LEB128BufferSpec(
+      BlockingBufferSpec(32 * 1024,
+        LZ4HCBlockBufferSpec(32 * 1024,
+          new StreamBlockBufferSpec)))
+
+    val keyVType = indexKeyType(rg)
+    val keyEType = EBaseStruct(FastIndexedSeq(
+      EField("locus", EBaseStruct(FastIndexedSeq(
+        EField("contig", EBinaryRequired, 0),
+        EField("position", EInt32Required, 1))), 0),
+      EField("alleles", EArray(EBinaryOptional, required = false), 1)),
+      required = false)
+
+    val annotationVType = TStruct.empty
+    val annotationEType = EBaseStruct(FastIndexedSeq(), required = true)
+
+    val leafEType = EBaseStruct(FastIndexedSeq(
+      EField("first_idx", EInt64Required, 0),
+      EField("keys", EArray(EBaseStruct(FastIndexedSeq(
+        EField("key", keyEType, 0),
+        EField("offset", EInt64Required, 1),
+        EField("annotation", annotationEType, 2)
+      ), required = true), required = true), 1)
+    ))
+    val leafVType = TStruct(FastIndexedSeq(
+      Field("first_idx", TInt64, 0),
+      Field("keys", TArray(TStruct(FastIndexedSeq(
+        Field("key", keyVType, 0),
+        Field("offset", TInt64, 1),
+        Field("annotation", annotationVType, 2)
+      ))), 1)))
+
+    val internalNodeEType = EBaseStruct(FastIndexedSeq(
+      EField("children", EArray(EBaseStruct(FastIndexedSeq(
+        EField("index_file_offset", EInt64Required, 0),
+        EField("first_idx", EInt64Required, 1),
+        EField("first_key", keyEType, 2),
+        EField("first_record_offset", EInt64Required, 3),
+        EField("first_annotation", annotationEType, 4)
+      ), required = true), required = true), 0)
+    ))
+
+    val internalNodeVType = TStruct(FastIndexedSeq(
+      Field("children", TArray(TStruct(FastIndexedSeq(
+        Field("index_file_offset", TInt64, 0),
+        Field("first_idx", TInt64, 1),
+        Field("first_key", keyVType, 2),
+        Field("first_record_offset", TInt64, 3),
+        Field("first_annotation", annotationVType, 4)
+      ))), 0)
+    ))
+
+    (TypedCodecSpec(leafEType, leafVType, bufferSpec), (TypedCodecSpec(internalNodeEType, internalNodeVType, bufferSpec)))
+  }
+}
 
 case class BgenSettings(
   nSamples: Int,
-  entries: EntriesSetting,
-  dropCols: Boolean,
-  rowFields: RowFields,
-  rg: Option[ReferenceGenome],
+  requestedType: TableType,
+  rgBc: Option[BroadcastValue[ReferenceGenome]],
   indexAnnotationType: Type
 ) {
-  val (includeGT, includeGP, includeDosage) = entries match {
-    case NoEntries => (false, false, false)
-    case EntriesWithFields(gt, gp, dosage) => (gt, gp, dosage)
-  }
+  require(PruneDeadFields.isSupertype(requestedType, MatrixBGENReader.fullMatrixType(rg).canonicalTableType))
 
-  val matrixType: MatrixType = MatrixBGENReader.getMatrixType(
-    rg,
-    rowFields.rsid,
-    rowFields.varid,
-    rowFields.offset,
-    rowFields.fileIdx,
-    includeGT,
-    includeGP,
-    includeDosage
-  )
+  val entryType: Option[TStruct] = requestedType.rowType
+    .fieldOption(MatrixType.entriesIdentifier)
+    .map(f => f.typ.asInstanceOf[TArray].elementType.asInstanceOf[TStruct])
 
-  val typ: TStruct = entries match {
-    case NoEntries =>
-      matrixType.rowType
-    case _: EntriesWithFields =>
-      matrixType.rvRowType
-  }
+  val rowPType: PStruct = PCanonicalStruct(required = true,
+    Array(
+      "locus" -> PCanonicalLocus.schemaFromRG(rg, required = false),
+      "alleles" -> PCanonicalArray(PCanonicalString(false), false),
+      "rsid" -> PCanonicalString(),
+      "varid" -> PCanonicalString(),
+      "offset" -> PInt64(),
+      "file_idx" -> PInt32(),
+      MatrixType.entriesIdentifier -> PCanonicalArray(PCanonicalStruct(
+        Array(
+          "GT" -> PCanonicalCall(),
+          "GP" -> PCanonicalArray(PFloat64Required, required = true),
+          "dosage" -> PFloat64Required
+        ).filter { case (name, _) => entryType.exists(t => t.hasField(name))
+        }: _*)))
+      .filter { case (name, _) => requestedType.rowType.hasField(name) }: _*)
 
-  def pType: PStruct = typ.physicalType
+  assert(rowPType.virtualType == requestedType.rowType, s"${ rowPType.virtualType.parsableString() } vs ${ requestedType.rowType.parsableString() }")
+
+  def hasField(name: String): Boolean = requestedType.rowType.hasField(name)
+
+  def hasEntryField(name: String): Boolean = entryType.exists(t => t.hasField(name))
+
+  def rg: Option[ReferenceGenome] = rgBc.map(_.value)
 }
 
 object BgenRDD {
   def apply(
-    sc: SparkContext,
+    ctx: ExecuteContext,
     partitions: Array[Partition],
     settings: BgenSettings,
     keys: RDD[Row]
-  ): ContextRDD[RVDContext, RegionValue] = {
-    ContextRDD(new BgenRDD(sc, partitions, settings, keys))
+  ): ContextRDD[RegionValue] = {
+    val f = CompileDecoder(ctx, settings)
+    val indexBuilder = {
+      val (leafCodec, internalNodeCodec) = BgenSettings.indexCodecSpecs(settings.rg)
+      val (leafPType: PStruct, leafDec) = leafCodec.buildDecoder(ctx, leafCodec.encodedVirtualType)
+      val (intPType: PStruct, intDec) = internalNodeCodec.buildDecoder(ctx, internalNodeCodec.encodedVirtualType)
+      IndexReaderBuilder.withDecoders(leafDec, intDec, BgenSettings.indexKeyType(settings.rg), BgenSettings.indexAnnotationType, leafPType, intPType)
+    }
+
+    ContextRDD(new BgenRDD(f, indexBuilder, partitions, settings, keys))
   }
 
   private[bgen] def decompress(
@@ -82,13 +150,12 @@ object BgenRDD {
 }
 
 private class BgenRDD(
-  sc: SparkContext,
+  f: (Int, Region) => AsmFunction4[Region, BgenPartition, HadoopFSDataBinaryReader, BgenSettings, Long],
+  indexBuilder: (FS, String, Int) => IndexReader,
   parts: Array[Partition],
   settings: BgenSettings,
   keys: RDD[Row]
-) extends RDD[RVDContext => Iterator[RegionValue]](sc, if (keys == null) Nil else Seq(new OneToOneDependency(keys))) {
-  private[this] val f = CompileDecoder(settings)
-  private[this] val indexBuilder = IndexReaderBuilder(settings)
+) extends RDD[RVDContext => Iterator[RegionValue]](SparkBackend.sparkContext("BgenRDD"), if (keys == null) Nil else Seq(new OneToOneDependency(keys))) {
 
   protected def getPartitions: Array[Partition] = parts
 
@@ -97,17 +164,17 @@ private class BgenRDD(
       split match {
         case p: IndexBgenPartition =>
           assert(keys == null)
-          new IndexBgenRecordIterator(ctx, p, settings, f()).flatten
+          new IndexBgenRecordIterator(ctx, p, settings, f(p.partitionIndex, ctx.partitionRegion)).flatten
         case p: LoadBgenPartition =>
-          val index: IndexReader = indexBuilder(p.sHadoopConfBc.value.value, p.indexPath, 8)
-          context.addTaskCompletionListener { context =>
+          val index: IndexReader = indexBuilder(p.fsBc.value, p.indexPath, 8)
+          context.addTaskCompletionListener { (context: TaskContext) =>
             index.close()
           }
           if (keys == null)
-            new BgenRecordIteratorWithoutFilter(ctx, p, settings, f(), index).flatten
+            new BgenRecordIteratorWithoutFilter(ctx, p, settings, f(p.partitionIndex, ctx.partitionRegion), index).flatten
           else {
             val keyIterator = keys.iterator(p.filterPartition, context)
-            new BgenRecordIteratorWithFilter(ctx, p, settings, f(), index, keyIterator).flatten
+            new BgenRecordIteratorWithFilter(ctx, p, settings, f(p.partitionIndex, ctx.partitionRegion), index, keyIterator).flatten
           }
       }
     }
@@ -134,7 +201,7 @@ private class IndexBgenRecordIterator(
     }
   }
 
-  def hasNext(): Boolean =
+  def hasNext: Boolean =
     bfis.getPosition < p.endByteOffset
 }
 
@@ -163,7 +230,7 @@ private class BgenRecordIteratorWithoutFilter(
     }
   }
 
-  def hasNext(): Boolean =
+  def hasNext: Boolean =
     it.hasNext
 }
 
@@ -181,7 +248,7 @@ private class BgenRecordIteratorWithFilter(
   private[this] var isEnd = false
   private[this] var current: LeafChild = _
   private[this] var key: Annotation = _
-  private[this] val ordering = index.keyType.ordering
+  private[this] val ordering = PartitionBoundOrdering(index.keyType)
 
   def next(): Option[RegionValue] = {
     val recordOffset = current.recordOffset
@@ -199,7 +266,7 @@ private class BgenRecordIteratorWithFilter(
     result
   }
 
-  def hasNext(): Boolean = {
+  def hasNext: Boolean = {
     if (isEnd)
       return false
 

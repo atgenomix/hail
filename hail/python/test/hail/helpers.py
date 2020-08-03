@@ -1,6 +1,9 @@
 import os
 from timeit import default_timer as timer
+import unittest
+from decorator import decorator
 
+from hail.utils.java import Env
 import hail as hl
 
 _initialized = False
@@ -9,49 +12,26 @@ _initialized = False
 def startTestHailContext():
     global _initialized
     if not _initialized:
-        url = os.environ.get('HAIL_TEST_SERVICE_BACKEND_URL')
-        if url:
-            hl.init(master='local[2]', min_block_size=0, quiet=True, _backend=hl.backend.ServiceBackend(url))
+        backend_name = os.environ.get('HAIL_QUERY_BACKEND', 'spark')
+        if backend_name == 'spark':
+            hl.init(master='local[1]', min_block_size=0, quiet=True)
         else:
-            hl.init(master='local[2]', min_block_size=0, quiet=True)
+            Env.hc()  # force initialization
         _initialized = True
 
 
 def stopTestHailContext():
     pass
 
-
-_test_dir = None
-_doctest_dir = None
+_test_dir = os.environ.get('HAIL_TEST_RESOURCES_DIR', '../src/test/resources')
+_doctest_dir = os.environ.get('HAIL_DOCTEST_DATA_DIR', 'hail/docs/data')
 
 
 def resource(filename):
-    global _test_dir
-    if _test_dir is None:
-        path = '.'
-        i = 0
-        while not os.path.exists(os.path.join(path, 'build.gradle')):
-            path = os.path.join(path, '..')
-            i += 1
-            if i > 100:
-                raise EnvironmentError("Hail tests must be run from inside the Hail git repository")
-        _test_dir = os.path.join(path, 'src', 'test', 'resources')
-
     return os.path.join(_test_dir, filename)
 
 
 def doctest_resource(filename):
-    global _doctest_dir
-    if _doctest_dir is None:
-        path = '.'
-        i = 0
-        while not os.path.exists(os.path.join(path, 'build.gradle')):
-            path = os.path.join(path, '..')
-            i += 1
-            if i > 100:
-                raise EnvironmentError("Hail tests must be run from inside the Hail git repository")
-        _doctest_dir = os.path.join(path, 'python', 'hail', 'docs', 'data')
-
     return os.path.join(_doctest_dir, filename)
 
 
@@ -110,7 +90,8 @@ def create_all_values():
         c=hl.call(0, 1),
         mc=hl.null(hl.tcall),
         t=hl.tuple([hl.call(1, 2, phased=True), 'foo', hl.null(hl.tstr)]),
-        mt=hl.null(hl.ttuple(hl.tlocus('GRCh37'), hl.tbool))
+        mt=hl.null(hl.ttuple(hl.tlocus('GRCh37'), hl.tbool)),
+        nd=hl.nd.arange(0, 10).reshape((2, 5)),
     )
 
 def prefix_struct(s, prefix):
@@ -134,3 +115,33 @@ def create_all_values_matrix_table():
 
 def create_all_values_datasets():
     return (create_all_values_table(), create_all_values_matrix_table())
+
+def skip_unless_spark_backend():
+    from hail.backend.spark_backend import SparkBackend
+    @decorator
+    def wrapper(func, *args, **kwargs):
+        if isinstance(hl.utils.java.Env.backend(), SparkBackend):
+            return func(*args, **kwargs)
+        else:
+            raise unittest.SkipTest('requires Spark')
+
+    return wrapper
+
+
+def run_with_cxx_compile():
+    @decorator
+    def wrapper(func, *args, **kwargs):
+        return
+
+    return wrapper
+
+
+def assert_evals_to(e, v):
+    res = hl.eval(e)
+    if res != v:
+        raise ValueError(f'  actual: {res}\n  expected: {v}')
+
+
+def assert_all_eval_to(*expr_and_expected):
+    exprs, expecteds = zip(*expr_and_expected)
+    assert_evals_to(hl.tuple(exprs), expecteds)

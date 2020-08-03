@@ -1,8 +1,9 @@
 package is.hail.utils.richUtils
 
-import java.io.{InputStream, OutputStream}
+import java.io.{DataInputStream, DataOutputStream, InputStream, OutputStream}
 
 import breeze.linalg.{DenseMatrix => BDM}
+import is.hail.io.fs.FS
 import is.hail.HailContext
 import is.hail.linalg.{BlockMatrix, BlockMatrixMetadata, GridPartitioner}
 import is.hail.io._
@@ -37,22 +38,22 @@ object RichDenseMatrixDouble {
       offset = 0, majorStride = if (isTranspose) cols else rows, isTranspose = isTranspose)
   }
 
-  def read(hc: HailContext, path: String, bufferSpec: BufferSpec): BDM[Double] = {
-    hc.hadoopConf.readDataFile(path)(is => read(is, bufferSpec))
+  def read(fs: FS, path: String, bufferSpec: BufferSpec): BDM[Double] = {
+    using(new DataInputStream(fs.open(path)))(is => read(is, bufferSpec))
   }
 
-  def importFromDoubles(hc: HailContext, path: String, nRows: Int, nCols: Int, rowMajor: Boolean): BDM[Double] = {
+  def importFromDoubles(fs: FS, path: String, nRows: Int, nCols: Int, rowMajor: Boolean): BDM[Double] = {
     require(nRows * nCols.toLong <= Int.MaxValue)
-    val data = RichArray.importFromDoubles(hc, path, nRows * nCols)
+    val data = RichArray.importFromDoubles(fs, path, nRows * nCols)
 
     RichDenseMatrixDouble(nRows, nCols, data, rowMajor)
   }
 
-  def exportToDoubles(hc: HailContext, path: String, m: BDM[Double], forceRowMajor: Boolean): Boolean = {
+  def exportToDoubles(fs: FS, path: String, m: BDM[Double], forceRowMajor: Boolean): Boolean = {
     val (data, rowMajor) = m.toCompactData(forceRowMajor)
     assert(data.length == m.rows * m.cols)
     
-    RichArray.exportToDoubles(hc, path, data)
+    RichArray.exportToDoubles(fs, path, data)
 
     rowMajor
   }
@@ -63,7 +64,7 @@ class RichDenseMatrixDouble(val m: BDM[Double]) extends AnyVal {
   def matrixMultiply(bm: BlockMatrix): BlockMatrix = {
     require(m.cols == bm.nRows,
       s"incompatible matrix dimensions: ${ m.rows } x ${ m.cols } and ${ bm.nRows } x ${ bm.nCols } ")
-    BlockMatrix.fromBreezeMatrix(bm.blocks.sparkContext, m, bm.blockSize).dot(bm)
+    BlockMatrix.fromBreezeMatrix(m, bm.blockSize).dot(bm)
   }
 
   def forceSymmetry() {
@@ -105,19 +106,18 @@ class RichDenseMatrixDouble(val m: BDM[Double]) extends AnyVal {
     out.flush()
   }
 
-  def write(hc: HailContext, path: String, forceRowMajor: Boolean = false, bufferSpec: BufferSpec) {
-    hc.hadoopConf.writeFile(path)(os => write(os, forceRowMajor, bufferSpec: BufferSpec))
+  def
+  write(fs: FS, path: String, forceRowMajor: Boolean = false, bufferSpec: BufferSpec) {
+    using(fs.create(path))(os => write(os, forceRowMajor, bufferSpec: BufferSpec))
   }
 
-  def writeBlockMatrix(hc: HailContext, path: String, blockSize: Int, forceRowMajor: Boolean = false, overwrite: Boolean = false) {
-    val hadoop = hc.hadoopConf
-    
+  def writeBlockMatrix(fs: FS, path: String, blockSize: Int, forceRowMajor: Boolean = false, overwrite: Boolean = false) {
     if (overwrite)
-      hadoop.delete(path, recursive = true)
-    else if (hadoop.exists(path))
+      fs.delete(path, recursive = true)
+    else if (fs.exists(path))
       fatal(s"file already exists: $path")    
 
-    hadoop.mkDir(path)
+    fs.mkDir(path)
 
     val gp = GridPartitioner(blockSize, m.rows, m.cols)
     val nParts = gp.numPartitions
@@ -131,23 +131,23 @@ class RichDenseMatrixDouble(val m: BDM[Double]) extends AnyVal {
       val (blockNRows, blockNCols) = gp.blockDims(pi)
       val iOffset = i * blockSize
       val jOffset = j * blockSize
-      var block = m(iOffset until iOffset + blockNRows, jOffset until jOffset + blockNCols)
+      val block = m(iOffset until iOffset + blockNRows, jOffset until jOffset + blockNCols)
 
-      block.write(hc, filename, forceRowMajor, BlockMatrix.bufferSpec)
+      block.write(fs, filename, forceRowMajor, BlockMatrix.bufferSpec)
 
       f
     }
       .toArray
 
-    hadoop.writeDataFile(path + BlockMatrix.metadataRelativePath) { os =>
+    using(new DataOutputStream(fs.create(path + BlockMatrix.metadataRelativePath))) { os =>
       implicit val formats = defaultJSONFormats
       jackson.Serialization.write(
-        BlockMatrixMetadata(blockSize, m.rows, m.cols, gp.maybeBlocks, partFiles),
+        BlockMatrixMetadata(blockSize, m.rows, m.cols, gp.partitionIndexToBlockIndex, partFiles),
         os)
     }
 
     info(s"wrote $nParts ${ plural(nParts, "item") } in $nParts ${ plural(nParts, "partition") }")
 
-    hadoop.writeTextFile(path + "/_SUCCESS")(out => ())
+    using(fs.create(path + "/_SUCCESS"))(out => ())
   }
 }

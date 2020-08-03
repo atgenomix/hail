@@ -1,20 +1,22 @@
 package is.hail.io.plink
 
-import is.hail.HailContext
-import is.hail.annotations._
-import is.hail.expr.ir.{MatrixRead, MatrixReader, MatrixValue, PruneDeadFields}
-import is.hail.expr.types._
-import is.hail.expr.types.virtual._
+import is.hail.annotations.{Region, RegionValueBuilder}
+import is.hail.expr.JSONAnnotationImpex
+import is.hail.expr.ir._
+import is.hail.expr.ir.lowering.TableStage
+import is.hail.types._
+import is.hail.types.physical.{PBoolean, PCanonicalArray, PCanonicalCall, PCanonicalLocus, PCanonicalString, PCanonicalStruct, PFloat64, PStruct, PType}
+import is.hail.types.virtual._
 import is.hail.io.vcf.LoadVCF
-import is.hail.rvd.{RVD, RVDContext, RVDType}
-import is.hail.sparkextras.ContextRDD
 import is.hail.utils.StringEscapeUtils._
 import is.hail.utils._
-import is.hail.variant.{Locus, _}
-import org.apache.hadoop
-import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.io.LongWritable
+import is.hail.variant._
+import is.hail.io.fs.{FS, Seekable}
+import is.hail.rvd.RVDPartitioner
+import org.apache.spark.TaskContext
 import org.apache.spark.sql.Row
+import org.json4s.jackson.JsonMethods
+import org.json4s.{DefaultFormats, Formats, JValue}
 
 case class FamFileConfig(isQuantPheno: Boolean = false,
   delimiter: String = "\\t",
@@ -23,40 +25,66 @@ case class FamFileConfig(isQuantPheno: Boolean = false,
 object LoadPlink {
   def expectedBedSize(nSamples: Int, nVariants: Long): Long = 3 + nVariants * ((nSamples + 3) / 4)
 
-  def parseBim(bimPath: String, hConf: Configuration, a2Reference: Boolean = true,
-    contigRecoding: Map[String, String] = Map.empty[String, String]): Array[(String, Int, Double, String, String, String)] = {
-    hConf.readLines(bimPath)(_.map(_.map { line =>
-      line.split("\\s+") match {
-        case Array(contig, rsId, cmPos, bpPos, allele1, allele2) =>
-          val recodedContig = contigRecoding.getOrElse(contig, contig)
-          if (a2Reference)
-            (recodedContig, bpPos.toInt, cmPos.toDouble, allele2, allele1, rsId)
-          else
-            (recodedContig, bpPos.toInt, cmPos.toDouble, allele1, allele2, rsId)
+  def parseBim(fs: FS, bimPath: String, a2Reference: Boolean,
+    contigRecoding: Map[String, String], rg: Option[ReferenceGenome], locusAllelesType: TStruct,
+    skipInvalidLoci: Boolean): (Int, Array[PlinkVariant]) = {
+    val vs = new ArrayBuilder[PlinkVariant]()
+    var n = 0
+    fs.readLines(bimPath) { lines =>
+      lines.foreach { cline =>
+        cline.foreach { line =>
+          line.split("\\s+") match {
+            case Array(contig, rsId, cmPos, bpPos, allele1, allele2) =>
+              val pos = bpPos.toInt
+              val recodedContig = contigRecoding.getOrElse(contig, contig)
+              if (!skipInvalidLoci || rg.forall(_.isValidLocus(contig, pos))) {
+                val locus = Locus.annotation(recodedContig, bpPos.toInt, rg)
+                val alleles =
+                  if (a2Reference)
+                    FastIndexedSeq(allele2, allele1)
+                  else
+                    FastIndexedSeq(allele1, allele2)
+                val locusAlleles = Row(locus, alleles)
+                vs += new PlinkVariant(n, locusAlleles, cmPos.toDouble, rsId)
+              }
 
-        case other => fatal(s"Invalid .bim line.  Expected 6 fields, found ${ other.length } ${ plural(other.length, "field") }")
+            case _ =>
+              fatal(s"Invalid .bim line.  Expected 6 fields, found ${ line.length } ${ plural(line.length, "field") }")
+          }
+        }
+        n += 1
       }
-    }.value
-    ).toArray)
+    }
+    val variants = vs.result()
+    (n, variants.sortBy(_.locusAlleles)(locusAllelesType.ordering.toOrdering))
   }
 
   val numericRegex =
     """^-?(?:\d+|\d*\.\d+)(?:[eE]-?\d+)?$""".r
 
-  def parseFam(filename: String, ffConfig: FamFileConfig,
-    hConf: hadoop.conf.Configuration): (IndexedSeq[Row], TStruct) = {
+  def importFamJSON(fs: FS, path: String, isQuantPheno: Boolean, delimiter: String, missingValue: String): String = {
+    val ffConfig = FamFileConfig(isQuantPheno, delimiter, missingValue)
+    val (data, ptyp) = LoadPlink.parseFam(fs, path, ffConfig)
+    val jv = JSONAnnotationImpex.exportAnnotation(
+      Row(ptyp.virtualType.toString, data),
+      TStruct("type" -> TString, "data" -> TArray(ptyp.virtualType)))
+    JsonMethods.compact(jv)
+  }
+
+
+  def parseFam(fs: FS, filename: String, ffConfig: FamFileConfig): (IndexedSeq[Row], PCanonicalStruct) = {
 
     val delimiter = unescapeString(ffConfig.delimiter)
 
-    val phenoSig = if (ffConfig.isQuantPheno) ("quant_pheno", TFloat64()) else ("is_case", TBoolean())
+    val phenoSig = if (ffConfig.isQuantPheno) ("quant_pheno", PFloat64()) else ("is_case", PBoolean())
 
-    val signature = TStruct(("id", TString()), ("fam_id", TString()), ("pat_id", TString()),
-      ("mat_id", TString()), ("is_female", TBoolean()), phenoSig)
+    val signature = PCanonicalStruct(("id", PCanonicalString()), ("fam_id", PCanonicalString()), ("pat_id", PCanonicalString()),
+      ("mat_id", PCanonicalString()), ("is_female", PBoolean()), phenoSig)
 
     val idBuilder = new ArrayBuilder[String]
     val structBuilder = new ArrayBuilder[Row]
 
-    val m = hConf.readLines(filename) {
+    val m = fs.readLines(filename) {
       _.foreachLine { line =>
         val split = line.split(delimiter)
         if (split.length != 6)
@@ -73,7 +101,7 @@ object LoadPlink {
           case "0" => null
           case "1" => false
           case "2" => true
-          case _ => fatal(s"Invalid sex: `$isFemale'. Male is `1', female is `2', unknown is `0'")
+          case _ => fatal(s"Invalid sex: '$isFemale'. Male is '1', female is '2', unknown is '0'")
         }
 
         var warnedAbout9 = false
@@ -90,7 +118,7 @@ object LoadPlink {
                 }
                 -9d
               case numericRegex() => pheno.toDouble
-              case _ => fatal(s"Invalid quantitative phenotype: `$pheno'. Value must be numeric or `${ ffConfig.missingValue }'")
+              case _ => fatal(s"Invalid quantitative phenotype: '$pheno'. Value must be numeric or '${ ffConfig.missingValue }'")
             }
           else
             pheno match {
@@ -100,7 +128,7 @@ object LoadPlink {
               case "0" => null
               case "-9" => null
               case "N/A" => null
-              case numericRegex() => fatal(s"Invalid case-control phenotype: `$pheno'. Control is `1', case is `2', missing is `0', `-9', `${ ffConfig.missingValue }', or non-numeric.")
+              case numericRegex() => fatal(s"Invalid case-control phenotype: '$pheno'. Control is '1', case is '2', missing is '0', '-9', '${ ffConfig.missingValue }', or non-numeric.")
               case _ => null
             }
         idBuilder += kid
@@ -118,178 +146,338 @@ object LoadPlink {
   }
 }
 
-case class MatrixPLINKReader(
+object MatrixPLINKReader {
+  def fromJValue(ctx: ExecuteContext, jv: JValue): MatrixPLINKReader = {
+    val backend = ctx.backend
+    val fs = ctx.fs
+
+    implicit val formats: Formats = DefaultFormats
+    val params = jv.extract[MatrixPLINKReaderParameters]
+
+    val referenceGenome = params.rg.map(ReferenceGenome.getReference)
+    referenceGenome.foreach(_.validateContigRemap(params.contigRecoding))
+
+    val locusType = TLocus.schemaFromRG(referenceGenome)
+    val locusAllelesType = TStruct(
+      "locus" -> locusType,
+      "alleles" -> TArray(TString))
+
+    val ffConfig = FamFileConfig(params.quantPheno, params.delimiter, params.missing)
+
+    val (sampleInfo, signature) = LoadPlink.parseFam(fs, params.fam, ffConfig)
+
+    val nameMap = Map("id" -> "s")
+    val saSignature = signature.copy(fields = signature.fields.map(f => f.copy(name = nameMap.getOrElse(f.name, f.name))))
+
+    val nSamples = sampleInfo.length
+    if (nSamples <= 0)
+      fatal("FAM file does not contain any samples")
+
+    val (nTotalVariants, variants) = LoadPlink.parseBim(fs, params.bim, params.a2Reference, params.contigRecoding,
+      referenceGenome, locusAllelesType, params.skipInvalidLoci)
+    val nVariants = variants.length
+    if (nTotalVariants <= 0)
+      fatal("BIM file does not contain any variants")
+
+    info(s"Found $nSamples samples in fam file.")
+    info(s"Found $nTotalVariants variants in bim file.")
+
+    using(fs.open(params.bed)) { dis =>
+      val b1 = dis.read()
+      val b2 = dis.read()
+      val b3 = dis.read()
+
+      if (b1 != 108 || b2 != 27)
+        fatal("First two bytes of BED file do not match PLINK magic numbers 108 & 27")
+
+      if (b3 == 0)
+        fatal("BED file is in individual major mode. First use plink with --make-bed to convert file to snp major mode before using Hail")
+    }
+
+    val bedSize = fs.getFileSize(params.bed)
+    if (bedSize != LoadPlink.expectedBedSize(nSamples, nTotalVariants))
+      fatal("BED file size does not match expected number of bytes based on BIM and FAM files")
+
+    var nPartitions = params.nPartitions match {
+      case Some(nPartitions) => nPartitions
+      case None =>
+        val blockSizeInB = params.blockSizeInMB.getOrElse(128) * 1024 * 1024
+        (nVariants + blockSizeInB - 1) / blockSizeInB
+    }
+    params.minPartitions match {
+      case Some(minPartitions) =>
+        if (nPartitions < minPartitions)
+          nPartitions = minPartitions
+      case None =>
+    }
+    // partitions non-empty
+    if (nPartitions > nVariants)
+      nPartitions = nVariants
+
+    val partSize = partition(nVariants, nPartitions)
+    val partScan = partSize.scanLeft(0)(_ + _)
+
+    val cb = new ArrayBuilder[Any]()
+    val ib = new ArrayBuilder[Interval]()
+
+    var p = 0
+    var prevEnd = 0
+    val lOrd = locusType.ordering
+    while (p < nPartitions) {
+      val start = prevEnd
+
+      var end = partScan(p + 1)
+      if (start < end) {
+        while (end + 1 < nVariants
+          && lOrd.equiv(variants(end).locusAlleles.asInstanceOf[Row].get(0),
+            variants(end + 1).locusAlleles.asInstanceOf[Row].get(0)))
+          end += 1
+        
+        cb += Row(params.bed, start, end)
+
+        ib += Interval(
+          variants(start).locusAlleles,
+          variants(end - 1).locusAlleles,
+          includesStart = true, includesEnd = true)
+
+        prevEnd = end
+      }
+
+      p += 1
+    }
+    assert(prevEnd == nVariants)
+
+    val contexts = cb.result()
+
+    val partitioner = new RVDPartitioner(locusAllelesType, ib.result(), 0)
+
+    val fullMatrixType: MatrixType = MatrixType(
+      globalType = TStruct.empty,
+      colKey = Array("s"),
+      colType = saSignature.virtualType,
+      rowType = TStruct(
+        "locus" -> locusType,
+        "alleles" -> TArray(TString),
+        "rsid" -> TString,
+        "cm_position" -> TFloat64),
+      rowKey = Array("locus", "alleles"),
+      entryType = TStruct("GT" -> TCall))
+    assert(locusAllelesType == fullMatrixType.rowKeyStruct)
+
+    new MatrixPLINKReader(params, referenceGenome, fullMatrixType, sampleInfo, variants, contexts, partitioner)
+  }
+}
+
+case class MatrixPLINKReaderParameters(
   bed: String,
   bim: String,
   fam: String,
-  nPartitions: Option[Int] = None,
-  delimiter: String = "\\\\s+",
-  missing: String = "NA",
-  quantPheno: Boolean = false,
-  a2Reference: Boolean = true,
+  nPartitions: Option[Int],
+  blockSizeInMB: Option[Int],
+  minPartitions: Option[Int],
+  delimiter: String,
+  missing: String,
+  quantPheno: Boolean,
+  a2Reference: Boolean,
   rg: Option[String],
-  contigRecoding: Map[String, String] = Map.empty[String, String],
-  skipInvalidLoci: Boolean = false
-) extends MatrixReader {
-  private val hc = HailContext.get
-  private val sc = hc.sc
-  private val referenceGenome = rg.map(ReferenceGenome.getReference)
-  referenceGenome.foreach(_.validateContigRemap(contigRecoding))
+  contigRecoding: Map[String, String],
+  skipInvalidLoci: Boolean)
 
-  val ffConfig = FamFileConfig(quantPheno, delimiter, missing)
+class PlinkVariant(
+  val index: Int,
+  val locusAlleles: Any,
+  val cmPos: Double,
+  val rsid: String)
 
-  val (sampleInfo, signature) = LoadPlink.parseFam(fam, ffConfig, hc.hadoopConf)
+class MatrixPLINKReader(
+  val params: MatrixPLINKReaderParameters,
+  referenceGenome: Option[ReferenceGenome],
+  val fullMatrixType: MatrixType,
+  sampleInfo: IndexedSeq[Row],
+  variants: Array[PlinkVariant],
+  contexts: Array[Any],
+  partitioner: RVDPartitioner
+) extends MatrixHybridReader {
+  def pathsUsed: Seq[String] = FastSeq(params.bed, params.bim, params.fam)
 
-  val nameMap = Map("id" -> "s")
-  val saSignature = signature.copy(fields = signature.fields.map(f => f.copy(name = nameMap.getOrElse(f.name, f.name))))
+  def nSamples: Int = sampleInfo.length
 
-  val nSamples = sampleInfo.length
-  if (nSamples <= 0)
-    fatal("FAM file does not contain any samples")
-
-  val variants = LoadPlink.parseBim(bim, hc.hadoopConf, a2Reference, contigRecoding)
-  val nVariants = variants.length
-  if (nVariants <= 0)
-    fatal("BIM file does not contain any variants")
-
-  info(s"Found $nSamples samples in fam file.")
-  info(s"Found $nVariants variants in bim file.")
-
-  hc.sc.hadoopConfiguration.readFile(bed) { dis =>
-    val b1 = dis.read()
-    val b2 = dis.read()
-    val b3 = dis.read()
-
-    if (b1 != 108 || b2 != 27)
-      fatal("First two bytes of BED file do not match PLINK magic numbers 108 & 27")
-
-    if (b3 == 0)
-      fatal("BED file is in individual major mode. First use plink with --make-bed to convert file to snp major mode before using Hail")
-  }
-
-  val bedSize = hc.sc.hadoopConfiguration.getFileSize(bed)
-  if (bedSize != LoadPlink.expectedBedSize(nSamples, nVariants))
-    fatal("BED file size does not match expected number of bytes based on BIM and FAM files")
-
-  if (bedSize < nPartitions.getOrElse(hc.sc.defaultMinPartitions))
-    fatal(s"The number of partitions requested (${ nPartitions.getOrElse(hc.sc.defaultMinPartitions) }) is greater than the file size ($bedSize)")
+  def nVariants: Long = variants.length
 
   val columnCount: Option[Int] = Some(nSamples)
 
   val partitionCounts: Option[IndexedSeq[Long]] = None
 
-  val fullType: MatrixType = MatrixType.fromParts(
-    globalType = TStruct.empty(),
-    colKey = Array("s"),
-    colType = saSignature,
-    rowType = TStruct(
-      "locus" -> TLocus.schemaFromRG(referenceGenome),
-      "alleles" -> TArray(TString()),
-      "rsid" -> TString(),
-      "cm_position" -> TFloat64()),
-    rowKey = Array("locus", "alleles"),
-    entryType = TStruct("GT" -> TCall()))
+  def rowAndGlobalPTypes(context: ExecuteContext, requestedType: TableType): (PStruct, PStruct) = {
+    requestedType.canonicalRowPType -> PType.canonical(requestedType.globalType).asInstanceOf[PStruct]
+  }
 
-  val fullRVDType: RVDType = fullType.canonicalRVDType
+  def executeGeneric(ctx: ExecuteContext): GenericTableValue = {
+    val fsBc = ctx.fsBc
 
-  def apply(mr: MatrixRead): MatrixValue = {
-    val requestedType = mr.typ
-    assert(PruneDeadFields.isSupertype(requestedType, fullType))
+    val localA2Reference = params.a2Reference
+    val variantsBc = ctx.backend.broadcast(variants)
+    val localNSamples = nSamples
 
-    val rvd = if (mr.dropRows)
-      RVD.empty(sc, requestedType.canonicalRVDType)
-    else {
-      val variantsBc = sc.broadcast(variants)
-      sc.hadoopConfiguration.setInt("nSamples", nSamples)
-      sc.hadoopConfiguration.setBoolean("a2Reference", a2Reference)
+    val localLocusType = TLocus.schemaFromRG(referenceGenome)
 
-      val crdd = ContextRDD.weaken[RVDContext](
-        sc.hadoopFile(
-          bed,
-          classOf[PlinkInputFormat],
-          classOf[LongWritable],
-          classOf[PlinkRecord],
-          nPartitions.getOrElse(sc.defaultMinPartitions)))
+    val globals = Row(sampleInfo)
 
-      val kType = requestedType.canonicalRVDType.kType
-      val rvRowType = requestedType.rvRowType
+    val contextType = TStruct(
+      "bed" -> TString,
+      "start" -> TInt32,
+      "end" -> TInt32)
 
-      val hasRsid = requestedType.rowType.hasField("rsid")
-      val hasCmPos = requestedType.rowType.hasField("cm_position")
-      val hasGT = requestedType.entryType.hasField("GT")
+    val fullRowPType = PCanonicalStruct(true,
+      "locus" -> PCanonicalLocus.schemaFromRG(referenceGenome, true),
+      "alleles" -> PCanonicalArray(PCanonicalString(true), true),
+      "rsid" -> PCanonicalString(true),
+      "cm_position" -> PFloat64(true),
+      LowerMatrixIR.entriesFieldName -> PCanonicalArray(PCanonicalStruct(true, "GT" -> PCanonicalCall()), true))
 
-      val skipInvalidLociLocal = skipInvalidLoci
-      val rgLocal = referenceGenome
+    val bodyPType = (requestedRowType: TStruct) => fullRowPType.subsetTo(requestedRowType).asInstanceOf[PStruct]
 
-      val fastKeys = crdd.cmapPartitions { (ctx, it) =>
-        val region = ctx.region
+    val body = { (requestedType: TStruct) =>
+      val hasLocus = requestedType.hasField("locus")
+      val hasAlleles = requestedType.hasField("alleles")
+      val hasRsid = requestedType.hasField("rsid")
+      val hasCmPos = requestedType.hasField("cm_position")
+
+      val hasEntries = requestedType.hasField(LowerMatrixIR.entriesFieldName)
+      val hasGT = hasEntries && (requestedType.fieldType(LowerMatrixIR.entriesFieldName).asInstanceOf[TArray]
+        .elementType.asInstanceOf[TStruct].hasField("GT"))
+
+      val requestedPType = bodyPType(requestedType)
+
+      { (region: Region, context: Any) =>
+        val c = context.asInstanceOf[Row]
+        val bed = c.getString(0)
+        val start = c.getInt(1)
+        val end = c.getInt(2)
+
+        val blockLength = (localNSamples + 3) / 4
+
         val rvb = new RegionValueBuilder(region)
-        val rv = RegionValue(region)
 
-        it.flatMap { case (_, record) =>
-          val (contig, pos, _, ref, alt, _) = variantsBc.value(record.getKey)
-          if (skipInvalidLociLocal && !rgLocal.forall(_.isValidLocus(contig, pos)))
-            None
-          else {
-            rvb.start(kType)
-            rvb.startStruct()
-            rvb.addAnnotation(kType.types(0).virtualType, Locus.annotation(contig, pos, rgLocal))
-            rvb.startArray(2)
-            rvb.addString(ref)
-            rvb.addString(alt)
-            rvb.endArray()
-            rvb.endStruct()
+        val is = fsBc.value.open(bed)
+        TaskContext.get.addTaskCompletionListener { (context: TaskContext) =>
+          is.close()
+        }
+        var offset: Long = 0
 
-            rv.setOffset(rvb.end())
-            Some(rv)
+        val input = new Array[Byte](blockLength)
+
+        val table = new Array[Int](4)
+        table(0) = if (localA2Reference) Call2.fromUnphasedDiploidGtIndex(2) else Call2.fromUnphasedDiploidGtIndex(0)
+        // 1 missing
+        table(2) = Call2.fromUnphasedDiploidGtIndex(1)
+        table(3) = if (localA2Reference) Call2.fromUnphasedDiploidGtIndex(0) else Call2.fromUnphasedDiploidGtIndex(2)
+
+        Iterator.range(start, end).flatMap { i =>
+          val variant = variantsBc.value(i)
+
+          val newOffset: Long = 3L + variant.index.toLong * blockLength
+          if (newOffset != offset) {
+            is match {
+              case base: Seekable =>
+                base.seek(newOffset)
+              case base: org.apache.hadoop.fs.Seekable =>
+                base.seek(newOffset)
+            }
+            offset = newOffset
           }
+
+          is.readFully(input, 0, input.length)
+
+          rvb.start(requestedPType)
+          rvb.startStruct()
+
+          val locusAlleles = variant.locusAlleles.asInstanceOf[Row]
+
+          if (hasLocus)
+            rvb.addAnnotation(localLocusType, locusAlleles.get(0))
+
+          if (hasAlleles) {
+            val alleles = locusAlleles.getAs[IndexedSeq[String]](1)
+            rvb.startArray(2)
+            rvb.addString(alleles(0))
+            rvb.addString(alleles(1))
+            rvb.endArray()
+          }
+
+          if (hasRsid)
+            rvb.addString(variant.rsid)
+          if (hasCmPos)
+            rvb.addDouble(variant.cmPos)
+
+          if (hasEntries) {
+            rvb.startArray(localNSamples)
+            if (hasGT) {
+              var i = 0
+              while (i < localNSamples) {
+                rvb.startStruct() // g
+                val x = (input(i >> 2) >> ((i & 3) << 1)) & 3
+                if (x == 1)
+                  rvb.setMissing()
+                else
+                  rvb.addInt(table(x))
+                rvb.endStruct() // g
+                i += 1
+              }
+            } else {
+              var i = 0
+              while (i < localNSamples) {
+                rvb.startStruct() // g
+                rvb.endStruct() // g
+                i += 1
+              }
+            }
+
+            rvb.endArray()
+          }
+          rvb.endStruct()
+
+          Some(rvb.end())
         }
       }
-
-      val rdd2 = crdd.cmapPartitions { (ctx, it) =>
-        val region = ctx.region
-        val rvb = new RegionValueBuilder(region)
-        val rv = RegionValue(region)
-
-        it.flatMap { case (_, record) =>
-          val (contig, pos, cmPos, ref, alt, rsid) = variantsBc.value(record.getKey)
-
-          if (skipInvalidLociLocal && !rgLocal.forall(_.isValidLocus(contig, pos)))
-            None
-          else {
-            rvb.start(rvRowType.physicalType)
-            rvb.startStruct()
-            rvb.addAnnotation(kType.types(0).virtualType, Locus.annotation(contig, pos, rgLocal))
-            rvb.startArray(2)
-            rvb.addString(ref)
-            rvb.addString(alt)
-            rvb.endArray()
-            if (hasRsid)
-              rvb.addAnnotation(rvRowType.types(2), rsid)
-            if (hasCmPos)
-              rvb.addDouble(cmPos)
-            record.getValue(rvb, hasGT)
-            rvb.endStruct()
-
-            rv.setOffset(rvb.end())
-            Some(rv)
-          }
-        }
-      }
-
-      RVD.coerce(requestedType.canonicalRVDType, rdd2, fastKeys)
     }
 
-    if (skipInvalidLoci && referenceGenome.isDefined) {
-      val nFiltered = rvd.count() - nVariants
-      if (nFiltered > 0)
-        info(s"Filtered out $nFiltered ${ plural(nFiltered, "variant") } that are inconsistent with reference genome '${ referenceGenome.get.name }'.")
-    }
+    val tt = fullMatrixType.toTableType(LowerMatrixIR.entriesFieldName, LowerMatrixIR.colsFieldName)
 
-    MatrixValue(requestedType,
-      BroadcastRow(Row.empty, requestedType.globalType, sc),
-      BroadcastIndexedSeq(if (mr.dropCols) Array.empty[Annotation] else sampleInfo, TArray(requestedType.colType), sc),
-      rvd
-    )
+    new GenericTableValue(
+      tt,
+      Some(partitioner),
+      { (requestedGlobalsType: Type) =>
+        val subset = tt.globalType.valueSubsetter(requestedGlobalsType)
+        subset(globals).asInstanceOf[Row]
+      },
+      contextType,
+      contexts,
+      bodyPType,
+      body)
+  }
+
+  def apply(tr: TableRead, ctx: ExecuteContext): TableValue =
+    executeGeneric(ctx).toTableValue(ctx, tr.typ)
+
+  override def lowerGlobals(ctx: ExecuteContext, requestedGlobalsType: TStruct): IR = {
+    val subset = fullMatrixType.globalType.valueSubsetter(requestedGlobalsType)
+    val globals = Row(sampleInfo)
+    Literal(requestedGlobalsType, subset(globals).asInstanceOf[Row])
+  }
+
+  override def lower(ctx: ExecuteContext, requestedType: TableType): TableStage =
+    executeGeneric(ctx).toTableStage(ctx, requestedType)
+
+  override def toJValue: JValue = {
+    implicit val formats: Formats = DefaultFormats
+    decomposeWithName(params, "MatrixPLINKReader")
+  }
+
+  override def hashCode(): Int = params.hashCode()
+
+  override def equals(that: Any): Boolean = that match {
+    case that: MatrixPLINKReader => params == that.params
+    case _ => false
   }
 }

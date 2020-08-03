@@ -1,9 +1,9 @@
 import json
 import re
-from hail.typecheck import *
-from hail.utils import wrap_to_list
-from hail.utils.java import jiterable_to_list, Env, joption
-from hail.typecheck import oneof, transformed
+from hail.typecheck import typecheck_method, sequenceof, dictof, oneof, \
+    sized_tupleof, nullable, transformed, lazy
+from hail.utils.misc import wrap_to_list
+from hail.utils.java import Env
 import hail as hl
 
 rg_type = lazy()
@@ -47,8 +47,8 @@ class ReferenceGenome(object):
     ----------
     name : :obj:`str`
         Name of reference. Must be unique and NOT one of Hail's
-        predefined references: ``'GRCh37'``, ``'GRCh38'``, ``'GRCm38'``, and
-        ``'default'``.
+        predefined references: ``'GRCh37'``, ``'GRCh38'``, ``'GRCm38'``,
+        ``'CanFam3'`` and ``'default'``.
     contigs : :obj:`list` of :obj:`str`
         Contig names.
     lengths : :obj:`dict` of :obj:`str` to :obj:`int`
@@ -90,7 +90,7 @@ class ReferenceGenome(object):
                       _builtin=bool)
     def __init__(self, name, contigs, lengths, x_contigs=[], y_contigs=[], mt_contigs=[], par=[], _builtin=False):
         super(ReferenceGenome, self).__init__()
-        
+
         contigs = wrap_to_list(contigs)
         x_contigs = wrap_to_list(x_contigs)
         y_contigs = wrap_to_list(y_contigs)
@@ -109,17 +109,15 @@ class ReferenceGenome(object):
         self._lengths = lengths
         self._par_tuple = par
         self._par = [hl.Interval(hl.Locus(c, s, self), hl.Locus(c, e, self)) for (c, s, e) in par]
+        self._global_positions = None
 
         ReferenceGenome._references[name] = self
 
         if not _builtin:
             Env.backend().add_reference(self._config)
 
-        hl.ir.register_reference_genome_functions(name)
-
-        self._has_sequence = False
-        self._liftovers = set()
-
+        self._sequence_files = None
+        self._liftovers = dict()
 
     def __str__(self):
         return self._config['name']
@@ -160,7 +158,7 @@ class ReferenceGenome(object):
 
         Returns
         -------
-        :obj:`list` of :obj:`str`
+        :obj:`dict` of :obj:`str` to :obj:`int`
         """
         return self._lengths
 
@@ -224,6 +222,18 @@ class ReferenceGenome(object):
         else:
             raise KeyError("Contig `{}' is not in reference genome.".format(contig))
 
+    @typecheck_method(contig=str)
+    def _contig_global_position(self, contig):
+        if self._global_positions is None:
+            gp = {}
+            lengths = self._lengths
+            x = 0
+            for c in self.contigs:
+                gp[c] = x
+                x += lengths[c]
+            self._global_positions = gp
+        return self._global_positions[contig]
+
     @classmethod
     @typecheck_method(path=str)
     def read(cls, path):
@@ -251,7 +261,8 @@ class ReferenceGenome(object):
 
 
         `name` must be unique and not overlap with Hail's pre-instantiated
-        references: ``'GRCh37'``, ``'GRCh38'``, ``'GRCm38'``, and ``'default'``.
+        references: ``'GRCh37'``, ``'GRCh38'``, ``'GRCm38'``, ``'CanFam3'``, and
+        ``'default'``.
         The contig names in `xContigs`, `yContigs`, and `mtContigs` must be
         present in `contigs`. The intervals listed in `par` must have contigs in
         either `xContigs` or `yContigs` and must have positions between 0 and
@@ -277,7 +288,7 @@ class ReferenceGenome(object):
         --------
 
         >>> my_rg = hl.ReferenceGenome("new_reference", ["x", "y", "z"], {"x": 500, "y": 300, "z": 200})
-        >>> my_rg.write("output/new_reference.json")
+        >>> my_rg.write(f"output/new_reference.json")
 
         Notes
         -----
@@ -344,9 +355,9 @@ class ReferenceGenome(object):
             the fasta_file's extension with `fai`.
         """
         if index_file is None:
-            index_file = re.sub('\.[^.]*$', '.fai', fasta_file)
+            index_file = re.sub(r'\.[^.]*$', '.fai', fasta_file)
         Env.backend().add_sequence(self.name, fasta_file, index_file)
-        self._has_sequence = True
+        self._sequence_files = (fasta_file, index_file)
 
     def has_sequence(self):
         """True if the reference sequence has been loaded.
@@ -355,16 +366,11 @@ class ReferenceGenome(object):
         -------
         :obj:`bool`
         """
-        return self._has_sequence
+        return self._sequence_files is not None
 
     def remove_sequence(self):
-        """Remove the reference sequence.
-
-        Returns
-        -------
-        :obj:`bool`
-        """
-        self._has_sequence = False
+        """Remove the reference sequence."""
+        self._sequence_files = None
         Env.backend().remove_sequence(self.name)
 
     @classmethod
@@ -378,7 +384,7 @@ class ReferenceGenome(object):
     def from_fasta_file(cls, name, fasta_file, index_file,
                         x_contigs=[], y_contigs=[], mt_contigs=[], par=[]):
         """Create reference genome from a FASTA file.
-        
+
         Parameters
         ----------
         name: :obj:`str`
@@ -402,9 +408,9 @@ class ReferenceGenome(object):
         """
         par_strings = ["{}:{}-{}".format(contig, start, end) for (contig, start, end) in par]
         Env.backend().from_fasta_file(name, fasta_file, index_file, x_contigs, y_contigs, mt_contigs, par_strings)
-        
+
         rg = ReferenceGenome._from_config(Env.backend().get_reference(name), _builtin=True)
-        rg._has_sequence = True
+        rg._sequence_files = (fasta_file, index_file)
         return rg
 
     @typecheck_method(dest_reference_genome=reference_genome_type)
@@ -431,7 +437,7 @@ class ReferenceGenome(object):
         dest_reference_genome : :obj:`str` or :class:`.ReferenceGenome`
         """
         if dest_reference_genome.name in self._liftovers:
-            self._liftovers.remove(dest_reference_genome.name)
+            del self._liftovers[dest_reference_genome.name]
             Env.backend().remove_liftover(self.name, dest_reference_genome.name)
 
     @typecheck_method(chain_file=str,
@@ -479,8 +485,9 @@ class ReferenceGenome(object):
         """
 
         Env.backend().add_liftover(self.name, chain_file, dest_reference_genome.name)
-        self._liftovers.add(dest_reference_genome.name)
-        hl.ir.register_liftover_functions(self.name, dest_reference_genome.name)
+        if dest_reference_genome.name in self._liftovers:
+            raise KeyError(f"Liftover already exists from {self.name} to {dest_reference_genome.name}.")
+        self._liftovers[dest_reference_genome.name] = chain_file
 
 
 rg_type.set(ReferenceGenome)

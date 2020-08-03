@@ -1,14 +1,12 @@
 package is.hail.expr.ir
 
-import is.hail.SparkSuite
+import is.hail.TestUtils._
 import is.hail.asm4s.Code
 import is.hail.expr.ir.functions.{IRRandomness, RegistryFunctions}
-import is.hail.expr.types._
-import is.hail.rvd.RVD
-import is.hail.TestUtils._
-import is.hail.expr.types.virtual.{TArray, TInt32, TInt64}
-import is.hail.table.Table
+import is.hail.types.physical.{PInt32, PInt64}
+import is.hail.types.virtual.{TArray, TFloat64, TInt32, TInt64, TStream}
 import is.hail.utils._
+import is.hail.{ExecStrategy, HailContext, HailSuite}
 import org.apache.spark.sql.Row
 import org.testng.annotations.{BeforeClass, Test}
 
@@ -29,31 +27,33 @@ class TestIRRandomness(val seed: Long) extends IRRandomness(seed) {
 }
 
 object TestRandomFunctions extends RegistryFunctions {
-  def getTestRNG(mb: EmitMethodBuilder, seed: Long): Code[TestIRRandomness] = {
-    val rng = mb.newField[IRRandomness]
-    mb.fb.rngs += rng -> Code.checkcast[IRRandomness](Code.newInstance[TestIRRandomness, Long](seed))
+  def getTestRNG(mb: EmitMethodBuilder[_], seed: Long): Code[TestIRRandomness] = {
+    val rng = mb.genFieldThisRef[IRRandomness]()
+    mb.ecb.rngs += rng -> Code.checkcast[IRRandomness](Code.newInstance[TestIRRandomness, Long](seed))
     Code.checkcast[TestIRRandomness](rng)
   }
 
   def registerAll() {
-    registerSeeded("counter_seeded", TInt32()) { case (mb, seed) =>
-      getTestRNG(mb, seed).invoke[Int]("counter")
+    registerSeeded0("counter_seeded", TInt32, PInt32(true)) { case (r, rt, seed) =>
+      getTestRNG(r.mb, seed).invoke[Int]("counter")
     }
 
-    registerSeeded("seed_seeded", TInt64()) { case (mb, seed) =>
-      getTestRNG(mb, seed).invoke[Long]("seed")
+    registerSeeded0("seed_seeded", TInt64, PInt64(true)) { case (r, rt, seed) =>
+      getTestRNG(r.mb, seed).invoke[Long]("seed")
     }
 
-    registerSeeded("pi_seeded", TInt32()) { case (mb, seed) =>
-      getTestRNG(mb, seed).invoke[Int]("partitionIndex")
+    registerSeeded0("pi_seeded", TInt32, PInt32(true)) { case (r, rt, seed) =>
+      getTestRNG(r.mb, seed).invoke[Int]("partitionIndex")
     }
   }
 }
 
-class RandomFunctionsSuite extends SparkSuite {
+class RandomFunctionsSuite extends HailSuite {
 
-  val counter = ApplySeeded("counter_seeded", FastSeq(), 0L)
-  val partitionIdx = ApplySeeded("pi_seeded", FastSeq(), 0L)
+  implicit val execStrats = ExecStrategy.javaOnly
+
+  def counter = ApplySeeded("counter_seeded", FastSeq(), 0L, TInt32)
+  val partitionIdx = ApplySeeded("pi_seeded", FastSeq(), 0L, TInt32)
 
   def mapped2(n: Int, npart: Int) = TableMapRows(
     TableRange(n, npart),
@@ -67,7 +67,7 @@ class RandomFunctionsSuite extends SparkSuite {
   }
 
   @Test def testRandomAcrossJoins() {
-    def asArray(ir: TableIR) = Interpret(ir).rdd.collect()
+    def asArray(ir: TableIR) = Interpret(ir, ctx).rdd.collect()
 
     val joined = TableJoin(
       mapped2(10, 4),
@@ -84,37 +84,39 @@ class RandomFunctionsSuite extends SparkSuite {
   }
 
   @Test def testRepartitioningAfterRandomness() {
-    val mapped = Interpret(mapped2(15, 4)).rvd
+    val mapped = Interpret(mapped2(15, 4), ctx).rvd
     val newRangeBounds = FastIndexedSeq(
       Interval(Row(0), Row(4), true, true),
       Interval(Row(4), Row(10), false, true),
       Interval(Row(10), Row(14), false, true))
     val newPartitioner = mapped.partitioner.copy(rangeBounds=newRangeBounds)
 
-    val repartitioned = mapped.repartition(newPartitioner)
-    val cachedAndRepartitioned = mapped.cache().repartition(newPartitioner)
+    ExecuteContext.scoped() { ctx =>
+      val repartitioned = mapped.repartition(ctx, newPartitioner)
+      val cachedAndRepartitioned = mapped.cache(ctx).repartition(ctx, newPartitioner)
 
-    assert(mapped.toRows.collect() sameElements repartitioned.toRows.collect())
-    assert(mapped.toRows.collect() sameElements cachedAndRepartitioned.toRows.collect())
+      assert(mapped.toRows.collect() sameElements repartitioned.toRows.collect())
+      assert(mapped.toRows.collect() sameElements cachedAndRepartitioned.toRows.collect())
+    }
   }
 
   @Test def testInterpretIncrementsCorrectly() {
     assertEvalsTo(
-      ArrayMap(ArrayRange(0, 3, 1), "i", counter * counter),
+      ToArray(StreamMap(StreamRange(0, 3, 1), "i", counter * counter)),
       FastIndexedSeq(0, 1, 4))
 
     assertEvalsTo(
-      ArrayFold(ArrayRange(0, 3, 1), -1, "j", "i", counter + counter),
+      StreamFold(StreamRange(0, 3, 1), -1, "j", "i", counter + counter),
       4)
 
     assertEvalsTo(
-      ArrayFilter(ArrayRange(0, 3, 1), "i", Ref("i", TInt32()).ceq(counter) && counter.ceq(counter)),
+      ToArray(StreamFilter(StreamRange(0, 3, 1), "i", Ref("i", TInt32).ceq(counter) && counter.ceq(counter))),
       FastIndexedSeq(0, 1, 2))
 
     assertEvalsTo(
-      ArrayFlatMap(ArrayRange(0, 3, 1),
+      ToArray(StreamFlatMap(StreamRange(0, 3, 1),
         "i",
-        MakeArray(FastSeq(counter, counter, counter), TArray(TInt32()))),
+        MakeStream(FastSeq(counter, counter, counter), TStream(TInt32)))),
       FastIndexedSeq(0, 0, 0, 1, 1, 1, 2, 2, 2))
   }
 
@@ -132,9 +134,17 @@ class RandomFunctionsSuite extends SparkSuite {
           "pi" -> partitionIdx,
           "counter" -> counter)))
 
-    val expected = Interpret(tir).rvd.toRows.collect()
-    val actual = new Table(hc, tir).rdd.collect()
+    val expected = Interpret(tir, ctx).rvd.toRows.collect()
+    val actual = CompileAndEvaluate[IndexedSeq[Row]](ctx, GetField(TableCollect(tir), "rows"), false)
 
     assert(expected.sameElements(actual))
+  }
+
+  @Test def testRandCat() {
+    val seed = 5L
+    assertEvalsTo(invokeSeeded("rand_cat", seed, TInt32, MakeArray(IndexedSeq[IR](0.1), TArray(TFloat64))), 0)
+    assertEvalsTo(invokeSeeded("rand_cat", seed, TInt32, MakeArray(IndexedSeq[IR](0.3, 0.2, 0.95, 0.05), TArray(TFloat64))), 1)
+    assertEvalsTo(invokeSeeded("rand_cat", seed, TInt32, NA(TArray(TFloat64))), null)
+    assertFatal(invokeSeeded("rand_cat", seed, TInt32, MakeArray(IndexedSeq[IR](0.3, NA(TFloat64)), TArray(TFloat64))), "rand_cat")
   }
 }

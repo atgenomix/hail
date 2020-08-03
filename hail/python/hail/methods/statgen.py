@@ -1,22 +1,29 @@
 import itertools
 import math
 import numpy as np
-from typing import *
+from typing import Dict, List, Tuple, Callable
+import builtins
 
+import hail
 import hail as hl
 import hail.expr.aggregators as agg
-from hail.expr.expressions import *
-from hail.expr.types import *
-from hail.ir import *
+from hail.expr import Expression, ExpressionException, \
+    expr_float64, expr_call, expr_any, expr_numeric, expr_array, \
+    expr_locus, \
+    analyze, check_entry_indexed, check_row_indexed, \
+    matrix_table_source, table_source
+from hail.expr.types import tbool, tarray, tfloat64, tint32
+from hail import ir
 from hail.genetics.reference_genome import reference_genome_type
 from hail.linalg import BlockMatrix
 from hail.matrixtable import MatrixTable
-from hail.methods.misc import require_biallelic, require_row_key_variant
+from hail.methods.misc import require_biallelic, require_row_key_variant, require_col_key_str
 from hail.stats import LinearMixedModel
 from hail.table import Table
-from hail.typecheck import *
-from hail.utils import wrap_to_list, new_temp_file
-from hail.utils.java import *
+from hail.typecheck import typecheck, nullable, numeric, oneof, sequenceof, \
+    enumeration, anytype
+from hail.utils import wrap_to_list, new_temp_file, FatalError
+from hail.utils.java import Env, info, warning
 
 
 @typecheck(dataset=MatrixTable,
@@ -26,6 +33,8 @@ from hail.utils.java import *
            max=nullable(numeric))
 def identity_by_descent(dataset, maf=None, bounded=True, min=None, max=None) -> Table:
     """Compute matrix of identity-by-descent estimates.
+
+    .. include:: ../_templates/req_tstring.rst
 
     .. include:: ../_templates/req_tvariant.rst
 
@@ -47,6 +56,9 @@ def identity_by_descent(dataset, maf=None, bounded=True, min=None, max=None) -> 
 
     Notes
     -----
+
+    The dataset must have a column field named `s` which is a :class:`.StringExpression`
+    and which uniquely identifies a column.
 
     The implementation is based on the IBD algorithm described in the `PLINK
     paper <http://www.ncbi.nlm.nih.gov/pmc/articles/PMC1950838>`__.
@@ -74,7 +86,7 @@ def identity_by_descent(dataset, maf=None, bounded=True, min=None, max=None) -> 
     Parameters
     ----------
     dataset : :class:`.MatrixTable`
-        Variant-keyed :class:`.MatrixTable` containing genotype information.
+        Variant-keyed and sample-keyed :class:`.MatrixTable` containing genotype information.
     maf : :class:`.Float64Expression`, optional
         Row-indexed expression for the minor allele frequency.
     bounded : :obj:`bool`
@@ -92,17 +104,23 @@ def identity_by_descent(dataset, maf=None, bounded=True, min=None, max=None) -> 
     :class:`.Table`
     """
 
+    require_col_key_str(dataset, 'identity_by_descent')
+
     if maf is not None:
         analyze('identity_by_descent/maf', maf, dataset._row_indices)
-        dataset = dataset.select_rows(__maf = maf)
+        dataset = dataset.select_rows(__maf=maf)
     else:
         dataset = dataset.select_rows()
     dataset = dataset.select_cols().select_globals().select_entries('GT')
-    return Table._from_java(Env.hail().methods.IBD.apply(require_biallelic(dataset, 'ibd')._jmt,
-                                                         joption('__maf' if maf is not None else None),
-                                                         bounded,
-                                                         joption(min),
-                                                         joption(max)))
+    dataset = require_biallelic(dataset, 'ibd')
+
+    return Table(ir.MatrixToTableApply(dataset._mir, {
+        'name': 'IBD',
+        'mafFieldName': '__maf' if maf is not None else None,
+        'bounded': bounded,
+        'min': min,
+        'max': max,
+    }))
 
 
 @typecheck(call=expr_call,
@@ -112,8 +130,8 @@ def identity_by_descent(dataset, maf=None, bounded=True, min=None, max=None) -> 
            male_threshold=numeric,
            aaf=nullable(str))
 def impute_sex(call, aaf_threshold=0.0, include_par=False, female_threshold=0.2, male_threshold=0.8, aaf=None) -> Table:
-    """Impute sex of samples by calculating inbreeding coefficient on the X
-    chromosome.
+    r"""Impute sex of samples by calculating inbreeding coefficient on the
+    X chromosome.
 
     .. include:: ../_templates/req_tvariant.rst
 
@@ -125,7 +143,8 @@ def impute_sex(call, aaf_threshold=0.0, include_par=False, female_threshold=0.2,
     Remove samples where imputed sex does not equal reported sex:
 
     >>> imputed_sex = hl.impute_sex(dataset.GT)
-    >>> dataset_result = dataset.filter_cols(imputed_sex[dataset.s].is_female != dataset.pheno.is_female)
+    >>> dataset_result = dataset.filter_cols(imputed_sex[dataset.s].is_female != dataset.pheno.is_female,
+    ...                                      keep=False)
 
     Notes
     -----
@@ -142,12 +161,12 @@ def impute_sex(call, aaf_threshold=0.0, include_par=False, female_threshold=0.2,
 
     3. Filter to variants with AAF above `aaf_threshold`.
 
-    4. Remove loci in the pseudoautosomal region, as defined by `gr`, if and
-       only if `include_par` is ``True`` (it defaults to ``False``)
+    4. Remove loci in the pseudoautosomal region, as defined by `gr`, unless
+       `include_par` is ``True`` (it defaults to ``False``)
 
     5. For each row and column with a non-missing genotype call, :math:`E`, the
        expected number of homozygotes (from population AAF), is computed as
-       :math:`1.0 - (2.0*maf*(1.0-maf))`.
+       :math:`1.0 - (2.0*\mathrm{maf}*(1.0-\mathrm{maf}))`.
 
     6. For each row and column with a non-missing genotype call, :math:`O`, the
        observed number of homozygotes, is computed interpreting ``0`` as
@@ -199,6 +218,7 @@ def impute_sex(call, aaf_threshold=0.0, include_par=False, female_threshold=0.2,
     ------
     :class:`.Table`
         Sex imputation statistics per sample.
+
     """
     if aaf_threshold < 0.0 or aaf_threshold > 1.0:
         raise FatalError("Invalid argument for `aaf_threshold`. Must be in range [0, 1].")
@@ -381,10 +401,10 @@ def linear_regression_rows(y, x, covariates, block_size=16, pass_through=()) -> 
 
     y_is_list = isinstance(y, list)
     if y_is_list and len(y) == 0:
-        raise ValueError(f"'linear_regression_rows': found no values for 'y'")
+        raise ValueError("'linear_regression_rows': found no values for 'y'")
     is_chained = y_is_list and isinstance(y[0], list)
-    if is_chained and any(len(l) == 0 for l in y):
-        raise ValueError(f"'linear_regression_rows': found empty inner list for 'y'")
+    if is_chained and any(len(lst) == 0 for lst in y):
+        raise ValueError("'linear_regression_rows': found empty inner list for 'y'")
 
     y = wrap_to_list(y)
 
@@ -426,13 +446,147 @@ def linear_regression_rows(y, x, covariates, block_size=16, pass_through=()) -> 
         'rowBlockSize': block_size,
         'passThrough': [x for x in row_fields if x not in mt.row_key]
     }
-    ht_result = Table(MatrixToTableApply(mt._mir, config))
+    ht_result = Table(ir.MatrixToTableApply(mt._mir, config))
 
     if not y_is_list:
         fields = ['y_transpose_x', 'beta', 'standard_error', 't_stat', 'p_value']
         ht_result = ht_result.annotate(**{f: ht_result[f][0] for f in fields})
 
     return ht_result.persist()
+
+
+@typecheck(y=oneof(expr_float64, sequenceof(expr_float64), sequenceof(sequenceof(expr_float64))),
+           x=expr_float64,
+           covariates=sequenceof(expr_float64),
+           block_size=int,
+           pass_through=sequenceof(oneof(str, Expression)))
+def _linear_regression_rows_nd(y, x, covariates, block_size=16, pass_through=()) -> hail.Table:
+    mt = matrix_table_source('linear_regression_rows_nd/x', x)
+    check_entry_indexed('linear_regression_rows_nd/x', x)
+
+    y_is_list = isinstance(y, list)
+    if y_is_list and len(y) == 0:
+        raise ValueError("'linear_regression_rows_nd': found no values for 'y'")
+    is_chained = y_is_list and isinstance(y[0], list)
+
+    if is_chained:
+        raise ValueError("linear_regression_rows_nd does not currently support chained linear regression.")
+
+    if is_chained and any(len(lst) == 0 for lst in y):
+        raise ValueError("'linear_regression_rows': found empty inner list for 'y'")
+
+    y = wrap_to_list(y)
+
+    for e in (itertools.chain.from_iterable(y) if is_chained else y):
+        analyze('linear_regression_rows_nd/y', e, mt._col_indices)
+
+    for e in covariates:
+        analyze('linear_regression_rows_nd/covariates', e, mt._col_indices)
+
+    _warn_if_no_intercept('linear_regression_rows_nd', covariates)
+
+    x_field_name = Env.get_uid()
+    if is_chained:
+        y_field_names = [[f'__y_{i}_{j}' for j in range(len(y[i]))] for i in range(len(y))]
+        y_dict = dict(zip(itertools.chain.from_iterable(y_field_names), itertools.chain.from_iterable(y)))
+
+    else:
+        y_field_names = list(f'__y_{i}' for i in range(len(y)))
+        y_dict = dict(zip(y_field_names, y))
+
+    cov_field_names = list(f'__cov{i}' for i in range(len(covariates)))
+
+    row_fields = _get_regression_row_fields(mt, pass_through, 'linear_regression_rows_nd')
+
+    # FIXME: selecting an existing entry field should be emitted as a SelectFields
+    mt = mt._select_all(col_exprs=dict(**y_dict,
+                                       **dict(zip(cov_field_names, covariates))),
+                        row_exprs=row_fields,
+                        col_key=[],
+                        entry_exprs={x_field_name: x})
+
+    # NEW STUFF
+    entries_field_name = 'ent'
+    sample_field_name = "by_sample"
+    X_field_name = entries_field_name + "_nd"
+
+    def all_defined(struct_root, field_names):
+        defined_array = hl.array([hl.is_defined(struct_root[field_name]) for field_name in field_names])
+        return defined_array.all(lambda a: a)
+
+    # Given a hail array, get the mean of the nonmissing entries and
+    # return new array where the missing entries are the mean.
+    def mean_impute(hl_array):
+        non_missing_mean = hl.mean(hl_array, filter_missing=True)
+        return hl_array.map(lambda entry: hl.if_else(hl.is_defined(entry), entry, non_missing_mean))
+
+    def select_array_indices(hl_array, indices):
+        return indices.map(lambda i: hl_array[i])
+
+    def dot_rows_with_themselves(matrix):
+        return (matrix * matrix) @ hl.nd.ones(matrix.shape[1])
+
+    ht_local = mt._localize_entries(entries_field_name, sample_field_name)
+
+    ht = ht_local.transmute(**{entries_field_name: ht_local[entries_field_name][x_field_name]})
+    ht = ht._group_within_partitions("grouped_fields", block_size)
+
+    ys_and_covs_to_keep_with_indices = hl.zip_with_index(ht[sample_field_name]).filter(lambda struct_with_index: all_defined(struct_with_index[1], y_field_names + cov_field_names))
+    indices_to_keep = ys_and_covs_to_keep_with_indices.map(lambda pair: pair[0])
+    ys_and_covs_to_keep = ys_and_covs_to_keep_with_indices.map(lambda pair: pair[1])
+
+    cov_nd = hl.nd.array(ys_and_covs_to_keep.map(lambda struct: hl.array([struct[cov_name] for cov_name in cov_field_names]))) if cov_field_names else hl.nd.zeros((hl.len(indices_to_keep), 0))
+    ht = ht.annotate_globals(kept_samples=indices_to_keep,
+                             __y_nd=hl.nd.array(ys_and_covs_to_keep.map(lambda struct: hl.array([struct[y_name] for y_name in y_field_names]))),
+                             __cov_nd=cov_nd)
+    k = builtins.len(covariates)
+
+    ht = ht.annotate(**{X_field_name: hl.nd.array(hl.map(lambda row: mean_impute(select_array_indices(row, ht.kept_samples)), ht["grouped_fields"][entries_field_name])).T})
+    n = hl.len(ht.kept_samples)
+    ht = ht.annotate_globals(d=n - k - 1)
+    cov_Qt = hl.if_else(k > 0, hl.nd.qr(ht.__cov_nd)[0].T, hl.nd.zeros((0, n)))
+    ht = ht.annotate_globals(__Qty=cov_Qt @ ht.__y_nd)
+    ht = ht.annotate_globals(__yyp=dot_rows_with_themselves(ht.__y_nd.T) - dot_rows_with_themselves(ht.__Qty.T))
+
+    sum_x_nd = ht[X_field_name].T @ hl.nd.ones((n,))
+    ht = ht.annotate(sum_x=sum_x_nd._data_array())
+    Qtx = cov_Qt @ ht[X_field_name]
+    ytx = ht.__y_nd.T @ ht[X_field_name]
+    xyp = ytx - (ht.__Qty.T @ Qtx)
+    xxpRec = (dot_rows_with_themselves(ht[X_field_name].T) - dot_rows_with_themselves(Qtx.T)).map(lambda entry: 1 / entry)
+    b = xyp * xxpRec
+    se = ((1.0 / ht.d) * (ht.__yyp.reshape((-1, 1)) @ xxpRec.reshape((1, -1)) - (b * b))).map(lambda entry: hl.sqrt(entry))
+    t = b / se
+    p = t.map(lambda entry: 2 * hl.expr.functions.pT(-hl.abs(entry), ht.d, True, False))
+    ht = ht.annotate(__b=b, __ytx=ytx, __se=se, __t=t, __p=p)
+
+    def zip_to_struct(ht, struct_root_name, **kwargs):
+        mapping = list(kwargs.items())
+        sources = [pair[1] for pair in mapping]
+        dests = [pair[0] for pair in mapping]
+        ht = ht.annotate(**{struct_root_name: hl.zip(*sources)})
+        ht = ht.transmute(**{struct_root_name: ht[struct_root_name].map(lambda tup: hl.struct(**{dests[i]: tup[i] for i in range(len(dests))}))})
+        return ht
+
+    res = ht.key_by()
+    key_fields = [key_field for key_field in ht.key]
+    key_dict = {key_field: res.grouped_fields[key_field] for key_field in key_fields}
+    linreg_fields_dict = {"sum_x": res.sum_x, "y_transpose_x": res.__ytx.T._data_array(), "beta": res.__b.T._data_array(),
+                          "standard_error": res.__se.T._data_array(), "t_stat": res.__t.T._data_array(), "p_value": res.__p.T._data_array()}
+    combined_dict = {**key_dict, **linreg_fields_dict}
+    res = zip_to_struct(res, "all_zipped", **combined_dict)
+
+    res = res.explode(res.all_zipped)
+    res = res.select(**{field: res.row.all_zipped[field] for field in res.row.all_zipped})
+    res = res.key_by(*[res[key_field] for key_field in ht.key])
+
+    if not y_is_list:
+        fields = ['y_transpose_x', 'beta', 'standard_error', 't_stat', 'p_value']
+        res = res.annotate(**{f: res[f][0] for f in fields})
+
+    res = res.select_globals()
+
+    return res
 
 
 @typecheck(test=enumeration('wald', 'lrt', 'score', 'firth'),
@@ -664,7 +818,7 @@ def logistic_regression_rows(test, y, x, covariates, pass_through=()) -> hail.Ta
 
     y_is_list = isinstance(y, list)
     if y_is_list and len(y) == 0:
-        raise ValueError(f"'logistic_regression_rows': found no values for 'y'")
+        raise ValueError("'logistic_regression_rows': found no values for 'y'")
     y = wrap_to_list(y)
 
     for e in covariates:
@@ -696,12 +850,13 @@ def logistic_regression_rows(test, y, x, covariates, pass_through=()) -> hail.Ta
         'passThrough': [x for x in row_fields if x not in mt.row_key]
     }
 
-    result = Table(MatrixToTableApply(mt._mir, config))
+    result = Table(ir.MatrixToTableApply(mt._mir, config))
 
     if not y_is_list:
         result = result.transmute(**result.logistic_regression[0])
 
-    return result
+    return result.persist()
+
 
 @typecheck(test=enumeration('wald', 'lrt', 'score'),
            y=expr_float64,
@@ -774,8 +929,8 @@ def poisson_regression_rows(test, y, x, covariates, pass_through=()) -> Table:
         'covFields': cov_field_names,
         'passThrough': [x for x in row_fields if x not in mt.row_key]
     }
-    
-    return Table(MatrixToTableApply(mt._mir, config))
+
+    return Table(ir.MatrixToTableApply(mt._mir, config)).persist()
 
 
 @typecheck(y=expr_float64,
@@ -801,8 +956,8 @@ def linear_mixed_model(y,
     Initialize a model using three fixed effects (including intercept) and
     genetic marker random effects:
 
-    >>> marker_ds = dataset.filter_rows(dataset.use_as_marker)
-    >>> model, _ = hl.linear_mixed_model(
+    >>> marker_ds = dataset.filter_rows(dataset.use_as_marker) # doctest: +SKIP
+    >>> model, _ = hl.linear_mixed_model( # doctest: +SKIP
     ...     y=marker_ds.pheno.height,
     ...     x=[1, marker_ds.pheno.age, marker_ds.pheno.is_female],
     ...     z_t=marker_ds.GT.n_alt_alleles(),
@@ -810,8 +965,8 @@ def linear_mixed_model(y,
 
     Fit the model and examine :math:`h^2`:
 
-    >>> model.fit()
-    >>> model.h_sq
+    >>> model.fit()  # doctest: +SKIP
+    >>> model.h_sq  # doctest: +SKIP
 
     Sanity-check the normalized likelihood of :math:`h^2` over the percentile
     grid:
@@ -821,7 +976,7 @@ def linear_mixed_model(y,
 
     For this value of :math:`h^2`, test each variant for association:
 
-    >>> result_table = hl.linear_mixed_regression_rows(dataset.GT.n_alt_alleles(), model)
+    >>> result_table = hl.linear_mixed_regression_rows(dataset.GT.n_alt_alleles(), model)  # doctest: +SKIP
 
     Alternatively, one can define a full-rank model using a pre-computed kinship
     matrix :math:`K` in ndarray form. When :math:`K` is the realized
@@ -829,8 +984,8 @@ def linear_mixed_model(y,
     as above with :math:`P` written as a block matrix but returned as an
     ndarray:
 
-    >>> rrm = hl.realized_relationship_matrix(marker_ds.GT).to_numpy()
-    >>> model, p = hl.linear_mixed_model(
+    >>> rrm = hl.realized_relationship_matrix(marker_ds.GT).to_numpy()  # doctest: +SKIP
+    >>> model, p = hl.linear_mixed_model(  # doctest: +SKIP
     ...     y=dataset.pheno.height,
     ...     x=[1, dataset.pheno.age, dataset.pheno.is_female],
     ...     k=rrm,
@@ -847,10 +1002,11 @@ def linear_mixed_model(y,
     the number of random effects :math:`m`. At least one dimension must be less
     than or equal to 46300. If `standardize` is true, each random effect is first
     standardized to have mean 0 and variance :math:`\frac{1}{m}`, so that the
-    diagonal values of the kinship matrix `K = ZZ^T` are 1.0 in expectation.
-    This kinship matrix corresponds to the :meth:`realized_relationship_matrix`
-    in genetics. See :meth:`.LinearMixedModel.from_random_effects`
-    and :meth:`.BlockMatrix.svd` for more details.
+    diagonal values of the kinship matrix :math:`K = ZZ^T` are 1.0 in
+    expectation. This kinship matrix corresponds to the
+    :meth:`realized_relationship_matrix` in genetics. See
+    :meth:`.LinearMixedModel.from_random_effects` and :meth:`.BlockMatrix.svd`
+    for more details.
 
     If `k` is set, the model is full-rank. For correct results, the indices of
     `k` **must be aligned** with columns of the source of `y`.
@@ -911,8 +1067,8 @@ def linear_mixed_model(y,
     """
     source = matrix_table_source('linear_mixed_model/y', y)
 
-    if ((z_t is None and k is None) or
-            (z_t is not None and k is not None)):
+    if ((z_t is None and k is None)
+            or (z_t is not None and k is not None)):
         raise ValueError("linear_mixed_model: set exactly one of 'z_t' and 'k'")
 
     if len(x) == 0:
@@ -1138,7 +1294,6 @@ def skat(key_expr, weight_expr, y, x, covariates, logistic=False,
     Test each gene for association using the linear sequence kernel association
     test:
 
-    >>> burden_ds = hl.read_matrix_table('data/example_burden.vds')
     >>> skat_table = hl.skat(key_expr=burden_ds.gene,
     ...                      weight_expr=burden_ds.weight,
     ...                      y=burden_ds.burden.pheno,
@@ -1292,11 +1447,11 @@ def skat(key_expr, weight_expr, y, x, covariates, logistic=False,
     key_field_name = '__key'
     cov_field_names = list(f'__cov{i}' for i in range(len(covariates)))
 
-    mt = mt._annotate_all(col_exprs=dict(**{y_field_name: y},
-                                         **dict(zip(cov_field_names, covariates))),
-                          row_exprs={weight_field_name: weight_expr,
-                                     key_field_name: key_expr},
-                          entry_exprs=entry_expr)
+    mt = mt._select_all(col_exprs=dict(**{y_field_name: y},
+                                       **dict(zip(cov_field_names, covariates))),
+                        row_exprs={weight_field_name: weight_expr,
+                                   key_field_name: key_expr},
+                        entry_exprs=entry_expr)
 
     config = {
         'name': 'Skat',
@@ -1311,7 +1466,44 @@ def skat(key_expr, weight_expr, y, x, covariates, logistic=False,
         'iterations': iterations
     }
 
-    return Table(MatrixToTableApply(mt._mir, config))
+    return Table(ir.MatrixToTableApply(mt._mir, config))
+
+
+@typecheck(p_value=expr_numeric,
+           approximate=bool)
+def lambda_gc(p_value, approximate=True):
+    """
+    Compute genomic inflation factor (lambda GC) from an Expression of p-values.
+
+    .. include:: ../_templates/experimental.rst
+
+    Parameters
+    ----------
+    p_value : :class:`.NumericExpression`
+        Row-indexed numeric expression of p-values.
+    approximate : :obj:`bool`
+        If False, computes exact lambda GC (slower and uses more memory).
+
+    Returns
+    -------
+    :obj:`float`
+        Genomic inflation factor (lambda genomic control).
+    """
+    check_row_indexed('lambda_gc', p_value)
+    t = table_source('lambda_gc', p_value)
+    med_chisq = _lambda_gc_agg(p_value, approximate)
+    return t.aggregate(med_chisq)
+
+
+@typecheck(p_value=expr_numeric,
+           approximate=bool)
+def _lambda_gc_agg(p_value, approximate=True):
+    chisq = hl.qchisqtail(p_value, 1)
+    if approximate:
+        med_chisq = hl.agg.approx_quantiles(chisq, 0.5)
+    else:
+        med_chisq = hl.median(hl.agg.collect(chisq))
+    return med_chisq / hl.qchisqtail(0.5, 1)
 
 
 @typecheck(call_expr=expr_call,
@@ -1387,7 +1579,7 @@ def hwe_normalized_pca(call_expr, k=10, compute_loadings=False) -> Tuple[List[fl
     mt = mt.annotate_rows(__mean_gt=mt.__AC / mt.__n_called)
     mt = mt.annotate_rows(
         __hwe_scaled_std_dev=hl.sqrt(mt.__mean_gt * (2 - mt.__mean_gt) * n_variants / 2))
-    mt = mt._unfilter_entries()
+    mt = mt.unfilter_entries()
 
     normalized_gt = hl.or_else((mt.__gt - mt.__mean_gt) / mt.__hwe_scaled_std_dev, 0.0)
 
@@ -1491,30 +1683,29 @@ def pca(entry_expr, k=10, compute_loadings=False) -> Tuple[List[float], Table, T
         mt = mt.select_entries(**{field: entry_expr})
     mt = mt.select_cols().select_rows().select_globals()
 
-    t = (Table(MatrixToTableApply(mt._mir, {
+    t = (Table(ir.MatrixToTableApply(mt._mir, {
         'name': 'PCA',
         'entryField': field,
         'k': k,
         'computeLoadings': compute_loadings
-    }))
-         .cache())
+    })).persist())
 
     g = t.index_globals()
     scores = hl.Table.parallelize(g.scores, key=list(mt.col_key))
     if not compute_loadings:
         t = None
-    return hl.eval(g.eigenvalues), scores, t
+    return hl.eval(g.eigenvalues), scores, None if t is None else t.drop('eigenvalues', 'scores')
 
 
 @typecheck(call_expr=expr_call,
            min_individual_maf=numeric,
            k=nullable(int),
            scores_expr=nullable(expr_array(expr_float64)),
-           min_kinship=numeric,
+           min_kinship=nullable(numeric),
            statistics=enumeration('kin', 'kin2', 'kin20', 'all'),
            block_size=nullable(int))
 def pc_relate(call_expr, min_individual_maf, *, k=None, scores_expr=None,
-              min_kinship=-float("inf"), statistics="all", block_size=None) -> Table:
+              min_kinship=None, statistics="all", block_size=None) -> Table:
     r"""Compute relatedness estimates between individuals using a variant of the
     PC-Relate method.
 
@@ -1560,11 +1751,11 @@ def pc_relate(call_expr, min_individual_maf, *, k=None, scores_expr=None,
 
     .. math::
 
-      \widehat{\phi_{ij}} :=
+      \widehat{\phi_{ij}} \coloneqq
         \frac{1}{|S_{ij}|}
         \sum_{s \in S_{ij}}
           \frac{(g_{is} - 2 p_s) (g_{js} - 2 p_s)}
-                {4 \sum_{s \in S_{ij} p_s (1 - p_s)}}
+                {4 \sum_{s \in S_{ij}} p_s (1 - p_s)}
 
     This estimator is true under the model that the sharing of common
     (relative to the population) alleles is not very informative to
@@ -1589,7 +1780,7 @@ def pc_relate(call_expr, min_individual_maf, *, k=None, scores_expr=None,
     principal component coordinates. As such, the efficacy of this method
     rests on two assumptions:
 
-     - an individual's first ``k`` principal component coordinates fully
+     - an individual's first `k` principal component coordinates fully
        describe their allele-frequency-relevant ancestry, and
 
      - the relationship between ancestry (as described by principal
@@ -1607,17 +1798,17 @@ def pc_relate(call_expr, min_individual_maf, *, k=None, scores_expr=None,
      - :math:`\widehat{\mu_{is}} \in [0, 1]` be the individual-specific allele
        frequency for individual :math:`i` at genetic locus :math:`s`
 
-     - :math:`{\widehat{\sigma^2_{is}}} := \widehat{\mu_{is}} (1 - \widehat{\mu_{is}})`,
+     - :math:`{\widehat{\sigma^2_{is}}} \coloneqq \widehat{\mu_{is}} (1 - \widehat{\mu_{is}})`,
        the binomial variance of :math:`\widehat{\mu_{is}}`
 
-     - :math:`\widehat{\sigma_{is}} := \sqrt{\widehat{\sigma^2_{is}}}`,
+     - :math:`\widehat{\sigma_{is}} \coloneqq \sqrt{\widehat{\sigma^2_{is}}}`,
        the binomial standard deviation of :math:`\widehat{\mu_{is}}`
 
-     - :math:`\text{IBS}^{(0)}_{ij} := \sum_{s \in S_{ij}} \mathbb{1}_{||g_{is} - g_{js} = 2||}`,
+     - :math:`\text{IBS}^{(0)}_{ij} \coloneqq \sum_{s \in S_{ij}} \mathbb{1}_{||g_{is} - g_{js} = 2||}`,
        the number of genetic loci at which individuals :math:`i` and :math:`j`
        share no alleles
 
-     - :math:`\widehat{f_i} := 2 \widehat{\phi_{ii}} - 1`, the inbreeding
+     - :math:`\widehat{f_i} \coloneqq 2 \widehat{\phi_{ii}} - 1`, the inbreeding
        coefficient for individual :math:`i`
 
      - :math:`g^D_{is}` be a dominance encoding of the genotype matrix, and
@@ -1625,20 +1816,21 @@ def pc_relate(call_expr, min_individual_maf, *, k=None, scores_expr=None,
 
     .. math::
 
-        g^D_{is} :=
+        g^D_{is} \coloneqq
           \begin{cases}
             \widehat{\mu_{is}}     & g_{is} = 0 \\
             0                        & g_{is} = 1 \\
             1 - \widehat{\mu_{is}} & g_{is} = 2
           \end{cases}
 
-        X_{is} := g^D_{is} - \widehat{\sigma^2_{is}} (1 - \widehat{f_i})
+        \qquad
+        X_{is} \coloneqq g^D_{is} - \widehat{\sigma^2_{is}} (1 - \widehat{f_i})
 
     The estimator for kinship is given by:
 
     .. math::
 
-      \widehat{\phi_{ij}} :=
+      \widehat{\phi_{ij}} \coloneqq
         \frac{\sum_{s \in S_{ij}}(g - 2 \mu)_{is} (g - 2 \mu)_{js}}
               {4 * \sum_{s \in S_{ij}}
                             \widehat{\sigma_{is}} \widehat{\sigma_{js}}}
@@ -1647,7 +1839,7 @@ def pc_relate(call_expr, min_individual_maf, *, k=None, scores_expr=None,
 
     .. math::
 
-      \widehat{k^{(2)}_{ij}} :=
+      \widehat{k^{(2)}_{ij}} \coloneqq
         \frac{\sum_{s \in S_{ij}}X_{is} X_{js}}{\sum_{s \in S_{ij}}
           \widehat{\sigma^2_{is}} \widehat{\sigma^2_{js}}}
 
@@ -1655,7 +1847,7 @@ def pc_relate(call_expr, min_individual_maf, *, k=None, scores_expr=None,
 
     .. math::
 
-      \widehat{k^{(0)}_{ij}} :=
+      \widehat{k^{(0)}_{ij}} \coloneqq
         \begin{cases}
           \frac{\text{IBS}^{(0)}_{ij}}
                 {\sum_{s \in S_{ij}}
@@ -1670,7 +1862,7 @@ def pc_relate(call_expr, min_individual_maf, *, k=None, scores_expr=None,
 
     .. math::
 
-      \widehat{k^{(1)}_{ij}} :=
+      \widehat{k^{(1)}_{ij}} \coloneqq
         1 - \widehat{k^{(2)}_{ij}} - \widehat{k^{(0)}_{ij}}
 
     Note that, even if present, phase information is ignored by this method.
@@ -1760,8 +1952,8 @@ def pc_relate(call_expr, min_individual_maf, *, k=None, scores_expr=None,
         source as `call_expr`. All array values must have the same positive length,
         corresponding to the number of principal components, and all scores must
         be non-missing. Exactly one of `k` and `scores_expr` must be specified.
-    min_kinship : :obj:`float`
-        Pairs of samples with kinship lower than ``min_kinship`` are excluded
+    min_kinship : :obj:`float`, optional
+        If set, pairs of samples with kinship lower than `min_kinship` are excluded
         from the results.
     statistics : :obj:`str`
         Set of statistics to compute.
@@ -1797,7 +1989,7 @@ def pc_relate(call_expr, min_individual_maf, *, k=None, scores_expr=None,
     if n_missing > 0:
         raise ValueError(f'Found {n_missing} columns with missing scores array.')
 
-    mt = mt.select_entries(__gt=call_expr.n_alt_alleles())
+    mt = mt.select_entries(__gt=call_expr.n_alt_alleles()).unfilter_entries()
     mt = mt.annotate_rows(__mean_gt=agg.mean(mt.__gt))
     mean_imputed_gt = hl.or_else(hl.float64(mt.__gt), mt.__mean_gt)
 
@@ -1807,16 +1999,15 @@ def pc_relate(call_expr, min_individual_maf, *, k=None, scores_expr=None,
     g = BlockMatrix.from_entry_expr(mean_imputed_gt,
                                     block_size=block_size)
 
-    int_statistics = {'kin': 0, 'kin2': 1, 'kin20': 2, 'all': 3}[statistics]
+    pcs = scores_table.collect(_localize=False).map(lambda x: x.__scores)
 
-    ht = Table._from_java(scala_object(Env.hail().methods, 'PCRelate')
-                          .apply(Env.hc()._jhc,
-                                 g._jbm,
-                                 scores_table._jt,
-                                 min_individual_maf,
-                                 block_size,
-                                 min_kinship,
-                                 int_statistics))
+    ht = Table(ir.BlockMatrixToTableApply(g._bmir, pcs._ir, {
+        'name': 'PCRelate',
+        'maf': min_individual_maf,
+        'blockSize': block_size,
+        'minKinship': min_kinship,
+        'statistics': {'kin': 0, 'kin2': 1, 'kin20': 2, 'all': 3}[statistics]
+    }))
 
     if statistics == 'kin':
         ht = ht.drop('ibd0', 'ibd1', 'ibd2')
@@ -1831,9 +2022,18 @@ def pc_relate(call_expr, min_individual_maf, *, k=None, scores_expr=None,
 
 @typecheck(ds=oneof(Table, MatrixTable),
            keep_star=bool,
-           left_aligned=bool)
-def split_multi(ds, keep_star=False, left_aligned=False):
+           left_aligned=bool,
+           permit_shuffle=bool)
+def split_multi(ds, keep_star=False, left_aligned=False, *, permit_shuffle=False):
     """Split multiallelic variants.
+
+    Warning
+    -------
+    In order to support a wide variety of data types, this function splits only
+    the variants on a :class:`.MatrixTable`, but **not the genotypes**. Use
+    :func:`.split_multi_hts` if possible, or split the genotypes yourself using
+    one of the entry modification methods: :meth:`.MatrixTable.annotate_entries`,
+    :meth:`.MatrixTable.select_entries`, :meth:`.MatrixTable.transmute_entries`.
 
     The resulting dataset will be keyed by the split locus and alleles.
 
@@ -1875,14 +2075,6 @@ def split_multi(ds, keep_star=False, left_aligned=False):
     ...     PL=pl,
     ...     GQ=hl.gq_from_pl(pl)).drop('old_locus', 'old_alleles')
 
-    Warning
-    -------
-    In order to support a wide variety of data types, this function splits only
-    the variants on a :class:`.MatrixTable`, but **not the genotypes**. Use
-    :func:`.split_multi_hts` if possible, or split the genotypes yourself using
-    one of the entry modification methods: :meth:`.MatrixTable.annotate_entries`,
-    :meth:`.MatrixTable.select_entries`, :meth:`.MatrixTable.transmute_entries`.
-
     See Also
     --------
     :func:`.split_multi_hts`
@@ -1897,6 +2089,10 @@ def split_multi(ds, keep_star=False, left_aligned=False):
         If ``True``, variants are assumed to be left aligned and have unique
         loci. This avoids a shuffle. If the assumption is violated, an error
         is generated.
+    permit_shuffle : :obj:`bool`
+        If ``True``, permit a data shuffle to sort out-of-order split results.
+        This will only be required if input data has duplicate loci, one of
+        which contains more than one alternate allele.
 
     Returns
     -------
@@ -1937,7 +2133,7 @@ def split_multi(ds, keep_star=False, left_aligned=False):
             if rekey:
                 return mt.key_rows_by('locus', 'alleles')
             else:
-                return MatrixTable(MatrixKeyRowsBy(mt._mir, ['locus', 'alleles'], is_sorted=True))
+                return MatrixTable(ir.MatrixKeyRowsBy(mt._mir, ['locus', 'alleles'], is_sorted=True))
         else:
             assert isinstance(ds, Table)
             ht = (ds.annotate(**{new_id: expr})
@@ -1957,7 +2153,7 @@ def split_multi(ds, keep_star=False, left_aligned=False):
             if rekey:
                 return ht.key_by('locus', 'alleles')
             else:
-                return Table(TableKeyBy(ht._tir, ['locus', 'alleles'], is_sorted=True))
+                return Table(ir.TableKeyBy(ht._tir, ['locus', 'alleles'], is_sorted=True))
 
     if left_aligned:
         def make_struct(i):
@@ -1967,7 +2163,7 @@ def split_multi(ds, keep_star=False, left_aligned=False):
                         .or_error("Found non-left-aligned variant in split_multi"))
             return hl.bind(error_on_moved,
                            hl.min_rep(old_row.locus, [old_row.alleles[0], old_row.alleles[i]]))
-        return split_rows(hl.sorted(kept_alleles.map(make_struct)), False)
+        return split_rows(hl.sorted(kept_alleles.map(make_struct)), permit_shuffle)
     else:
         def make_struct(i, cond):
             def struct_or_empty(v):
@@ -1980,16 +2176,17 @@ def split_multi(ds, keep_star=False, left_aligned=False):
         def make_array(cond):
             return hl.sorted(kept_alleles.flatmap(lambda i: make_struct(i, cond)))
 
-        left = split_rows(make_array(lambda locus: locus == ds['locus']), False)
+        left = split_rows(make_array(lambda locus: locus == ds['locus']), permit_shuffle)
         moved = split_rows(make_array(lambda locus: locus != ds['locus']), True)
-    return left.union(moved) if is_table else left.union_rows(moved)
+    return left.union(moved) if is_table else left.union_rows(moved, _check_cols=False)
 
 
 @typecheck(ds=oneof(Table, MatrixTable),
            keep_star=bool,
            left_aligned=bool,
-           vep_root=str)
-def split_multi_hts(ds, keep_star=False, left_aligned=False, vep_root='vep'):
+           vep_root=str,
+           permit_shuffle=bool)
+def split_multi_hts(ds, keep_star=False, left_aligned=False, vep_root='vep', *, permit_shuffle=False):
     """Split multiallelic variants for datasets that contain one or more fields
     from a standard high-throughput sequencing entry schema.
 
@@ -2053,8 +2250,8 @@ def split_multi_hts(ds, keep_star=False, left_aligned=False, vep_root='vep'):
     the minimum over multiallelic `PL` entries for genotypes that map to that
     genotype.
 
-    `GQ` is recomputed from `PL` if `PL` is provided. If not, it is copied from the
-    original GQ.
+    `GQ` is recomputed from `PL` if `PL` is provided and is not
+    missing. If not, it is copied from the original GQ.
 
     Here is a second example for a het non-ref
 
@@ -2093,7 +2290,7 @@ def split_multi_hts(ds, keep_star=False, left_aligned=False, vep_root='vep'):
     values. Here is an example:
 
     >>> split_ds = hl.split_multi_hts(dataset)
-    >>> split_ds = split_ds.annotate_rows(info = Struct(AC=split_ds.info.AC[split_ds.a_index - 1],
+    >>> split_ds = split_ds.annotate_rows(info = hl.struct(AC=split_ds.info.AC[split_ds.a_index - 1],
     ...                                   **split_ds.info)) # doctest: +SKIP
     >>> hl.export_vcf(split_ds, 'output/export.vcf') # doctest: +SKIP
 
@@ -2131,14 +2328,19 @@ def split_multi_hts(ds, keep_star=False, left_aligned=False, vep_root='vep'):
         (intergenic_consequences, motif_feature_consequences,
         regulatory_feature_consequences, and transcript_consequences)
         will be split properly (i.e. a_index corresponding to the VEP allele_num).
+    permit_shuffle : :obj:`bool`
+        If ``True``, permit a data shuffle to sort out-of-order split results.
+        This will only be required if input data has duplicate loci, one of
+        which contains more than one alternate allele.
 
     Returns
     -------
     :class:`.MatrixTable` or :class:`.Table`
         A biallelic variant dataset.
+
     """
 
-    split = split_multi(ds, keep_star=keep_star, left_aligned=left_aligned)
+    split = split_multi(ds, keep_star=keep_star, left_aligned=left_aligned, permit_shuffle=permit_shuffle)
 
     row_fields = set(ds.row)
     update_rows_expression = {}
@@ -2187,11 +2389,13 @@ def split_multi_hts(ds, keep_star=False, left_aligned=False, vep_root='vep'):
             (hl.range(0, 3).map(lambda i:
                                 hl.min((hl.range(0, hl.triangle(split.old_alleles.length()))
                                         .filter(lambda j: hl.downcode(hl.unphased_diploid_gt_index_call(j),
-                                                                      split.a_index) == hl.unphased_diploid_gt_index_call(i)
+                                                                      split.a_index).unphased_diploid_gt_index() == i
                                                 ).map(lambda j: split.PL[j]))))))
-        update_entries_expression['PL'] = pl
         if 'GQ' in entry_fields:
-            update_entries_expression['GQ'] = hl.gq_from_pl(pl)
+            update_entries_expression['PL'] = pl
+            update_entries_expression['GQ'] = hl.or_else(hl.gq_from_pl(pl), split.GQ)
+        else:
+            update_entries_expression['PL'] = pl
     else:
         if 'GQ' in entry_fields:
             update_entries_expression['GQ'] = split.GQ
@@ -2246,7 +2450,7 @@ def genetic_relatedness_matrix(call_expr) -> BlockMatrix:
 
         G_{ik} = \frac{1}{m} \sum_{j=1}^m \frac{(C_{ij}-2p_j)(C_{kj}-2p_j)}{2 p_j (1-p_j)}
 
-    This method drops variants with :math:`p_j = 0` or math:`p_j = 1` before
+    This method drops variants with :math:`p_j = 0` or :math:`p_j = 1` before
     computing kinship.
 
     Parameters
@@ -2264,7 +2468,7 @@ def genetic_relatedness_matrix(call_expr) -> BlockMatrix:
     mt = matrix_table_source('genetic_relatedness_matrix/call_expr', call_expr)
     check_entry_indexed('genetic_relatedness_matrix/call_expr', call_expr)
 
-    mt = mt.select_entries(__gt=call_expr.n_alt_alleles())
+    mt = mt.select_entries(__gt=call_expr.n_alt_alleles()).unfilter_entries()
     mt = mt.select_rows(__AC=agg.sum(mt.__gt),
                         __n_called=agg.count_where(hl.is_defined(mt.__gt)))
     mt = mt.filter_rows((mt.__AC > 0) & (mt.__AC < 2 * mt.__n_called))
@@ -2337,7 +2541,7 @@ def realized_relationship_matrix(call_expr) -> BlockMatrix:
     mt = matrix_table_source('realized_relationship_matrix/call_expr', call_expr)
     check_entry_indexed('realized_relationship_matrix/call_expr', call_expr)
 
-    mt = mt.select_entries(__gt=call_expr.n_alt_alleles())
+    mt = mt.select_entries(__gt=call_expr.n_alt_alleles()).unfilter_entries()
     mt = mt.select_rows(__AC=agg.sum(mt.__gt),
                         __ACsq=agg.sum(mt.__gt * mt.__gt),
                         __n_called=agg.count_where(hl.is_defined(mt.__gt)))
@@ -2530,13 +2734,13 @@ def ld_matrix(entry_expr, locus_expr, radius, coord_expr=None, block_size=None) 
     or genotype dosage. Missing values are mean-imputed within variant.
 
     The method produces a symmetric block-sparse matrix supported in a
-    neighborhood of the diagonal. If variants ``i`` and ``j`` are on the same
-    contig and within `radius` base pairs (inclusive) then the ``(i, j)``
-    element is their
+    neighborhood of the diagonal. If variants :math:`i` and :math:`j` are on the
+    same contig and within `radius` base pairs (inclusive) then the
+    :math:`(i, j)` element is their
     `Pearson correlation coefficient <https://en.wikipedia.org/wiki/Pearson_correlation_coefficient>`__.
-    Otherwise, the ``(i, j)`` element is ``0.0``.
+    Otherwise, the :math:`(i, j)` element is ``0.0``.
 
-    Rows with a constant value (i.e., zero variance) will result in `nan`
+    Rows with a constant value (i.e., zero variance) will result in ``nan``
     correlation values. To avoid this, first check that all variants vary or
     filter out constant variants (for example, with the help of
     :func:`.aggregators.stats`).
@@ -2583,9 +2787,10 @@ def ld_matrix(entry_expr, locus_expr, radius, coord_expr=None, block_size=None) 
         Windowed correlation matrix between variants.
         Row and column indices correspond to matrix table variant index.
     """
-    starts, stops = hl.linalg.utils.locus_windows(locus_expr, radius, coord_expr)
+    starts_and_stops = hl.linalg.utils.locus_windows(locus_expr, radius, coord_expr, _localize=False)
+    starts_and_stops = hl.tuple([starts_and_stops[0].map(lambda i: hl.int64(i)), starts_and_stops[1].map(lambda i: hl.int64(i))])
     ld = hl.row_correlation(entry_expr, block_size)
-    return ld.sparsify_row_intervals(starts, stops)
+    return ld._sparsify_row_intervals_expr(starts_and_stops, blocks_only=False)
 
 
 @typecheck(n_populations=int,
@@ -2594,11 +2799,11 @@ def ld_matrix(entry_expr, locus_expr, radius, coord_expr=None, block_size=None) 
            n_partitions=nullable(int),
            pop_dist=nullable(sequenceof(numeric)),
            fst=nullable(sequenceof(numeric)),
-           af_dist=expr_any,
+           af_dist=nullable(expr_any),
            reference_genome=reference_genome_type,
            mixture=bool)
 def balding_nichols_model(n_populations, n_samples, n_variants, n_partitions=None,
-                          pop_dist=None, fst=None, af_dist=hl.rand_unif(0.1, 0.9, seed=0),
+                          pop_dist=None, fst=None, af_dist=None,
                           reference_genome='default', mixture=False) -> MatrixTable:
     r"""Generate a matrix table of variants, samples, and genotypes using the
     Balding-Nichols or Pritchard-Stephens-Donnelly model.
@@ -2608,7 +2813,7 @@ def balding_nichols_model(n_populations, n_samples, n_variants, n_partitions=Non
     Generate a matrix table of genotypes with 1000 variants and 100 samples
     across 3 populations:
 
-    >>> bn_ds = hl.balding_nichols_model(3, 100, 1000)
+    >>> bn_ds = hl.balding_nichols_model(3, 100, 1000, reference_genome='GRCh37')
 
     Generate a matrix table using 4 populations, 40 samples, 150 variants, 3
     partitions, population distribution ``[0.1, 0.2, 0.3, 0.4]``,
@@ -2630,15 +2835,15 @@ def balding_nichols_model(n_populations, n_samples, n_variants, n_partitions=Non
     This method simulates a matrix table of variants, samples, and genotypes
     using the Balding-Nichols model, which we now define.
 
-    - :math:`K` populations are labeled by integers 0, 1, ..., K - 1.
-    - :math:`N` samples are labeled by strings 0, 1, ..., N - 1.
+    - :math:`K` populations are labeled by integers :math:`0, 1, \dots, K - 1`.
+    - :math:`N` samples are labeled by strings :math:`0, 1, \dots, N - 1`.
     - :math:`M` variants are defined as ``1:1:A:C``, ``1:2:A:C``, ...,
       ``1:M:A:C``.
     - The default distribution for population assignment :math:`\pi` is uniform.
     - The default ancestral frequency distribution :math:`P_0` is uniform on
-      ``[0.1, 0.9]``.
+      :math:`[0.1, 0.9]`.
       All three classes are located in ``hail.stats``.
-    - The default :math:`F_{ST}` values are all 0.1.
+    - The default :math:`F_{ST}` values are all :math:`0.1`.
 
     The Balding-Nichols model models genotypes of individuals from a structured
     population comprising :math:`K` homogeneous modern populations that have
@@ -2666,13 +2871,12 @@ def balding_nichols_model(n_populations, n_samples, n_variants, n_partitions=Non
     The generative model is then given by:
 
     .. math::
-        k_n \,&\sim\, \pi
-
-        p_m \,&\sim\, P_0
-
-        p_{k,m} \mid p_m\,&\sim\, \mathrm{Beta}(\mu = p_m,\, \sigma^2 = F_k p_m (1 - p_m))
-
-        g_{n,m} \mid k_n, p_{k, m} \,&\sim\, \mathrm{Binomial}(2, p_{k_n, m})
+        \begin{aligned}
+            k_n \,&\sim\, \pi \\
+            p_m \,&\sim\, P_0 \\
+            p_{k,m} \mid p_m\,&\sim\, \mathrm{Beta}(\mu = p_m,\, \sigma^2 = F_k p_m (1 - p_m)) \\
+            g_{n,m} \mid k_n, p_{k, m} \,&\sim\, \mathrm{Binomial}(2, p_{k_n, m})
+        \end{aligned}
 
     The beta distribution by its mean and variance above; the usual parameters
     are :math:`a = (1 - p) \frac{1 - F}{F}` and :math:`b = p \frac{1 - F}{F}` with
@@ -2729,14 +2933,15 @@ def balding_nichols_model(n_populations, n_samples, n_variants, n_partitions=Non
         Default is 1 partition per million entries or 8, whichever is larger.
     pop_dist : :obj:`list` of :obj:`float`, optional
         Unnormalized population distribution, a list of length
-        ``n_populations`` with non-negative values.
+        `n_populations` with non-negative values.
         Default is ``[1, ..., 1]``.
     fst : :obj:`list` of :obj:`float`, optional
-        :math:`F_{ST}` values, a list of length ``n_populations`` with values
+        :math:`F_{ST}` values, a list of length `n_populations` with values
         in (0, 1). Default is ``[0.1, ..., 0.1]``.
-    af_dist : :class:`.Float64Expression` representing a random function.
-        Ancestral allele frequency distribution.
-        Default is :func:`.rand_unif` over the range `[0.1, 0.9]` with seed 0.
+    af_dist : :class:`.Float64Expression`, optional
+        Representing a random function.  Ancestral allele frequency
+        distribution.  Default is :func:`.rand_unif` over the range
+        `[0.1, 0.9]` with seed 0.
     reference_genome : :obj:`str` or :class:`.ReferenceGenome`
         Reference genome to use.
     mixture : :obj:`bool`
@@ -2747,6 +2952,7 @@ def balding_nichols_model(n_populations, n_samples, n_variants, n_partitions=Non
     -------
     :class:`.MatrixTable`
         Simulated matrix table of variants, samples, and genotypes.
+
     """
     if pop_dist is None:
         pop_dist = [1 for _ in range(n_populations)]
@@ -2754,8 +2960,11 @@ def balding_nichols_model(n_populations, n_samples, n_variants, n_partitions=Non
     if fst is None:
         fst = [0.1 for _ in range(n_populations)]
 
+    if af_dist is None:
+        af_dist = hl.rand_unif(0.1, 0.9, seed=0)
+
     if n_partitions is None:
-        n_partitions = max(8, int(n_samples * n_variants / 1000000))
+        n_partitions = max(8, int(n_samples * n_variants / (128 * 1024 * 1024)))
 
     # verify args
     for name, var in {"populations": n_populations,
@@ -2780,9 +2989,9 @@ def balding_nichols_model(n_populations, n_samples, n_variants, n_partitions=Non
 
     # verify af_dist
     if not af_dist._is_scalar:
-        raise ExpressionException('balding_nichols_model expects af_dist to ' +
-                                  'have scalar arguments: found expression ' +
-                                  'from source {}'
+        raise ExpressionException('balding_nichols_model expects af_dist to '
+                                  + 'have scalar arguments: found expression '
+                                  + 'from source {}'
                                   .format(af_dist._indices.source))
 
     if af_dist.dtype != tfloat64:
@@ -2819,7 +3028,7 @@ def balding_nichols_model(n_populations, n_samples, n_variants, n_partitions=Non
                                    af_dist))
     # entry info
     p = hl.sum(bn.pop * bn.af) if mixture else bn.af[bn.pop]
-    idx = hl.rand_cat([(1 - p) ** 2, 2 * p * (1-p), p ** 2])
+    idx = hl.rand_cat([(1 - p) ** 2, 2 * p * (1 - p), p ** 2])
     return bn.select_entries(GT=hl.unphased_diploid_gt_index_call(idx))
 
 
@@ -2853,17 +3062,17 @@ def filter_alleles(mt: MatrixTable,
        the minimal representation.
      - `old_alleles` (``array<str>``) -- The old alleles, before filtering and
        computing the minimal representation.
-     - old_to_new (``array<int32>``) -- An array that maps old allele index to
+     - `old_to_new` (``array<int32>``) -- An array that maps old allele index to
        new allele index. Its length is the same as `old_alleles`. Alleles that
        are filtered are missing.
-     - new_to_old (``array<int32>``) -- An array that maps new allele index to
+     - `new_to_old` (``array<int32>``) -- An array that maps new allele index to
        the old allele index. Its length is the same as the modified `alleles`
        field.
 
     If all alternate alleles of a variant are filtered out, the variant itself
     is filtered out.
 
-    **Using _f_**
+    **Using** `f`
 
     The `f` argument is a function or lambda evaluated per alternate allele to
     determine whether that allele is kept. If `f` evaluates to ``True``, the
@@ -2933,7 +3142,7 @@ def filter_alleles(mt: MatrixTable,
 
     right = mt.filter_rows((mt.locus != mt.__new_locus) | (mt.alleles != mt.__new_alleles))
     right = right.key_rows_by(locus=right.__new_locus, alleles=right.__new_alleles)
-    return left.union_rows(right).drop('__allele_inclusion', '__new_locus', '__new_alleles')
+    return left.union_rows(right, _check_cols=False).drop('__allele_inclusion', '__new_locus', '__new_alleles')
 
 
 @typecheck(mt=MatrixTable, f=anytype, subset=bool)
@@ -2958,7 +3167,7 @@ def filter_alleles_hts(mt: MatrixTable,
 
     Notes
     -----
-    For usage of the _f_ argument, see the :func:`.filter_alleles`
+    For usage of the `f` argument, see the :func:`.filter_alleles`
     documentation.
 
     :func:`.filter_alleles_hts` requires the dataset have the GATK VCF schema,
@@ -2981,10 +3190,10 @@ def filter_alleles_hts(mt: MatrixTable,
        the minimal representation.
      - `old_alleles` (``array<str>``) -- The old alleles, before filtering and
        computing the minimal representation.
-     - old_to_new (``array<int32>``) -- An array that maps old allele index to
+     - `old_to_new` (``array<int32>``) -- An array that maps old allele index to
        new allele index. Its length is the same as `old_alleles`. Alleles that
        are filtered are missing.
-     - new_to_old (``array<int32>``) -- An array that maps new allele index to
+     - `new_to_old` (``array<int32>``) -- An array that maps new allele index to
        the old allele index. Its length is the same as the modified `alleles`
        field.
 
@@ -3127,8 +3336,7 @@ def filter_alleles_hts(mt: MatrixTable,
                          "  found: {}\n"
                          "  expected: {}\n"
                          "  Use 'hl.filter_alleles' to split entries with non-HTS entry fields.".format(
-            mt.entry.dtype, hl.hts_entry_schema
-        ))
+                             mt.entry.dtype, hl.hts_entry_schema))
 
     mt = filter_alleles(mt, f)
 
@@ -3155,15 +3363,15 @@ def filter_alleles_hts(mt: MatrixTable,
             PL=newPL)
     # otherwise downcode
     else:
-        mt = mt.annotate_rows(__old_to_new_no_na = mt.old_to_new.map(lambda x: hl.or_else(x, 0)))
+        mt = mt.annotate_rows(__old_to_new_no_na=mt.old_to_new.map(lambda x: hl.or_else(x, 0)))
         newPL = hl.cond(
             hl.is_defined(mt.PL),
             (hl.range(0, hl.triangle(hl.len(mt.alleles)))
              .map(lambda newi: hl.min(hl.range(0, hl.triangle(hl.len(mt.old_alleles)))
                                       .filter(lambda oldi: hl.bind(
-                lambda oldc: hl.call(mt.__old_to_new_no_na[oldc[0]],
-                                     mt.__old_to_new_no_na[oldc[1]]) == hl.unphased_diploid_gt_index_call(newi),
-                hl.unphased_diploid_gt_index_call(oldi)))
+                                          lambda oldc: hl.call(mt.__old_to_new_no_na[oldc[0]],
+                                                               mt.__old_to_new_no_na[oldc[1]]) == hl.unphased_diploid_gt_index_call(newi),
+                                          hl.unphased_diploid_gt_index_call(oldi)))
                                       .map(lambda oldi: mt.PL[oldi])))),
             hl.null(tarray(tint32)))
         return mt.annotate_entries(
@@ -3201,7 +3409,7 @@ def _local_ld_prune(mt, call_field, r2=0.2, bp_window_size=1000000, memory_per_c
 
     info(f'ld_prune: running local pruning stage with max queue size of {max_queue_size} variants')
 
-    return Table(MatrixToTableApply(mt._mir, {
+    return Table(ir.MatrixToTableApply(mt._mir, {
         'name': 'LocalLDPrune',
         'callField': call_field,
         'r2Threshold': float(r2),
@@ -3298,10 +3506,10 @@ def ld_prune(call_expr, r2=0.2, bp_window_size=1000000, memory_per_core=256, kee
         block_size = BlockMatrix.default_block_size()
 
     if not 0.0 <= r2 <= 1:
-      raise ValueError(f'r2 must be in the range [0.0, 1.0], found {r2}')
+        raise ValueError(f'r2 must be in the range [0.0, 1.0], found {r2}')
 
     if bp_window_size < 0:
-      raise ValueError(f'bp_window_size must be non-negative, found {bp_window_size}')
+        raise ValueError(f'bp_window_size must be non-negative, found {bp_window_size}')
 
     check_entry_indexed('ld_prune/call_expr', call_expr)
     mt = matrix_table_source('ld_prune/call_expr', call_expr)
@@ -3322,7 +3530,7 @@ def ld_prune(call_expr, r2=0.2, bp_window_size=1000000, memory_per_core=256, kee
     locally_pruned_table = hl.read_table(locally_pruned_table_path).add_index()
 
     mt = mt.annotate_rows(info=locally_pruned_table[mt.row_key])
-    mt = mt.filter_rows(hl.is_defined(mt.info))
+    mt = mt.filter_rows(hl.is_defined(mt.info)).unfilter_entries()
 
     std_gt_bm = BlockMatrix.from_entry_expr(
         hl.or_else(
@@ -3335,7 +3543,7 @@ def ld_prune(call_expr, r2=0.2, bp_window_size=1000000, memory_per_core=256, kee
 
     entries = r2_bm.sparsify_row_intervals(range(stops.size), stops, blocks_only=True).entries(keyed=False)
     entries = entries.filter((entries.entry >= r2) & (entries.i < entries.j))
-    entries = entries.select(i = hl.int32(entries.i), j = hl.int32(entries.j))
+    entries = entries.select(i=hl.int32(entries.i), j=hl.int32(entries.j))
 
     if keep_higher_maf:
         fields = ['mean', 'locus']
@@ -3346,11 +3554,11 @@ def ld_prune(call_expr, r2=0.2, bp_window_size=1000000, memory_per_core=256, kee
         hl.agg.collect(locally_pruned_table.row.select('idx', *fields)), _localize=False)
     info = hl.sorted(info, key=lambda x: x.idx)
 
-    entries = entries.annotate_globals(info = info)
+    entries = entries.annotate_globals(info=info)
 
     entries = entries.filter(
-        (entries.info[entries.i].locus.contig == entries.info[entries.j].locus.contig) &
-        (entries.info[entries.j].locus.position - entries.info[entries.i].locus.position <= bp_window_size))
+        (entries.info[entries.i].locus.contig == entries.info[entries.j].locus.contig)
+        & (entries.info[entries.j].locus.position - entries.info[entries.i].locus.position <= bp_window_size))
 
     if keep_higher_maf:
         entries = entries.annotate(
@@ -3359,8 +3567,8 @@ def ld_prune(call_expr, r2=0.2, bp_window_size=1000000, memory_per_core=256, kee
             j=hl.struct(idx=entries.j,
                         twice_maf=hl.min(entries.info[entries.j].mean, 2.0 - entries.info[entries.j].mean)))
 
-        def tie_breaker(l, r):
-            return hl.sign(r.twice_maf - l.twice_maf)
+        def tie_breaker(left, right):
+            return hl.sign(right.twice_maf - left.twice_maf)
     else:
         tie_breaker = None
 
@@ -3368,7 +3576,7 @@ def ld_prune(call_expr, r2=0.2, bp_window_size=1000000, memory_per_core=256, kee
         entries.i, entries.j, keep=False, tie_breaker=tie_breaker, keyed=False)
 
     locally_pruned_table = locally_pruned_table.annotate_globals(
-        variants_to_remove = variants_to_remove.aggregate(
+        variants_to_remove=variants_to_remove.aggregate(
             hl.agg.collect_as_set(variants_to_remove.node.idx), _localize=False))
     return locally_pruned_table.filter(
         locally_pruned_table.variants_to_remove.contains(hl.int32(locally_pruned_table.idx)),
@@ -3378,7 +3586,7 @@ def ld_prune(call_expr, r2=0.2, bp_window_size=1000000, memory_per_core=256, kee
 
 def _warn_if_no_intercept(caller, covariates):
     if all([e._indices.axes for e in covariates]):
-        warn(f'{caller}: model appears to have no intercept covariate.'
-             '\n    To include an intercept, add 1.0 to the list of covariates.')
+        warning(f'{caller}: model appears to have no intercept covariate.'
+                '\n    To include an intercept, add 1.0 to the list of covariates.')
         return True
     return False

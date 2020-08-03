@@ -1,9 +1,14 @@
 import hail as hl
-from hail.typecheck import *
+from hail.typecheck import typecheck
 
 
-@typecheck(mt=hl.MatrixTable, path=str, batch_size=int, bgzip=bool)
-def export_entries_by_col(mt: hl.MatrixTable, path: str, batch_size: int = 256, bgzip: bool = True):
+@typecheck(mt=hl.MatrixTable, path=str, batch_size=int, bgzip=bool, header_json_in_file=bool, use_string_key_as_file_name=bool)
+def export_entries_by_col(mt: hl.MatrixTable,
+                          path: str,
+                          batch_size: int = 256,
+                          bgzip: bool = True,
+                          header_json_in_file: bool = True,
+                          use_string_key_as_file_name: bool = False):
     """Export entries of the `mt` by column as separate text files.
 
     Examples
@@ -65,11 +70,17 @@ def export_entries_by_col(mt: hl.MatrixTable, path: str, batch_size: int = 256, 
         Number of columns to write per iteration.
     bgzip : :obj:`bool`
         BGZip output files.
+    header_json_in_file : :obj:`bool`
+        Include JSON header in each component file (if False, only written to index.tsv)
     """
+    if use_string_key_as_file_name and not (len(mt.col_key) == 1 and mt.col_key[0].dtype == hl.tstr):
+        raise ValueError(f'parameter "use_string_key_as_file_name" requires a single string column key, found {list(mt.col_key.dtype.values())}')
     hl.utils.java.Env.backend().execute(
         hl.ir.MatrixToValueApply(mt._mir,
                                  {'name': 'MatrixExportEntriesByCol',
                                   'parallelism': batch_size,
                                   'path': path,
-                                  'bgzip': bgzip})
+                                  'bgzip': bgzip,
+                                  'headerJsonInFile': header_json_in_file,
+                                  'useStringKeyAsFileName': use_string_key_as_file_name})
     )

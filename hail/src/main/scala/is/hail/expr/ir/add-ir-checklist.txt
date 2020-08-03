@@ -22,6 +22,8 @@ This is the list of things you need to do to add a new IR node.
 
  - Add support for the IR in PruneDeadFields
 
+ - Add test cases to PruneSuite to test the memoize and rebuild behaviors.
+
  - Add any optimizations to Optimize,
    - In particular, any simplifying rewrite rules to Simplify
 
@@ -33,11 +35,11 @@ This is the list of things you need to do to add a new IR node.
 
  - Support it in Children and Copy
 
- - Implement it in Interpret
+ - Implement it in Interpret or add it to Interpretable as false
 
  - Implement it in Emit (the compiler) or add it to Compilable as false
 
- - If it binds a variable, add support to Binds and Subst
+ - If it binds a variable, add support to Bindings
 
 * MatrixIR
 

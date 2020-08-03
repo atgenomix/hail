@@ -1,28 +1,112 @@
 import builtins
-from typing import *
+import functools
+from typing import Union, Optional, Any, Callable, Iterable, TypeVar
 
+import hail
 import hail as hl
-from hail.expr.expressions import *
-from hail.expr.expressions.expression_typecheck import *
-from hail.expr.types import *
+from hail.expr.expressions import Expression, ArrayExpression, SetExpression, \
+    Int32Expression, Int64Expression, Float32Expression, \
+    Float64Expression, DictExpression, StructExpression, LocusExpression, \
+    StringExpression, IntervalExpression, ArrayNumericExpression, \
+    BooleanExpression, CallExpression, TupleExpression, \
+    ExpressionException, NumericExpression, \
+    unify_all, construct_expr, to_expr, unify_exprs, impute_type, \
+    construct_variable, apply_expr, coercer_from_dtype, unify_types_limited, \
+    expr_array, expr_any, expr_struct, expr_int32, expr_int64, expr_float32, \
+    expr_float64, expr_oneof, expr_bool, expr_tuple, expr_dict, expr_str, \
+    expr_set, expr_call, expr_locus, expr_interval, expr_ndarray, \
+    expr_numeric, cast_expr
+from hail.expr.types import HailType, hail_type, tint32, tint64, tfloat32, \
+    tfloat64, tstr, tbool, tarray, tset, tdict, tstruct, tlocus, tinterval, \
+    tcall, ttuple, tndarray, \
+    is_primitive, is_numeric
 from hail.genetics.reference_genome import reference_genome_type, ReferenceGenome
-from hail.ir import *
-from hail.typecheck import *
-from hail.utils.java import Env
+import hail.ir as ir
+from hail.typecheck import typecheck, nullable, anytype, enumeration, tupleof, \
+    func_spec, oneof
+from hail.utils.java import Env, warning
+from hail.utils.misc import plural
+
+import numpy as np
 
 Coll_T = TypeVar('Collection_T', ArrayExpression, SetExpression)
 Num_T = TypeVar('Numeric_T', Int32Expression, Int64Expression, Float32Expression, Float64Expression)
 
 
-def _func(name, ret_type, *args):
+def _func(name, ret_type, *args, type_args=()):
     indices, aggregations = unify_all(*args)
-    return construct_expr(Apply(name, *(a._ir for a in args)), ret_type, indices, aggregations)
+    return construct_expr(ir.Apply(name, ret_type, *(a._ir for a in args), type_args=type_args), ret_type, indices, aggregations)
 
 
 def _seeded_func(name, ret_type, seed, *args):
     seed = seed if seed is not None else Env.next_seed()
     indices, aggregations = unify_all(*args)
-    return construct_expr(ApplySeeded(name, seed, *(a._ir for a in args)), ret_type, indices, aggregations)
+    return construct_expr(ir.ApplySeeded(name, seed, ret_type, *(a._ir for a in args)), ret_type, indices, aggregations)
+
+
+@typecheck(a=expr_array(), x=expr_any)
+def _lower_bound(a, x):
+    if a.dtype.element_type != x.dtype:
+        raise TypeError(f"_lower_bound: incompatible types: {a.dtype}, {x.dtype}")
+    indices, aggregations = unify_all(a, x)
+    return construct_expr(ir.LowerBoundOnOrderedCollection(a._ir, x._ir, on_key=False), tint32, indices, aggregations)
+
+
+@typecheck(cdf=expr_struct(), q=expr_oneof(expr_float32, expr_float64))
+def _quantile_from_cdf(cdf, q):
+    def compute(cdf):
+        n = cdf.ranks[cdf.ranks.length() - 1]
+        pos = hl.int64(q * n) + 1
+        idx = (hl.switch(q)
+                 .when(0.0, 0)
+                 .when(1.0, cdf.values.length() - 1)
+                 .default(_lower_bound(cdf.ranks, pos) - 1))
+        res = hl.cond(n == 0,
+                      hl.null(cdf.values.dtype.element_type),
+                      cdf.values[idx])
+        return res
+    return hl.rbind(cdf, compute)
+
+
+@typecheck(cdf=expr_struct(), failure_prob=expr_oneof(expr_float32, expr_float64), all_quantiles=bool)
+def _error_from_cdf(cdf, failure_prob, all_quantiles=False):
+    """Estimates error of approx_cdf aggregator, using Hoeffding's inequality.
+
+    Parameters
+    ----------
+    cdf : :class:`.StructExpression`
+        Result of :func:`.approx_cdf` aggregator
+    failure_prob: :class:`.NumericExpression`
+        Upper bound on probability of true error being greater than estimated error.
+    all_quantiles: :obj:`bool`
+        If ``True``, with probability 1 - `failure_prob`, error estimate applies
+        to all quantiles simultaneously.
+
+    Returns
+    -------
+    :class:`.NumericExpression`
+        Upper bound on error of quantile estimates.
+    """
+    def compute_sum(cdf):
+        s = hl.sum(hl.range(0, hl.len(cdf._compaction_counts)).map(lambda i: cdf._compaction_counts[i] * (2 ** (2 * i))))
+        return s / (cdf.ranks[-1] ** 2)
+
+    def update_grid_size(p, s):
+        return 4 * hl.sqrt(hl.log(2 * p / failure_prob) / (2 * s))
+
+    def compute_grid_size(s):
+        return hl.fold(lambda p, i: update_grid_size(p, s), 1 / failure_prob, hl.range(0, 5))
+
+    def compute_single_error(s, failure_prob=failure_prob):
+        return hl.sqrt(hl.log(2 / failure_prob) * s / 2)
+
+    def compute_global_error(s):
+        return hl.rbind(compute_grid_size(s), lambda p: 1 / p + compute_single_error(s, failure_prob / p))
+
+    if all_quantiles:
+        return hl.rbind(cdf, lambda cdf: hl.rbind(compute_sum(cdf), compute_global_error))
+    else:
+        return hl.rbind(cdf, lambda cdf: hl.rbind(compute_sum(cdf), compute_single_error))
 
 
 @typecheck(t=hail_type)
@@ -53,7 +137,7 @@ def null(t: Union[HailType, str]):
     :class:`.Expression`
         A missing expression of type `t`.
     """
-    return construct_expr(NA(t), t)
+    return construct_expr(ir.NA(t), t)
 
 
 @typecheck(x=anytype, dtype=nullable(hail_type))
@@ -97,6 +181,7 @@ def literal(x: Any, dtype: Optional[Union[HailType, str]] = None):
     :class:`.Expression`
     """
     wrapper = {'has_expr': False}
+
     def typecheck_expr(t, x):
         if isinstance(x, Expression):
             wrapper['has_expr'] = True
@@ -115,6 +200,9 @@ def literal(x: Any, dtype: Optional[Union[HailType, str]] = None):
     if dtype is None:
         dtype = impute_type(x)
 
+    if isinstance(x, np.generic):
+        x = x.item()
+
     try:
         dtype._traverse(x, typecheck_expr)
     except TypeError as e:
@@ -130,33 +218,36 @@ def literal(x: Any, dtype: Optional[Union[HailType, str]] = None):
         if dtype == tint32:
             assert isinstance(x, builtins.int)
             assert tint32.min_value <= x <= tint32.max_value
-            return construct_expr(I32(x), tint32)
+            return construct_expr(ir.I32(x), tint32)
         elif dtype == tint64:
             assert isinstance(x, builtins.int)
             assert tint64.min_value <= x <= tint64.max_value
-            return construct_expr(I64(x), tint64)
+            return construct_expr(ir.I64(x), tint64)
         elif dtype == tfloat32:
             assert isinstance(x, (builtins.float, builtins.int))
-            return construct_expr(F32(x), tfloat32)
+            return construct_expr(ir.F32(x), tfloat32)
         elif dtype == tfloat64:
             assert isinstance(x, (builtins.float, builtins.int))
-            return construct_expr(F64(x), tfloat64)
+            return construct_expr(ir.F64(x), tfloat64)
         elif dtype == tbool:
             assert isinstance(x, builtins.bool)
-            return construct_expr(TrueIR() if x else FalseIR(), tbool)
+            return construct_expr(ir.TrueIR() if x else ir.FalseIR(), tbool)
         else:
             assert dtype == tstr
             assert isinstance(x, builtins.str)
-            return construct_expr(Str(x), tstr)
+            return construct_expr(ir.Str(x), tstr)
     else:
-        return construct_expr(Literal(dtype, x), dtype)
+        return construct_expr(ir.Literal(dtype, x), dtype)
+
 
 @typecheck(condition=expr_bool, consequent=expr_any, alternate=expr_any, missing_false=bool)
 def cond(condition,
          consequent,
          alternate,
          missing_false: bool = False):
-    """Expression for an if/else statement; tests a condition and returns one of two options based on the result.
+    """Deprecated in favor of :func:`.if_else`.
+
+    Expression for an if/else statement; tests a condition and returns one of two options based on the result.
 
     Examples
     --------
@@ -167,6 +258,58 @@ def cond(condition,
 
     >>> a = hl.literal([1, 2, 3, 4])
     >>> hl.eval(hl.cond(hl.len(a) > 0, 2.0 * a, a / 2.0))
+    [2.0, 4.0, 6.0, 8.0]
+
+    Notes
+    -----
+
+    If `condition` evaluates to ``True``, returns `consequent`. If `condition`
+    evaluates to ``False``, returns `alternate`. If `predicate` is missing, returns
+    missing.
+
+    Note
+    ----
+    The type of `consequent` and `alternate` must be the same.
+
+    Parameters
+    ----------
+    condition : :class:`.BooleanExpression`
+        Condition to test.
+    consequent : :class:`.Expression`
+        Branch to return if the condition is ``True``.
+    alternate : :class:`.Expression`
+        Branch to return if the condition is ``False``.
+    missing_false : :obj:`.bool`
+        If ``True``, treat missing `condition` as ``False``.
+
+    See Also
+    --------
+    :func:`.case`, :func:`.switch`, :func:`.if_else`
+
+    Returns
+    -------
+    :class:`.Expression`
+        One of `consequent`, `alternate`, or missing, based on `condition`.
+    """
+    return if_else(condition, consequent, alternate, missing_false)
+
+
+@typecheck(condition=expr_bool, consequent=expr_any, alternate=expr_any, missing_false=bool)
+def if_else(condition,
+            consequent,
+            alternate,
+            missing_false: bool = False):
+    """Expression for an if/else statement; tests a condition and returns one of two options based on the result.
+
+    Examples
+    --------
+
+    >>> x = 5
+    >>> hl.eval(hl.if_else(x < 2, 'Hi', 'Bye'))
+    'Bye'
+
+    >>> a = hl.literal([1, 2, 3, 4])
+    >>> hl.eval(hl.if_else(hl.len(a) > 0, 2.0 * a, a / 2.0))
     [2.0, 4.0, 6.0, 8.0]
 
     Notes
@@ -207,16 +350,16 @@ def cond(condition,
 
     consequent, alternate, success = unify_exprs(consequent, alternate)
     if not success:
-        raise TypeError(f"'cond' requires the 'consequent' and 'alternate' arguments to have the same type\n"
+        raise TypeError(f"'if_else' and 'cond' require the 'consequent' and 'alternate' arguments to have the same type\n"
                         f"    consequent: type '{consequent.dtype}'\n"
                         f"    alternate:  type '{alternate.dtype}'")
     assert consequent.dtype == alternate.dtype
 
-    return construct_expr(If(condition._ir, consequent._ir, alternate._ir),
-                              consequent.dtype, indices, aggregations)
+    return construct_expr(ir.If(condition._ir, consequent._ir, alternate._ir),
+                          consequent.dtype, indices, aggregations)
 
 
-def case(missing_false: bool=False) -> 'hail.expr.builders.CaseBuilder':
+def case(missing_false: bool = False) -> 'hail.expr.builders.CaseBuilder':
     """Chain multiple if-else statements with a :class:`.CaseBuilder`.
 
     Examples
@@ -284,8 +427,8 @@ def switch(expr) -> 'hail.expr.builders.SwitchBuilder':
     return SwitchBuilder(expr)
 
 
-@typecheck(f=anytype, exprs=expr_any)
-def bind(f: Callable, *exprs):
+@typecheck(f=anytype, exprs=expr_any, _ctx=nullable(str))
+def bind(f: Callable, *exprs, _ctx=None):
     """Bind a temporary variable and use it in a function.
 
     Examples
@@ -316,22 +459,30 @@ def bind(f: Callable, *exprs):
     irs = []
 
     for expr in exprs:
-        uid = Env.get_uid()
+        uid = Env.get_uid(base=_ctx)
         args.append(construct_variable(uid, expr._type, expr._indices, expr._aggregations))
         uids.append(uid)
         irs.append(expr._ir)
 
     lambda_result = to_expr(f(*args))
-    indices, aggregations = unify_all(*exprs, lambda_result)
+    if _ctx:
+        indices, aggregations = unify_all(lambda_result)  # FIXME: hacky. May drop field refs from errors?
+    else:
+        indices, aggregations = unify_all(*exprs, lambda_result)
 
     res_ir = lambda_result._ir
-    for (uid, ir) in builtins.zip(uids, irs):
-        res_ir = Let(uid, ir, res_ir)
+    for (uid, value_ir) in builtins.zip(uids, irs):
+        if _ctx == 'agg':
+            res_ir = ir.AggLet(uid, value_ir, res_ir, is_scan=False)
+        elif _ctx == 'scan':
+            res_ir = ir.AggLet(uid, value_ir, res_ir, is_scan=True)
+        else:
+            res_ir = ir.Let(uid, value_ir, res_ir)
 
     return construct_expr(res_ir, lambda_result.dtype, indices, aggregations)
 
 
-def rbind(*exprs):
+def rbind(*exprs, _ctx=None):
     """Bind a temporary variable and use it in a function.
 
     This is :func:`.bind` with flipped argument order.
@@ -342,7 +493,7 @@ def rbind(*exprs):
     >>> hl.eval(hl.rbind(1, lambda x: x + 1))
     2
 
-    :func:`.let` also can take multiple arguments:
+    :func:`.rbind` also can take multiple arguments:
 
     >>> hl.eval(hl.rbind(4.0, 2.0, lambda x, y: x / y))
     2.0
@@ -360,10 +511,11 @@ def rbind(*exprs):
         Result of evaluating `f` with `exprs` as arguments.
     """
 
-    f = exprs[-1]
-    args = [expr_any.check(arg, 'rbind', f'argument {index}') for index, arg in enumerate(exprs[:-1])]
+    *args, f = exprs
+    args = [expr_any.check(arg, 'rbind', f'argument {index}')
+            for index, arg in enumerate(args)]
 
-    return hl.bind(f, *args)
+    return hl.bind(f, *args, _ctx=_ctx)
 
 
 @typecheck(c1=expr_int32, c2=expr_int32, c3=expr_int32, c4=expr_int32)
@@ -459,7 +611,7 @@ def dict(collection) -> DictExpression:
     Examples
     --------
 
-    >>> hl.eval(hl.dict([('foo', 1), ('bar', 2), ('baz', 3)]))  # doctest: +NOTEST
+    >>> hl.eval(hl.dict([('foo', 1), ('bar', 2), ('baz', 3)]))  # doctest: +SKIP_OUTPUT_CHECK
     {u'bar': 2, u'baz': 3, u'foo': 1}
 
     Notes
@@ -709,7 +861,7 @@ def locus(contig, pos, reference_genome: Union[str, ReferenceGenome] = 'default'
     Examples
     --------
 
-    >>> hl.eval(hl.locus("1", 10000))
+    >>> hl.eval(hl.locus("1", 10000, reference_genome='GRCh37'))
     Locus(contig=1, position=10000, reference_genome=GRCh37)
 
     Parameters
@@ -725,8 +877,7 @@ def locus(contig, pos, reference_genome: Union[str, ReferenceGenome] = 'default'
     -------
     :class:`.LocusExpression`
     """
-    fname = 'Locus({})'.format(reference_genome.name)
-    return _func(fname, tlocus(reference_genome), contig, pos)
+    return _func('Locus', tlocus(reference_genome), contig, pos)
 
 
 @typecheck(global_pos=expr_int64,
@@ -744,7 +895,7 @@ def locus_from_global_position(global_pos,
     >>> hl.eval(hl.locus_from_global_position(2824183054))
     Locus(contig=21, position=42584230, reference_genome=GRCh37)
 
-    >>> hl.eval(hl.locus_from_global_position(2824183054, 'GRCh38'))
+    >>> hl.eval(hl.locus_from_global_position(2824183054, reference_genome='GRCh38'))
     Locus(contig=chr22, position=1, reference_genome=GRCh38)
 
     Parameters
@@ -758,8 +909,7 @@ def locus_from_global_position(global_pos,
     -------
     :class:`.LocusExpression`
     """
-    fname = 'globalPosToLocus({})'.format(reference_genome.name)
-    return _func(fname, tlocus(reference_genome), global_pos)
+    return _func('globalPosToLocus', tlocus(reference_genome), global_pos)
 
 
 @typecheck(s=expr_str,
@@ -770,7 +920,7 @@ def parse_locus(s, reference_genome: Union[str, ReferenceGenome] = 'default') ->
     Examples
     --------
 
-    >>> hl.eval(hl.parse_locus("1:10000"))
+    >>> hl.eval(hl.parse_locus('1:10000', reference_genome='GRCh37'))
     Locus(contig=1, position=10000, reference_genome=GRCh37)
 
     Notes
@@ -789,7 +939,7 @@ def parse_locus(s, reference_genome: Union[str, ReferenceGenome] = 'default') ->
     -------
     :class:`.LocusExpression`
     """
-    return _func('Locus({})'.format(reference_genome.name), tlocus(reference_genome), s)
+    return _func('Locus', tlocus(reference_genome), s)
 
 
 @typecheck(s=expr_str,
@@ -800,7 +950,7 @@ def parse_variant(s, reference_genome: Union[str, ReferenceGenome] = 'default') 
     Examples
     --------
 
-    >>> hl.eval(hl.parse_variant('1:100000:A:T,C'))
+    >>> hl.eval(hl.parse_variant('1:100000:A:T,C', reference_genome='GRCh37'))
     Struct(locus=Locus(contig=1, position=100000, reference_genome=GRCh37), alleles=['A', 'T', 'C'])
 
     Notes
@@ -825,7 +975,64 @@ def parse_variant(s, reference_genome: Union[str, ReferenceGenome] = 'default') 
     """
     t = tstruct(locus=tlocus(reference_genome),
                 alleles=tarray(tstr))
-    return _func('LocusAlleles({})'.format(reference_genome.name), t, s)
+    return _func('LocusAlleles', t, s)
+
+
+def variant_str(*args) -> 'StringExpression':
+    """Create a variant colon-delimited string.
+
+    Parameters
+    ----------
+    args
+        Arguments (see notes).
+
+    Returns
+    -------
+    :class:`.StringExpression`
+
+    Notes
+    -----
+    Expects either one argument of type
+    ``struct{locus: locus<RG>, alleles: array<str>``, or two arguments of type
+    ``locus<RG>`` and ``array<str>``. The function returns a string of the form
+
+    .. code-block:: text
+
+        CHR:POS:REF:ALT1,ALT2,...ALTN
+        e.g.
+        1:1:A:T
+        16:250125:AAA:A,CAA
+
+    Examples
+    --------
+    >>> hl.eval(hl.variant_str(hl.locus('1', 10000), ['A', 'T', 'C']))
+    '1:10000:A:T,C'
+    """
+    args = [to_expr(arg) for arg in args]
+
+    def type_error():
+        raise ValueError(f"'variant_str' expects arguments of the following types:\n"
+                         f"  Option 1: 1 argument of type 'struct{{locus: locus<RG>, alleles: array<str>}}\n"
+                         f"  Option 2: 2 arguments of type 'locus<RG>', 'array<str>'\n"
+                         f"  Found: {builtins.len(args)} {plural('argument', builtins.len(args))} "
+                         f"of type {', '.join(builtins.str(x.dtype) for x in args)}")
+
+    if builtins.len(args) == 1:
+        [s] = args
+        t = s.dtype
+        if not isinstance(t, tstruct) \
+                or not builtins.len(t) == 2 \
+                or not isinstance(t[0], tlocus) \
+                or not t[1] == tarray(tstr):
+            type_error()
+        return hl.rbind(s, lambda x: hl.str(x[0]) + ":" + x[1][0] + ":" + hl.delimit(x[1][1:]))
+    elif builtins.len(args) == 2:
+        [locus, alleles] = args
+        if not isinstance(locus.dtype, tlocus) or not alleles.dtype == tarray(tstr):
+            type_error()
+        return hl.str(locus) + ":" + hl.rbind(alleles, lambda x: x[0] + ":" + hl.delimit(x[1:]))
+    else:
+        type_error()
 
 
 @typecheck(gp=expr_array(expr_float64))
@@ -893,7 +1100,7 @@ def pl_dosage(pl) -> Float64Expression:
     -------
     :class:`.Expression` of type :py:data:`.tfloat64`
     """
-    return hl.sum(pl_to_gp(pl) * [0, 1, 2], filter_missing=False)
+    return hl.sum(pl_to_gp(pl) * hl.range(3), filter_missing=False)
 
 
 @typecheck(pl=expr_array(expr_int32), _cache_size=int)
@@ -919,8 +1126,8 @@ def pl_to_gp(pl, _cache_size=2048) -> ArrayNumericExpression:
     -------
    :class:`.ArrayNumericExpression` of type :py:data:`.tfloat64`
     """
-    phred_table = hl.literal([10 ** (-x/10.0) for x in builtins.range(_cache_size)])
-    gp = hl.bind(lambda pls: pls.map(lambda x: hl.cond(x >= _cache_size, 10 ** (-x/10.0), phred_table[x])), pl)
+    phred_table = hl.literal([10 ** (-x / 10.0) for x in builtins.range(_cache_size)])
+    gp = hl.bind(lambda pls: pls.map(lambda x: hl.cond(x >= _cache_size, 10 ** (-x / 10.0), phred_table[x])), pl)
     return hl.bind(lambda gp: gp / hl.sum(gp), gp)
 
 
@@ -968,21 +1175,24 @@ def interval(start,
 
     return _func('Interval', tinterval(start.dtype), start, end, includes_start, includes_end)
 
+
 @typecheck(contig=expr_str, start=expr_int32,
            end=expr_int32, includes_start=expr_bool,
-           includes_end=expr_bool, reference_genome=reference_genome_type)
+           includes_end=expr_bool, reference_genome=reference_genome_type,
+           invalid_missing=expr_bool)
 def locus_interval(contig,
                    start,
                    end,
                    includes_start=True,
                    includes_end=False,
-                   reference_genome: Union[str, ReferenceGenome] = 'default') -> IntervalExpression:
+                   reference_genome: Union[str, ReferenceGenome] = 'default',
+                   invalid_missing=False) -> IntervalExpression:
     """Construct a locus interval expression.
 
     Examples
     --------
 
-    >>> hl.eval(hl.locus_interval("1", 100, 1000))
+    >>> hl.eval(hl.locus_interval("1", 100, 1000, reference_genome='GRCh37'))
     Interval(start=Locus(contig=1, position=100, reference_genome=GRCh37),
              end=Locus(contig=1, position=1000, reference_genome=GRCh37),
              includes_start=True,
@@ -1002,31 +1212,33 @@ def locus_interval(contig,
         If ``True``, interval includes end point.
     reference_genome : :obj:`str` or :class:`.hail.genetics.ReferenceGenome`
         Reference genome to use.
+    invalid_missing : :class:`.BooleanExpression`
+        If ``True``, invalid intervals are set to NA rather than causing an exception.
 
     Returns
     -------
     :class:`.IntervalExpression`
     """
-    fname = 'LocusInterval({})'.format(reference_genome.name)
-    return _func(fname, tinterval(tlocus(reference_genome)), contig, start, end, includes_start, includes_end)
+    return _func('LocusInterval', tinterval(tlocus(reference_genome)), contig, start, end, includes_start, includes_end, invalid_missing)
 
 
 @typecheck(s=expr_str,
-           reference_genome=reference_genome_type)
-def parse_locus_interval(s, reference_genome: Union[str, ReferenceGenome] = 'default') -> IntervalExpression:
+           reference_genome=reference_genome_type,
+           invalid_missing=expr_bool)
+def parse_locus_interval(s, reference_genome: Union[str, ReferenceGenome] = 'default', invalid_missing=False) -> IntervalExpression:
     """Construct a locus interval expression by parsing a string or string
     expression.
 
     Examples
     --------
 
-    >>> hl.eval(hl.parse_locus_interval('1:1000-2000'))
+    >>> hl.eval(hl.parse_locus_interval('1:1000-2000', reference_genome='GRCh37'))
     Interval(start=Locus(contig=1, position=1000, reference_genome=GRCh37),
              end=Locus(contig=1, position=2000, reference_genome=GRCh37),
              includes_start=True,
              includes_end=False)
 
-    >>> hl.eval(hl.parse_locus_interval('1:start-10M'))
+    >>> hl.eval(hl.parse_locus_interval('1:start-10M', reference_genome='GRCh37'))
     Interval(start=Locus(contig=1, position=1, reference_genome=GRCh37),
              end=Locus(contig=1, position=10000000, reference_genome=GRCh37),
              includes_start=True,
@@ -1076,13 +1288,15 @@ def parse_locus_interval(s, reference_genome: Union[str, ReferenceGenome] = 'def
         String to parse.
     reference_genome : :obj:`str` or :class:`.hail.genetics.ReferenceGenome`
         Reference genome to use.
+    invalid_missing : :class:`.BooleanExpression`
+        If ``True``, invalid intervals are set to NA rather than causing an exception.
 
     Returns
     -------
     :class:`.IntervalExpression`
     """
-    return _func('LocusInterval({})'.format(reference_genome.name),
-                 tinterval(tlocus(reference_genome)), s)
+    return _func('LocusInterval',
+                 tinterval(tlocus(reference_genome)), s, invalid_missing)
 
 
 @typecheck(alleles=expr_int32,
@@ -1200,7 +1414,7 @@ def is_defined(expression) -> BooleanExpression:
     :class:`.BooleanExpression`
         ``True`` if `expression` is not missing, ``False`` otherwise.
     """
-    return ~apply_expr(lambda x: IsNA(x), tbool, expression)
+    return ~apply_expr(lambda x: ir.IsNA(x), tbool, expression)
 
 
 @typecheck(expression=expr_any)
@@ -1229,7 +1443,7 @@ def is_missing(expression) -> BooleanExpression:
     :class:`.BooleanExpression`
         ``True`` if `expression` is missing, ``False`` otherwise.
     """
-    return apply_expr(lambda x: IsNA(x), tbool, expression)
+    return apply_expr(lambda x: ir.IsNA(x), tbool, expression)
 
 
 @typecheck(x=expr_oneof(expr_float32, expr_float64))
@@ -1266,6 +1480,7 @@ def is_nan(x) -> BooleanExpression:
     """
     return _func("isnan", tbool, x)
 
+
 @typecheck(x=expr_oneof(expr_float32, expr_float64))
 def is_finite(x) -> BooleanExpression:
     """Returns ``True`` if the argument is a finite floating-point number.
@@ -1297,6 +1512,7 @@ def is_finite(x) -> BooleanExpression:
     :class:`.BooleanExpression`
     """
     return _func("is_finite", tbool, x)
+
 
 @typecheck(x=expr_oneof(expr_float32, expr_float64))
 def is_infinite(x) -> BooleanExpression:
@@ -1341,7 +1557,7 @@ def json(x) -> StringExpression:
     >>> hl.eval(hl.json([1,2,3,4,5]))
     '[1,2,3,4,5]'
 
-    >>> hl.eval(hl.json(hl.struct(a='Hello', b=0.12345, c=[1,2], d={'hi', 'bye'})))  # doctest: +NOTEST
+    >>> hl.eval(hl.json(hl.struct(a='Hello', b=0.12345, c=[1,2], d={'hi', 'bye'})))  # doctest: +SKIP_OUTPUT_CHECK
     '{"a":"Hello","c":[1,2],"b":0.12345,"d":["bye","hi"]}'
 
     Parameters
@@ -1355,6 +1571,31 @@ def json(x) -> StringExpression:
         String expression with JSON representation of `x`.
     """
     return _func("json", tstr, x)
+
+
+@typecheck(x=expr_str, dtype=hail_type)
+def parse_json(x, dtype):
+    """Convert a JSON string to a structured expression.
+
+    Examples
+    --------
+    >>> json_str = '{"a": 5, "b": 1.1, "c": "foo"}'
+    >>> parsed = hl.parse_json(json_str, dtype='struct{a: int32, b: float64, c: str}')
+    >>> hl.eval(parsed.a)
+    5
+
+    Parameters
+    ----------
+    x : :class:`.StringExpression`
+        JSON string.
+    dtype
+        Type of value to parse.
+
+    Returns
+    -------
+    :class:`.Expression`
+    """
+    return _func("parse_json", ttuple(dtype), x, type_args=(dtype,))[0]
 
 
 @typecheck(x=expr_float64, base=nullable(expr_float64))
@@ -1453,12 +1694,9 @@ def coalesce(*args):
         arg_types = ''.join([f"\n    argument {i}: type '{arg.dtype}'" for i, arg in enumerate(exprs)])
         raise TypeError(f"'coalesce' requires all arguments to have the same type or compatible types"
                         f"{arg_types}")
-    def make_case(*expr_args):
-        c = case()
-        for e in expr_args:
-            c = c.when(hl.is_defined(e), e)
-        return c.or_missing()
-    return bind(make_case, *exprs)
+    indices, aggregations = unify_all(*exprs)
+    return construct_expr(ir.Coalesce(*(e._ir for e in exprs)), exprs[0].dtype, indices, aggregations)
+
 
 @typecheck(a=expr_any, b=expr_any)
 def or_else(a, b):
@@ -1491,8 +1729,8 @@ def or_else(a, b):
         raise TypeError(f"'or_else' requires the 'a' and 'b' arguments to have the same type\n"
                         f"    a: type '{a.dtype}'\n"
                         f"    b: type '{b.dtype}'")
-    assert a.dtype == b.dtype
-    return hl.cond(hl.is_defined(a), a, b)
+    return coalesce(a, b)
+
 
 @typecheck(predicate=expr_bool, value=expr_any)
 def or_missing(predicate, value):
@@ -1523,25 +1761,42 @@ def or_missing(predicate, value):
 
 
 @typecheck(x=expr_int32, n=expr_int32, p=expr_float64,
-           alternative=enumeration("two.sided", "greater", "less"))
+           alternative=enumeration("two.sided", "two-sided", "greater", "less"))
 def binom_test(x, n, p, alternative: str) -> Float64Expression:
     """Performs a binomial test on `p` given `x` successes in `n` trials.
-
-    Examples
-    --------
-
-    >>> hl.eval(hl.binom_test(5, 10, 0.5, 'less'))
-    0.6230468749999999
-
-    With alternative ``less``, the p-value is the probability of at most `x`
-    successes, i.e. the cumulative probability at `x` of the distribution
-    Binom(`n`, `p`). With ``greater``, the p-value is the probably of at least
-    `x` successes. With ``two.sided``, the p-value is the total probability of
-    all outcomes with probability at most that of `x`.
 
     Returns the p-value from the `exact binomial test
     <https://en.wikipedia.org/wiki/Binomial_test>`__ of the null hypothesis that
     success has probability `p`, given `x` successes in `n` trials.
+
+    The alternatives are interpreted as follows:
+    - ``'less'``: a one-tailed test of the significance of `x` or fewer successes,
+    - ``'greater'``: a one-tailed test of the significance of `x` or more successes, and
+    - ``'two-sided'``: a two-tailed test of the significance of `x` or any equivalent or more unlikely outcome.
+
+    Examples
+    --------
+
+    All the examples below use a fair coin as the null hypothesis. Zero is
+    interpreted as tail and one as heads.
+
+    Test if a coin is biased towards heads or tails after observing two heads
+    out of ten flips:
+
+    >>> hl.eval(hl.binom_test(2, 10, 0.5, 'two-sided'))
+    0.10937499999999994
+
+    Test if a coin is biased towards tails after observing four heads out of ten
+    flips:
+
+    >>> hl.eval(hl.binom_test(4, 10, 0.5, 'less'))
+    0.3769531250000001
+
+    Test if a coin is biased towards heads after observing thirty-two heads out
+    of fifty flips:
+
+    >>> hl.eval(hl.binom_test(32, 50, 0.5, 'greater'))
+    0.03245432353613613
 
     Parameters
     ----------
@@ -1552,7 +1807,7 @@ def binom_test(x, n, p, alternative: str) -> Float64Expression:
     p : float or :class:`.Expression` of type :py:data:`.tfloat64`
         Probability of success, between 0 and 1.
     alternative
-        : One of, "two.sided", "greater", "less".
+        : One of, "two-sided", "greater", "less", (deprecated: "two.sided").
 
     Returns
     -------
@@ -1560,12 +1815,18 @@ def binom_test(x, n, p, alternative: str) -> Float64Expression:
         p-value.
     """
 
-    alt_enum = {"two.sided": 0, "greater": 1, "less": 2}[alternative]
+    if alternative == 'two.sided':
+        warning('"two.sided" is a deprecated and will be removed in a future '
+                'release, please use "two-sided" for the `alternative` parameter '
+                'to hl.binom_test')
+        alternative = 'two-sided'
+
+    alt_enum = {"two-sided": 0, "less": 1, "greater": 2}[alternative]
     return _func("binomTest", tfloat64, x, n, p, to_expr(alt_enum))
 
 
-@typecheck(x=expr_float64, df=expr_float64)
-def pchisqtail(x, df) -> Float64Expression:
+@typecheck(x=expr_float64, df=expr_float64, ncp=nullable(expr_float64))
+def pchisqtail(x, df, ncp=None) -> Float64Expression:
     """Returns the probability under the right-tail starting at x for a chi-squared
     distribution with df degrees of freedom.
 
@@ -1575,17 +1836,25 @@ def pchisqtail(x, df) -> Float64Expression:
     >>> hl.eval(hl.pchisqtail(5, 1))
     0.025347318677468304
 
+    >>> hl.eval(hl.pchisqtail(3, 1, 2))
+    0.3761310507217904
+
     Parameters
     ----------
     x : float or :class:`.Expression` of type :py:data:`.tfloat64`
     df : float or :class:`.Expression` of type :py:data:`.tfloat64`
         Degrees of freedom.
+    ncp: float or :class:`.Expression` of type :py:data:`.tfloat64`
+        Noncentrality parameter. Defaults to 0 if unspecified.
 
     Returns
     -------
     :class:`.Expression` of type :py:data:`.tfloat64`
     """
-    return _func("pchisqtail", tfloat64, x, df)
+    if ncp is None:
+        return _func("pchisqtail", tfloat64, x, df)
+    else:
+        return _func("pnchisqtail", tfloat64, x, df, ncp)
 
 
 @typecheck(x=expr_float64)
@@ -1606,7 +1875,7 @@ def pnorm(x) -> Float64Expression:
 
     Notes
     -----
-    Returns the left-tail probability `p` = Prob(:math:Z < x) with :math:Z a standard normal random variable.
+    Returns the left-tail probability `p` = Prob(:math:`Z < x`) with :math:`Z` a standard normal random variable.
 
     Parameters
     ----------
@@ -1617,6 +1886,99 @@ def pnorm(x) -> Float64Expression:
     :class:`.Expression` of type :py:data:`.tfloat64`
     """
     return _func("pnorm", tfloat64, x)
+
+
+@typecheck(x=expr_float64, n=expr_float64, lower_tail=expr_bool, log_p=expr_bool)
+def pT(x, n, lower_tail=True, log_p=False) -> Float64Expression:
+    r"""The cumulative probability function of a `t-distribution
+    <https://en.wikipedia.org/wiki/Student%27s_t-distribution>`__ with
+    `n` degrees of freedom.
+
+    Examples
+    --------
+
+    >>> hl.eval(hl.pT(0, 10))
+    0.5
+
+    >>> hl.eval(hl.pT(1, 10))
+    0.82955343384897
+
+    >>> hl.eval(hl.pT(1, 10, lower_tail=False))
+    0.17044656615103004
+
+    >>> hl.eval(hl.pT(1, 10, log_p=True))
+    -0.186867754489647
+
+    Notes
+    -----
+    If `lower_tail` is true, returns Prob(:math:`X \leq` `x`) where :math:`X` is
+    a t-distributed random variable with `n` degrees of freedom. If `lower_tail`
+    is false, returns Prob(:math:`X` > `x`).
+
+    Parameters
+    ----------
+    x : float or :class:`.Expression` of type :py:data:`.tfloat64`
+    n : float or :class:`.Expression` of type :py:data:`.tfloat64`
+        Degrees of freedom of the t-distribution.
+    lower_tail : bool or :class:`.BooleanExpression`
+        If ``True``, compute the probability of an outcome at or below `x`,
+        otherwise greater than `x`.
+    log_p : bool or :class:`.BooleanExpression`
+        Return the natural logarithm of the probability.
+
+    Returns
+    -------
+    :class:`.Expression` of type :py:data:`.tfloat64`
+
+    """
+    return _func("pT", tfloat64, x, n, lower_tail, log_p)
+
+
+@typecheck(x=expr_float64, df1=expr_float64, df2=expr_float64, lower_tail=expr_bool, log_p=expr_bool)
+def pF(x, df1, df2, lower_tail=True, log_p=False) -> Float64Expression:
+    r"""The cumulative probability function of a `F-distribution
+    <https://en.wikipedia.org/wiki/F-distribution>`__ with parameters
+    `df1` and `df2`.
+
+    Examples
+    --------
+
+    >>> hl.eval(hl.pF(0, 3, 10))
+    0.0
+
+    >>> hl.eval(hl.pF(1, 3, 10))
+    0.5676627969783028
+
+    >>> hl.eval(hl.pF(1, 3, 10, lower_tail=False))
+    0.4323372030216972
+
+    >>> hl.eval(hl.pF(1, 3, 10, log_p=True))
+    -0.566227703842908
+
+    Notes
+    -----
+    If `lower_tail` is true, returns Prob(:math:`X \leq` `x`) where :math:`X` is
+    a random variable with distribution :math:`F`(df1, df2). If `lower_tail`
+    is false, returns Prob(:math:`X` > `x`).
+
+    Parameters
+    ----------
+    x : float or :class:`.Expression` of type :py:data:`.tfloat64`
+    df1 : float or :class:`.Expression` of type :py:data:`.tfloat64`
+        Parameter of the F-distribution
+    df2 : float or :class:`.Expression` of type :py:data:`.tfloat64`
+        Parameter of the F-distribution
+    lower_tail : bool or :class:`.BooleanExpression`
+        If ``True``, compute the probability of an outcome at or below `x`,
+        otherwise greater than `x`.
+    log_p : bool or :class:`.BooleanExpression`
+        Return the natural logarithm of the probability.
+
+    Returns
+    -------
+    :class:`.Expression` of type :py:data:`.tfloat64`
+    """
+    return _func("pF", tfloat64, x, df1, df2, lower_tail, log_p)
 
 
 @typecheck(x=expr_float64, lamb=expr_float64, lower_tail=expr_bool, log_p=expr_bool)
@@ -1666,7 +2028,7 @@ def qchisqtail(p, df) -> Float64Expression:
     Notes
     -----
     Returns right-quantile `x` for which `p` = Prob(:math:`Z^2` > x) with :math:`Z^2` a chi-squared random
-     variable with degrees of freedom specified by `df`. `p` must satisfy 0 < `p` <= 1.
+    variable with degrees of freedom specified by `df`. `p` must satisfy 0 < `p` <= 1.
 
     Parameters
     ----------
@@ -1741,15 +2103,18 @@ def qpois(p, lamb, lower_tail=True, log_p=False) -> Float64Expression:
     return _func("qpois", tint32, p, lamb, lower_tail, log_p)
 
 
-@typecheck(start=expr_int32, stop=expr_int32, step=expr_int32)
-def range(start, stop, step=1) -> ArrayNumericExpression:
+@typecheck(start=expr_int32, stop=nullable(expr_int32), step=expr_int32)
+def range(start, stop=None, step=1) -> ArrayNumericExpression:
     """Returns an array of integers from `start` to `stop` by `step`.
 
     Examples
     --------
 
-    >>> hl.eval(hl.range(0, 10))
+    >>> hl.eval(hl.range(10))
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    >>> hl.eval(hl.range(3, 10))
+    [3, 4, 5, 6, 7, 8, 9]
 
     >>> hl.eval(hl.range(0, 10, step=3))
     [0, 3, 6, 9]
@@ -1757,6 +2122,9 @@ def range(start, stop, step=1) -> ArrayNumericExpression:
     Notes
     -----
     The range includes `start`, but excludes `stop`.
+
+    If provided exactly one argument, the argument is interpreted as `stop` and
+    `start` is set to zero. This matches the behavior of Python's ``range``.
 
     Parameters
     ----------
@@ -1771,7 +2139,33 @@ def range(start, stop, step=1) -> ArrayNumericExpression:
     -------
     :class:`.ArrayInt32Expression`
     """
-    return apply_expr(lambda sta, sto, ste: ArrayRange(sta, sto, ste), tarray(tint32), start, stop, step)
+    if stop is None:
+        stop = start
+        start = hl.literal(0)
+    return apply_expr(lambda sta, sto, ste: ir.ToArray(ir.StreamRange(sta, sto, ste)), tarray(tint32), start, stop, step)
+
+
+@typecheck(length=expr_int32)
+def zeros(length) -> ArrayNumericExpression:
+    """Returns an array of zeros of length `length`.
+
+    Examples
+    --------
+
+    >>> hl.eval(hl.zeros(4))
+    [0, 0, 0, 0]
+
+    Parameters
+    ----------
+    length : int or :class:`.Expression` of type :py:data:`.tint32`
+        length of zeros array.
+
+    Returns
+    -------
+    :class:`.ArrayInt32Expression`
+    """
+
+    return apply_expr(lambda z: ir.ArrayZeros(z), tarray(tint32), length)
 
 
 @typecheck(p=expr_float64, seed=nullable(int))
@@ -1781,10 +2175,10 @@ def rand_bool(p, seed=None) -> BooleanExpression:
     Examples
     --------
 
-    >>> hl.eval(hl.rand_bool(0.5))  # doctest: +NOTEST
+    >>> hl.eval(hl.rand_bool(0.5))  # doctest: +SKIP_OUTPUT_CHECK
     True
 
-    >>> hl.eval(hl.rand_bool(0.5))  # doctest: +NOTEST
+    >>> hl.eval(hl.rand_bool(0.5))  # doctest: +SKIP_OUTPUT_CHECK
     False
 
     Parameters
@@ -1809,10 +2203,10 @@ def rand_norm(mean=0, sd=1, seed=None) -> Float64Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.rand_norm())  # doctest: +NOTEST
+    >>> hl.eval(hl.rand_norm())  # doctest: +SKIP_OUTPUT_CHECK
     1.5388475315213386
 
-    >>> hl.eval(hl.rand_norm())  # doctest: +NOTEST
+    >>> hl.eval(hl.rand_norm())  # doctest: +SKIP_OUTPUT_CHECK
     -0.3006188509144124
 
     Parameters
@@ -1831,6 +2225,65 @@ def rand_norm(mean=0, sd=1, seed=None) -> Float64Expression:
     return _seeded_func("rand_norm", tfloat64, seed, mean, sd)
 
 
+@typecheck(mean=nullable(expr_array(expr_float64)), cov=nullable(expr_array(expr_float64)), seed=nullable(int))
+def rand_norm2d(mean=None, cov=None, seed=None) -> ArrayNumericExpression:
+    """Samples from a normal distribution with mean `mean` and covariance matrix `cov`.
+
+    Examples
+    --------
+
+    >>> hl.eval(hl.rand_norm2d())  # doctest: +SKIP_OUTPUT_CHECK
+    [0.5515477294463427, -1.1782691532205807]
+
+    >>> hl.eval(hl.rand_norm2d())  # doctest: +SKIP_OUTPUT_CHECK
+    [-1.127240906867922, 1.4495317887283203]
+
+    Notes
+    -----
+    The covariance of a 2d normal distribution is a 2x2 symmetric matrix
+    [[a, b], [b, c]]. This is specified in `cov` as a length 3 array [a, b, c].
+    The covariance matrix must be positive semi-definite, i.e. a>0, c>0, and
+    a*c - b^2 > 0.
+
+    If `mean` and `cov` are both None, draws from the standard 2d normal
+    distribution.
+
+    Parameters
+    ----------
+    mean : :class:`.ArrayNumericExpression`, optional
+        Mean of normal distribution. Array of length 2.
+    cov : :class:`.ArrayNumericExpression`, optional
+        Covariance of normal distribution. Array of length 3.
+    seed : :obj:`int`, optional
+        Random seed.
+
+    Returns
+    -------
+    :class:`.ArrayFloat64Expression`
+    """
+    if mean is None:
+        mean = [0, 0]
+    if cov is None:
+        cov = [1, 0, 1]
+
+    def f(mean, cov):
+        m1 = mean[0]
+        m2 = mean[1]
+        s11 = cov[0]
+        s12 = cov[1]
+        s22 = cov[2]
+
+        x = hl.range(0, 2).map(lambda i: rand_norm(seed=seed))
+        return hl.rbind(hl.sqrt(s11),
+                        lambda root_s11:
+                        hl.array([
+                            m1 + root_s11 * x[0],
+                            m2 + (s12 / root_s11) * x[0]
+                            + hl.sqrt(s22 - s12 * s12 / s11) * x[1]]))
+
+    return hl.rbind(mean, cov, f)
+
+
 @typecheck(lamb=expr_float64, seed=nullable(int))
 def rand_pois(lamb, seed=None) -> Float64Expression:
     """Samples from a `Poisson distribution
@@ -1840,10 +2293,10 @@ def rand_pois(lamb, seed=None) -> Float64Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.rand_pois(1))  # doctest: +NOTEST
+    >>> hl.eval(hl.rand_pois(1))  # doctest: +SKIP_OUTPUT_CHECK
     2.0
 
-    >>> hl.eval(hl.rand_pois(1))  # doctest: +NOTEST
+    >>> hl.eval(hl.rand_pois(1))  # doctest: +SKIP_OUTPUT_CHECK
     3.0
 
     Parameters
@@ -1868,10 +2321,10 @@ def rand_unif(lower, upper, seed=None) -> Float64Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.rand_unif(0, 1))  # doctest: +NOTEST
+    >>> hl.eval(hl.rand_unif(0, 1))  # doctest: +SKIP_OUTPUT_CHECK
     0.7983073825816226
 
-    >>> hl.eval(hl.rand_unif(0, 1))  # doctest: +NOTEST
+    >>> hl.eval(hl.rand_unif(0, 1))  # doctest: +SKIP_OUTPUT_CHECK
     0.5161799497741769
 
     Parameters
@@ -1911,10 +2364,10 @@ def rand_beta(a, b, lower=None, upper=None, seed=None) -> Float64Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.rand_beta(0, 1))  # doctest: +NOTEST
+    >>> hl.eval(hl.rand_beta(0, 1))  # doctest: +SKIP_OUTPUT_CHECK
     0.6696807666871818
 
-    >>> hl.eval(hl.rand_beta(0, 1))  # doctest: +NOTEST
+    >>> hl.eval(hl.rand_beta(0, 1))  # doctest: +SKIP_OUTPUT_CHECK
     0.8512985039011525
 
     Parameters
@@ -1953,10 +2406,10 @@ def rand_gamma(shape, scale, seed=None) -> Float64Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.rand_gamma(1, 1))  # doctest: +NOTEST
+    >>> hl.eval(hl.rand_gamma(1, 1))  # doctest: +SKIP_OUTPUT_CHECK
     2.3915947710237537
 
-    >>> hl.eval(hl.rand_gamma(1, 1))  # doctest: +NOTEST
+    >>> hl.eval(hl.rand_gamma(1, 1))  # doctest: +SKIP_OUTPUT_CHECK
     0.1339939936379711
 
     Parameters
@@ -1992,10 +2445,10 @@ def rand_cat(prob, seed=None) -> Int32Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.rand_cat([0, 1.7, 2]))  # doctest: +NOTEST
+    >>> hl.eval(hl.rand_cat([0, 1.7, 2]))  # doctest: +SKIP_OUTPUT_CHECK
     2
 
-    >>> hl.eval(hl.rand_cat([0, 1.7, 2]))  # doctest: +NOTEST
+    >>> hl.eval(hl.rand_cat([0, 1.7, 2]))  # doctest: +SKIP_OUTPUT_CHECK
     1
 
     Parameters
@@ -2020,10 +2473,10 @@ def rand_dirichlet(a, seed=None) -> ArrayExpression:
     Examples
     --------
 
-    >>> hl.eval(hl.rand_dirichlet([1, 1, 1]))  # doctest: +NOTEST
+    >>> hl.eval(hl.rand_dirichlet([1, 1, 1]))  # doctest: +SKIP_OUTPUT_CHECK
     [0.4630197581640282,0.18207753442497876,0.3549027074109931]
 
-    >>> hl.eval(hl.rand_dirichlet([1, 1, 1]))  # doctest: +NOTEST
+    >>> hl.eval(hl.rand_dirichlet([1, 1, 1]))  # doctest: +SKIP_OUTPUT_CHECK
     [0.20851948405364765,0.7873859423649898,0.004094573581362475]
 
     Parameters
@@ -2069,6 +2522,7 @@ def sqrt(x) -> Float64Expression:
     """
     return _func("sqrt", tfloat64, x)
 
+
 @typecheck(x=expr_array(expr_float64), y=expr_array(expr_float64))
 def corr(x, y) -> Float64Expression:
     """Compute the
@@ -2077,7 +2531,7 @@ def corr(x, y) -> Float64Expression:
 
     Examples
     --------
-    >>> hl.eval(hl.corr([1, 2, 4], [2, 3, 1]))  # doctest: +NOTEST
+    >>> hl.eval(hl.corr([1, 2, 4], [2, 3, 1]))  # doctest: +SKIP_OUTPUT_CHECK
     -0.6546536707079772
 
     Notes
@@ -2098,6 +2552,7 @@ def corr(x, y) -> Float64Expression:
     """
     return _func("corr", tfloat64, x, y)
 
+
 _base_regex = "^([ACGTNM])+$"
 _symbolic_regex = r"(^\.)|(\.$)|(^<)|(>$)|(\[)|(\])"
 _allele_types = ["Unknown", "SNP", "MNP", "Insertion", "Deletion", "Complex", "Star", "Symbolic"]
@@ -2106,6 +2561,7 @@ _allele_ints = {v: k for k, v in _allele_enum.items()}
 
 
 @typecheck(ref=expr_str, alt=expr_str)
+@ir.udf(tstr, tstr)
 def _num_allele_type(ref, alt) -> Int32Expression:
     return hl.bind(lambda r, a:
                    hl.cond(r.matches(_base_regex),
@@ -2232,12 +2688,14 @@ def is_transversion(ref, alt) -> BooleanExpression:
 
 
 @typecheck(ref=expr_str, alt=expr_str)
+@ir.udf(tstr, tstr)
 def _is_snp_transition(ref, alt) -> BooleanExpression:
     indices = hl.range(0, ref.length())
-    return hl.any(lambda i: ((ref[i] != alt[i]) & (((ref[i] == 'A') & (alt[i] == 'G')) |
-                                                   ((ref[i] == 'G') & (alt[i] == 'A')) |
-                                                   ((ref[i] == 'C') & (alt[i] == 'T')) |
-                                                   ((ref[i] == 'T') & (alt[i] == 'C')))), indices)
+    return hl.any(lambda i: ((ref[i] != alt[i]) & (((ref[i] == 'A') & (alt[i] == 'G'))
+                                                   | ((ref[i] == 'G') & (alt[i] == 'A'))
+                                                   | ((ref[i] == 'C') & (alt[i] == 'T'))
+                                                   | ((ref[i] == 'T') & (alt[i] == 'C')))), indices)
+
 
 @typecheck(ref=expr_str, alt=expr_str)
 def is_insertion(ref, alt) -> BooleanExpression:
@@ -2308,8 +2766,8 @@ def is_indel(ref, alt) -> BooleanExpression:
     -------
     :class:`.BooleanExpression`
     """
-    return hl.bind(lambda t: (t == _allele_ints["Insertion"]) |
-                             (t == _allele_ints["Deletion"]),
+    return hl.bind(lambda t: (t == _allele_ints["Insertion"])
+                   | (t == _allele_ints["Deletion"]),
                    _num_allele_type(ref, alt))
 
 
@@ -2391,7 +2849,7 @@ def is_strand_ambiguous(ref, alt) -> BooleanExpression:
 
 
 @typecheck(ref=expr_str, alt=expr_str)
-def allele_type(ref, alt)-> StringExpression:
+def allele_type(ref, alt) -> StringExpression:
     """Returns the type of the polymorphism as a string.
 
     Examples
@@ -2495,6 +2953,13 @@ def entropy(s) -> Float64Expression:
     :class:`.Expression` of type :py:data:`.tfloat64`
     """
     return _func("entropy", tfloat64, s)
+
+
+@typecheck(x=expr_any, trunc=nullable(expr_int32))
+def _showstr(x, trunc=None):
+    if trunc is None:
+        return _func("showStr", tstr, x)
+    return _func("showStr", tstr, x, trunc)
 
 
 @typecheck(x=expr_any)
@@ -2799,7 +3264,7 @@ def group_by(f: Callable, collection) -> DictExpression:
 
     >>> a = ['The', 'quick', 'brown', 'fox']
 
-    >>> hl.eval(hl.group_by(lambda x: hl.len(x), a))
+    >>> hl.eval(hl.group_by(lambda x: hl.len(x), a))  # doctest: +SKIP_OUTPUT_CHECK
     {5: ['quick', 'brown'], 3: ['The', 'fox']}
 
     Parameters
@@ -2908,27 +3373,19 @@ def zip(*arrays, fill_missing: bool = False) -> ArrayExpression:
     -------
     :class:`.ArrayExpression`
     """
-
     n_arrays = builtins.len(arrays)
-    if fill_missing:
-        def _(array_lens):
-            result_len = hl.max(array_lens)
-            indices = hl.range(0, result_len)
-            return hl.map(lambda i: builtins.tuple(
-                hl.cond(i < array_lens[j], arrays[j][i], hl.null(arrays[j].dtype.element_type))
-                for j in builtins.range(n_arrays)), indices)
+    uids = [Env.get_uid() for _ in builtins.range(n_arrays)]
+    body_ir = ir.MakeTuple([ir.Ref(uid) for uid in uids])
+    indices, aggregations = unify_all(*arrays)
+    behavior = 'ExtendNA' if fill_missing else 'TakeMinLength'
+    return construct_expr(ir.ToArray(ir.StreamZip([ir.ToStream(a._ir) for a in arrays], uids, body_ir, behavior)),
+                          tarray(ttuple(*(a.dtype.element_type for a in arrays))),
+                          indices,
+                          aggregations)
 
-        return bind(_, [hl.len(a) for a in arrays])
-    else:
-        def _(array_lens):
-            result_len = hl.min(array_lens)
-            indices = hl.range(0, result_len)
-            return hl.map(lambda i: builtins.tuple(arrays[j][i] for j in builtins.range(n_arrays)), indices)
 
-        return bind(_, [hl.len(a) for a in arrays])
-
-@typecheck(a=expr_array())
-def zip_with_index(a):
+@typecheck(a=expr_array(), index_first=bool)
+def zip_with_index(a, index_first=True):
     """Returns an array of (index, element) tuples.
 
     Examples
@@ -2937,19 +3394,27 @@ def zip_with_index(a):
     >>> hl.eval(hl.zip_with_index(['A', 'B', 'C']))
     [(0, 'A'), (1, 'B'), (2, 'C')]
 
+    >>> hl.eval(hl.zip_with_index(['A', 'B', 'C'], index_first=False))
+    [('A', 0), ('B', 1), ('C', 2)]
+
+
     Parameters
     ----------
     a : :class:`.ArrayExpression`
+    index_first: :obj:`bool`
+        If ``True``, the index is the first value of the element tuples. If
+        ``False``, the index is the second value.
 
     Returns
     -------
     :class:`.ArrayExpression`
-        Array of (index, element) tuples.
+        Array of (index, element) or (element, index) tuples.
     """
-    return bind(lambda aa: range(0, len(aa)).map(lambda i: (i, aa[i])), a)
+    return bind(lambda aa: range(0, len(aa)).map(lambda i: (i, aa[i]) if index_first else (aa[i], i)), a)
+
 
 @typecheck(f=func_spec(1, expr_any),
-           collection=expr_oneof(expr_set(), expr_array()))
+           collection=expr_oneof(expr_set(), expr_array(), expr_ndarray()))
 def map(f: Callable, collection):
     """Transform each element of a collection.
 
@@ -3007,9 +3472,9 @@ def len(x) -> Int32Expression:
     if isinstance(x.dtype, ttuple) or isinstance(x.dtype, tstruct):
         return hl.int32(builtins.len(x))
     elif x.dtype == tstr:
-        return apply_expr(lambda x: StringLength(x), tint32, x)
+        return apply_expr(lambda x: ir.Apply("length", tint32, x), tint32, x)
     else:
-        return apply_expr(lambda x: ArrayLen(x), tint32, array(x))
+        return apply_expr(lambda x: ir.ArrayLen(ir.CastToArray(x)), tint32, array(x))
 
 
 @typecheck(x=expr_oneof(expr_array(), expr_str))
@@ -3039,9 +3504,95 @@ def reversed(x):
     return x
 
 
+@typecheck(name=builtins.str,
+           exprs=tupleof(Expression),
+           filter_missing=builtins.bool,
+           filter_nan=builtins.bool)
+def _comparison_func(name, exprs, filter_missing, filter_nan):
+    if builtins.len(exprs) < 1:
+        raise ValueError(f"{name:!r} requires at least one argument")
+    if (builtins.len(exprs) == 1
+            and (isinstance(exprs[0].dtype, (tarray, tset)))
+            and is_numeric(exprs[0].dtype.element_type)):
+        [e] = exprs
+        if filter_nan and e.dtype.element_type in (tfloat32, tfloat64):
+            name = 'nan' + name
+        return array(e)._filter_missing_method(filter_missing, name, exprs[0].dtype.element_type)
+    else:
+        if not builtins.all(is_numeric(e.dtype) for e in exprs):
+            expr_types = ', '.join("'{}'".format(e.dtype) for e in exprs)
+            raise TypeError(f"{name!r} expects a single numeric array expression or multiple numeric expressions\n"
+                            f"  Found {builtins.len(exprs)} arguments with types {expr_types}")
+        unified_typ = unify_types_limited(*(e.dtype for e in exprs))
+        ec = coercer_from_dtype(unified_typ)
+        indices, aggs = unify_all(*exprs)
+
+        func_name = name
+        if filter_missing:
+            func_name += '_ignore_missing'
+        if filter_nan and unified_typ in (tfloat32, tfloat64):
+            func_name = 'nan' + func_name
+        return construct_expr(functools.reduce(lambda l, r: ir.Apply(func_name, unified_typ, l, r), [ec.coerce(e)._ir for e in exprs]),
+                              unified_typ,
+                              indices,
+                              aggs)
+
+
 @typecheck(exprs=expr_oneof(expr_numeric, expr_set(expr_numeric), expr_array(expr_numeric)),
-           filter_missing=bool)
-def max(*exprs, filter_missing: bool = True) -> NumericExpression:
+           filter_missing=builtins.bool)
+def nanmax(*exprs, filter_missing: builtins.bool = True) -> NumericExpression:
+    """Returns the maximum value of a collection or of given arguments, excluding NaN.
+
+    Examples
+    --------
+
+    Compute the maximum value of an array:
+
+    >>> hl.eval(hl.nanmax([1.1, 50.1, float('nan')]))
+    50.1
+
+    Take the maximum value of arguments:
+
+    >>> hl.eval(hl.nanmax(1.1, 50.1, float('nan')))
+    50.1
+
+    Notes
+    -----
+    Like the Python builtin ``max`` function, this function can either take a
+    single iterable expression (an array or set of numeric elements), or
+    variable-length arguments of numeric expressions.
+
+    Note
+    ----
+    If `filter_missing` is ``True``, then the result is the maximum of
+    non-missing arguments or elements. If `filter_missing` is ``False``, then
+    any missing argument or element causes the result to be missing.
+
+    NaN arguments / array elements are ignored; the maximum value of `NaN` and
+    any non-`NaN` value `x` is `x`.
+
+    See Also
+    --------
+    :func:`max`, :func:`min`, :func:`nanmin`
+
+    Parameters
+    ----------
+    exprs : :class:`.ArrayExpression` or :class:`.SetExpression` or varargs of :class:`.NumericExpression`
+        Single numeric array or set, or multiple numeric values.
+    filter_missing : :obj:`bool`
+        Remove missing arguments/elements before computing maximum.
+
+    Returns
+    -------
+    :class:`.NumericExpression`
+    """
+
+    return _comparison_func('max', exprs, filter_missing, filter_nan=True)
+
+
+@typecheck(exprs=expr_oneof(expr_numeric, expr_set(expr_numeric), expr_array(expr_numeric)),
+           filter_missing=builtins.bool)
+def max(*exprs, filter_missing: builtins.bool = True) -> NumericExpression:
     """Returns the maximum element of a collection or of given numeric expressions.
 
     Examples
@@ -3065,54 +3616,47 @@ def max(*exprs, filter_missing: bool = True) -> NumericExpression:
 
     Note
     ----
-    Missing arguments / array elements are ignored if `filter_missing` is ``True``.
-    If `filter_missing` is ``False``, then any missing element causes the result to
-    be missing.
+    If `filter_missing` is ``True``, then the result is the maximum of
+    non-missing arguments or elements. If `filter_missing` is ``False``, then
+    any missing argument or element causes the result to be missing.
+
+    If any element or argument is `NaN`, then the result is `NaN`.
+
+    See Also
+    --------
+    :func:`nanmax`, :func:`min`, :func:`nanmin`
 
     Parameters
     ----------
     exprs : :class:`.ArrayExpression` or :class:`.SetExpression` or varargs of :class:`.NumericExpression`
         Single numeric array or set, or multiple numeric values.
     filter_missing : :obj:`bool`
-        Remove missing elements from the collection before computing product.
+        Remove missing arguments/elements before computing maximum.
 
     Returns
     -------
     :class:`.NumericExpression`
     """
-    if builtins.len(exprs) < 1:
-        raise ValueError("'max' requires at least one argument")
-    if builtins.len(exprs) == 1:
-        expr = exprs[0]
-        if not (isinstance(expr.dtype, tset) or isinstance(expr.dtype, tarray)):
-            raise TypeError("'max' expects a single numeric array expression or multiple numeric expressions\n"
-                            "  Found 1 argument of type '{}'".format(expr.dtype))
-        return expr._filter_missing_method(filter_missing, 'max', expr.dtype.element_type)
-    else:
-        if not builtins.all(is_numeric(e.dtype) for e in exprs):
-            raise TypeError("'max' expects a single numeric array expression or multiple numeric expressions\n"
-                            "  Found {} arguments with types '{}'".format(builtins.len(exprs), ', '.join(
-                "'{}'".format(e.dtype) for e in exprs)))
-        return max(hl.array(list(exprs)), filter_missing=filter_missing)
+    return _comparison_func('max', exprs, filter_missing, filter_nan=False)
 
 
 @typecheck(exprs=expr_oneof(expr_numeric, expr_set(expr_numeric), expr_array(expr_numeric)),
-           filter_missing=bool)
-def min(*exprs, filter_missing: bool = True) -> NumericExpression:
-    """Returns the minimum of a collection or of given numeric expressions.
+           filter_missing=builtins.bool)
+def nanmin(*exprs, filter_missing: builtins.bool = True) -> NumericExpression:
+    """Returns the minimum value of a collection or of given arguments, excluding NaN.
 
     Examples
     --------
 
-    Take the minimum value of an array:
+    Compute the minimum value of an array:
 
-    >>> hl.eval(hl.min([2, 3, 5, 6, 7, 9]))
-    2
+    >>> hl.eval(hl.nanmin([1.1, 50.1, float('nan')]))
+    1.1
 
-    Take the minimum value:
+    Take the minimum value of arguments:
 
-    >>> hl.eval(hl.min(12, 50, 2))
-    2
+    >>> hl.eval(hl.nanmin(1.1, 50.1, float('nan')))
+    1.1
 
     Notes
     -----
@@ -3122,40 +3666,85 @@ def min(*exprs, filter_missing: bool = True) -> NumericExpression:
 
     Note
     ----
-    Missing arguments / array elements are ignored if `filter_missing` is ``True``.
-    If `filter_missing` is ``False``, then any missing element causes the result to
-    be missing.
+    If `filter_missing` is ``True``, then the result is the minimum of
+    non-missing arguments or elements. If `filter_missing` is ``False``, then
+    any missing argument or element causes the result to be missing.
+
+    NaN arguments / array elements are ignored; the minimum value of `NaN` and
+    any non-`NaN` value `x` is `x`.
+
+    See Also
+    --------
+    :func:`min`, :func:`max`, :func:`nanmax`
 
     Parameters
     ----------
     exprs : :class:`.ArrayExpression` or :class:`.SetExpression` or varargs of :class:`.NumericExpression`
         Single numeric array or set, or multiple numeric values.
     filter_missing : :obj:`bool`
-        Remove missing elements from the collection before computing product.
+        Remove missing arguments/elements before computing minimum.
 
     Returns
     -------
     :class:`.NumericExpression`
     """
-    if builtins.len(exprs) < 1:
-        raise ValueError("'min' requires at least one argument")
-    if builtins.len(exprs) == 1:
-        expr = exprs[0]
-        if not (isinstance(expr.dtype, tset) or isinstance(expr.dtype, tarray)):
-            raise TypeError("'min' expects a single numeric array expression or multiple numeric expressions\n"
-                            "  Found 1 argument of type '{}'".format(expr.dtype))
-        return expr._filter_missing_method(filter_missing, 'min', expr.dtype.element_type)
-    else:
-        if not builtins.all(is_numeric(e.dtype) for e in exprs):
-            raise TypeError("'min' expects a single numeric array expression or multiple numeric expressions\n"
-                            "  Found {} arguments with types '{}'".format(builtins.len(exprs), ', '.join(
-                "'{}'".format(e.dtype) for e in exprs)))
-        return min(hl.array(list(exprs)), filter_missing=filter_missing)
+
+    return _comparison_func('min', exprs, filter_missing, filter_nan=True)
 
 
-@typecheck(x=expr_oneof(expr_numeric, expr_array(expr_numeric)))
+@typecheck(exprs=expr_oneof(expr_numeric, expr_set(expr_numeric), expr_array(expr_numeric)),
+           filter_missing=builtins.bool)
+def min(*exprs, filter_missing: builtins.bool = True) -> NumericExpression:
+    """Returns the minimum element of a collection or of given numeric expressions.
+
+    Examples
+    --------
+
+    Take the minimum value of an array:
+
+    >>> hl.eval(hl.min([1, 3, 5, 6, 7, 9]))
+    1
+
+    Take the minimum value of arguments:
+
+    >>> hl.eval(hl.min(1, 50, 2))
+    1
+
+    Notes
+    -----
+    Like the Python builtin ``min`` function, this function can either take a
+    single iterable expression (an array or set of numeric elements), or
+    variable-length arguments of numeric expressions.
+
+    Note
+    ----
+    If `filter_missing` is ``True``, then the result is the minimum of
+    non-missing arguments or elements. If `filter_missing` is ``False``, then
+    any missing argument or element causes the result to be missing.
+
+    If any element or argument is `NaN`, then the result is `NaN`.
+
+    See Also
+    --------
+    :func:`nanmin`, :func:`max`, :func:`nanmax`
+
+    Parameters
+    ----------
+    exprs : :class:`.ArrayExpression` or :class:`.SetExpression` or varargs of :class:`.NumericExpression`
+        Single numeric array or set, or multiple numeric values.
+    filter_missing : :obj:`bool`
+        Remove missing arguments/elements before computing minimum.
+
+    Returns
+    -------
+    :class:`.NumericExpression`
+    """
+    return _comparison_func('min', exprs, filter_missing, filter_nan=False)
+
+
+@typecheck(x=expr_oneof(expr_numeric, expr_array(expr_numeric), expr_ndarray(expr_numeric)))
 def abs(x):
-    """Take the absolute value of a numeric value or array.
+    """Take the absolute value of a numeric value, array or ndarray.
 
     Examples
     --------
@@ -3168,21 +3757,21 @@ def abs(x):
 
     Parameters
     ----------
-    x : :class:`.NumericExpression` or :class:`.ArrayNumericExpression`
+    x : :class:`.NumericExpression`, :class:`.ArrayNumericExpression` or :class:`.NDArrayNumericExpression`
 
     Returns
     -------
-    :class:`.NumericExpression` or :class:`.ArrayNumericExpression`.
+    :class:`.NumericExpression`, :class:`.ArrayNumericExpression` or :class:`.NDArrayNumericExpression`.
     """
-    if isinstance(x.dtype, tarray):
+    if isinstance(x.dtype, tarray) or isinstance(x.dtype, tndarray):
         return map(abs, x)
     else:
         return x._method('abs', x.dtype)
 
 
-@typecheck(x=expr_oneof(expr_numeric, expr_array(expr_numeric)))
+@typecheck(x=expr_oneof(expr_numeric, expr_array(expr_numeric), expr_ndarray(expr_numeric)))
 def sign(x):
-    """Returns the sign of a numeric value or array.
+    """Returns the sign of a numeric value, array or ndarray.
 
     Examples
     --------
@@ -3205,13 +3794,13 @@ def sign(x):
 
     Parameters
     ----------
-    x : :class:`.NumericExpression` or :class:`.ArrayNumericExpression`
+    x : :class:`.NumericExpression`, :class:`.ArrayNumericExpression` or :class:`.NDArrayNumericExpression`
 
     Returns
     -------
-    :class:`.NumericExpression` or :class:`.ArrayNumericExpression`.
+    :class:`.NumericExpression`, :class:`.ArrayNumericExpression` or :class:`.NDArrayNumericExpression`.
     """
-    if isinstance(x.dtype, tarray):
+    if isinstance(x.dtype, tarray) or isinstance(x.dtype, tndarray):
         return map(sign, x)
     else:
         return x._method('sign', x.dtype)
@@ -3246,7 +3835,7 @@ def mean(collection, filter_missing: bool = True) -> Float64Expression:
     -------
     :class:`.Expression` of type :py:data:`.tfloat64`
     """
-    return collection._filter_missing_method(filter_missing, "mean", tfloat64)
+    return array(collection)._filter_missing_method(filter_missing, "mean", tfloat64)
 
 
 @typecheck(collection=expr_oneof(expr_set(expr_numeric), expr_array(expr_numeric)))
@@ -3306,7 +3895,7 @@ def product(collection, filter_missing: bool = True) -> NumericExpression:
     -------
     :class:`.NumericExpression`
     """
-    return collection._filter_missing_method(filter_missing, "product", collection.dtype.element_type)
+    return array(collection)._filter_missing_method(filter_missing, "product", collection.dtype.element_type)
 
 
 @typecheck(collection=expr_oneof(expr_set(expr_numeric), expr_array(expr_numeric)),
@@ -3337,11 +3926,11 @@ def sum(collection, filter_missing: bool = True) -> NumericExpression:
     -------
     :class:`.NumericExpression`
     """
-    return collection._filter_missing_method(filter_missing, "sum", collection.dtype.element_type)
+    return array(collection)._filter_missing_method(filter_missing, "sum", collection.dtype.element_type)
 
 
 @typecheck(a=expr_array(expr_numeric),
-            filter_missing=bool)
+           filter_missing=bool)
 def cumulative_sum(a, filter_missing: bool = True) -> ArrayNumericExpression:
     """Returns an array of the cumulative sum of values in the array.
 
@@ -3426,7 +4015,7 @@ def set(collection) -> SetExpression:
     --------
 
     >>> s = hl.set(['Bob', 'Charlie', 'Alice', 'Bob', 'Bob'])
-    >>> hl.eval(s)  # doctest: +NOTEST
+    >>> hl.eval(s)  # doctest: +SKIP_OUTPUT_CHECK
     {'Alice', 'Bob', 'Charlie'}
 
     Returns
@@ -3436,11 +4025,11 @@ def set(collection) -> SetExpression:
     """
     if isinstance(collection.dtype, tset):
         return collection
-    return apply_expr(lambda c: ToSet(c), tset(collection.dtype.element_type), collection)
+    return apply_expr(lambda c: ir.ToSet(ir.ToStream(c)), tset(collection.dtype.element_type), collection)
 
 
 @typecheck(t=hail_type)
-def empty_set(t: Union[HailType, str]) -> SetExpression:
+def empty_set(t: Union[HailType, builtins.str]) -> SetExpression:
     """Returns an empty set of elements of a type `t`.
 
     Examples
@@ -3484,14 +4073,14 @@ def array(collection) -> ArrayExpression:
     if isinstance(collection.dtype, tarray):
         return collection
     elif isinstance(collection.dtype, tset):
-        return apply_expr(lambda c: ToArray(c), tarray(collection.dtype.element_type), collection)
+        return apply_expr(lambda c: ir.CastToArray(c), tarray(collection.dtype.element_type), collection)
     else:
         assert isinstance(collection.dtype, tdict)
         return _func('dictToArray', tarray(ttuple(collection.dtype.key_type, collection.dtype.value_type)), collection)
 
 
 @typecheck(t=hail_type)
-def empty_array(t: Union[HailType, str]) -> ArrayExpression:
+def empty_array(t: Union[HailType, builtins.str]) -> ArrayExpression:
     """Returns an empty array of elements of a type `t`.
 
     Examples
@@ -3510,12 +4099,110 @@ def empty_array(t: Union[HailType, str]) -> ArrayExpression:
     :class:`.ArrayExpression`
     """
     array_t = hl.tarray(t)
-    ir = MakeArray([], array_t)
-    return construct_expr(ir, array_t)
+    a = ir.MakeArray([], array_t)
+    return construct_expr(a, array_t)
+
+
+def _ndarray(collection, row_major=None, dtype=None):
+    """Construct a Hail ndarray from either a flat Hail array, a `NumPy` ndarray or python value/nested lists.
+
+    Parameters
+    ----------
+    collection : :class:`numpy.ndarray` or :obj:`numeric` or :obj: `list` of `numeric`
+        Type of the array elements.
+    row_major : :obj: `bool` or None
+
+    Returns
+    -------
+    :class:`.NDArrayExpression`
+    """
+    def list_shape(x):
+        if isinstance(x, list) or isinstance(x, builtins.tuple):
+            dim_len = builtins.len(x)
+            if dim_len != 0:
+                first, rest = x[0], x[1:]
+                inner_shape = list_shape(first)
+                for e in rest:
+                    other_inner_shape = list_shape(e)
+                    if inner_shape != other_inner_shape:
+                        raise ValueError(f'inner dimensions do not match: {inner_shape}, {other_inner_shape}')
+                return [dim_len] + inner_shape
+            else:
+                return [dim_len]
+        else:
+            return []
+
+    def deep_flatten(es):
+        result = []
+        for e in es:
+            if isinstance(e, list) or isinstance(e, builtins.tuple):
+                result.extend(deep_flatten(e))
+            else:
+                result.append(e)
+
+        return result
+
+    def check_arrays_uniform(nested_arr, shape_list, ndim):
+        current_level_correct = (hl.len(nested_arr) == shape_list[-ndim])
+        if ndim == 1:
+            return current_level_correct
+        else:
+            return current_level_correct & (hl.all(lambda inner: check_arrays_uniform(inner, shape_list, ndim - 1), nested_arr))
+
+    if isinstance(collection, Expression):
+        if isinstance(collection, ArrayNumericExpression):
+            data_expr = collection
+            shape_expr = to_expr(tuple([hl.int64(hl.len(collection))]), ttuple(tint64))
+            ndim = 1
+        elif isinstance(collection, NumericExpression):
+            data_expr = array([collection])
+            shape_expr = hl.tuple([])
+            ndim = 0
+        elif isinstance(collection, ArrayExpression):
+            recursive_type = collection.dtype
+            ndim = 0
+            while isinstance(recursive_type, tarray) or isinstance(recursive_type, tndarray):
+                recursive_type = recursive_type._element_type
+                ndim += 1
+
+            data_expr = collection
+            for i in builtins.range(ndim - 1):
+                data_expr = hl.flatten(data_expr)
+
+            nested_collection = collection
+            shape_list = []
+            for i in builtins.range(ndim):
+                shape_list.append(hl.int64(hl.len(nested_collection)))
+                nested_collection = nested_collection[0]
+
+            shape_expr = (hl.case().when(check_arrays_uniform(collection, shape_list, ndim), hl.tuple(shape_list))
+                                   .or_error("inner dimensions do not match"))
+
+        else:
+            raise ValueError(f"{collection} cannot be converted into an ndarray")
+
+    else:
+        if isinstance(collection, np.ndarray):
+            return hl.literal(collection)
+        elif isinstance(collection, list) or isinstance(collection, builtins.tuple):
+            shape = list_shape(collection)
+            data = deep_flatten(collection)
+        else:
+            shape = []
+            data = [collection]
+
+        shape_expr = to_expr(tuple([hl.int64(i) for i in shape]), ttuple(*[tint64 for _ in shape]))
+        data_expr = hl.array(data) if data else hl.empty_array("float64")
+        ndim = builtins.len(shape)
+
+    data_expr = data_expr.map(lambda value: cast_expr(value, dtype))
+    ndir = ir.MakeNDArray(data_expr._ir, shape_expr._ir, hl.bool(True)._ir)
+
+    return construct_expr(ndir, tndarray(data_expr.dtype.element_type, ndim))
 
 
 @typecheck(key_type=hail_type, value_type=hail_type)
-def empty_dict(key_type: Union[HailType, str], value_type: Union[HailType, str]) -> DictExpression:
+def empty_dict(key_type: Union[HailType, builtins.str], value_type: Union[HailType, builtins.str]) -> DictExpression:
     """Returns an empty dictionary with key type `key_type` and value type
     `value_type`.
 
@@ -3603,18 +4290,18 @@ def _compare(left, right):
     if left.dtype != right.dtype:
         raise TypeError(f"'compare' expected 'left' and 'right' to have the same type: found {left.dtype} vs {right.dtype}")
     indices, aggregations = unify_all(left, right)
-    return construct_expr(ApplyComparisonOp("Compare", left._ir, right._ir), tint32, indices, aggregations)
+    return construct_expr(ir.ApplyComparisonOp("Compare", left._ir, right._ir), tint32, indices, aggregations)
 
 
 @typecheck(collection=expr_array(),
            less_than=nullable(func_spec(2, expr_bool)))
 def _sort_by(collection, less_than):
-    l = Env.get_uid()
-    r = Env.get_uid()
-    left = construct_expr(Ref(l), collection.dtype.element_type, collection._indices, collection._aggregations)
-    right = construct_expr(Ref(r), collection.dtype.element_type, collection._indices, collection._aggregations)
+    left_id = Env.get_uid()
+    right_id = Env.get_uid()
+    left = construct_expr(ir.Ref(left_id), collection.dtype.element_type, collection._indices, collection._aggregations)
+    right = construct_expr(ir.Ref(right_id), collection.dtype.element_type, collection._indices, collection._aggregations)
     return construct_expr(
-        ArraySort(collection._ir, l, r, less_than(left, right)._ir),
+        ir.ArraySort(ir.ToStream(collection._ir), left_id, right_id, less_than(left, right)._ir),
         collection.dtype,
         collection._indices,
         collection._aggregations)
@@ -3624,7 +4311,7 @@ def _sort_by(collection, less_than):
            key=nullable(func_spec(1, expr_any)),
            reverse=expr_bool)
 def sorted(collection,
-           key: Optional[Callable]=None,
+           key: Optional[Callable] = None,
            reverse=False) -> ArrayExpression:
     """Returns a sorted array.
 
@@ -3661,12 +4348,12 @@ def sorted(collection,
         Sorted array.
     """
 
-    def comp(l, r):
+    def comp(left, right):
         return (hl.case()
-                .when(hl.is_missing(l), False)
-                .when(hl.is_missing(r), True)
-                .when(reverse, hl._compare(r, l) < 0)
-                .default(hl._compare(l, r) < 0))
+                .when(hl.is_missing(left), False)
+                .when(hl.is_missing(right), True)
+                .when(reverse, hl._compare(right, left) < 0)
+                .default(hl._compare(left, right) < 0))
 
     if key is None:
         return _sort_by(collection, comp)
@@ -3772,13 +4459,13 @@ def float64(x) -> Float64Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.float64('1.1'))  # doctest: +NOTEST
+    >>> hl.eval(hl.float64('1.1'))  # doctest: +SKIP_OUTPUT_CHECK
     1.1
 
-    >>> hl.eval(hl.float64(1))  # doctest: +NOTEST
+    >>> hl.eval(hl.float64(1))  # doctest: +SKIP_OUTPUT_CHECK
     1.0
 
-    >>> hl.eval(hl.float64(True))  # doctest: +NOTEST
+    >>> hl.eval(hl.float64(True))  # doctest: +SKIP_OUTPUT_CHECK
     1.0
 
     Parameters
@@ -3794,6 +4481,36 @@ def float64(x) -> Float64Expression:
     else:
         return x._method("toFloat64", tfloat64)
 
+
+@typecheck(x=expr_str)
+def parse_float64(x) -> Float64Expression:
+    """Parse a string as a 64-bit floating point number.
+
+    Examples
+    --------
+
+    >>> hl.eval(hl.parse_float64('1.1'))  # doctest: +SKIP_OUTPUT_CHECK
+    1.1
+
+    >>> hl.eval(hl.parse_float64('asdf'))
+    None
+
+    Notes
+    -----
+    If the input is an invalid floating point number, then result of this call will be missing.
+
+    Parameters
+    ----------
+    x : :class:`.StringExpression`
+
+    Returns
+    -------
+    :class:`.NumericExpression` of type :py:data:`.tfloat64`
+
+    """
+    return x._method("toFloat64OrMissing", tfloat64)
+
+
 @typecheck(x=expr_oneof(expr_numeric, expr_bool, expr_str))
 def float32(x) -> Float32Expression:
     """Convert to a 32-bit floating point expression.
@@ -3801,13 +4518,13 @@ def float32(x) -> Float32Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.float32('1.1'))  # doctest: +NOTEST
+    >>> hl.eval(hl.float32('1.1'))  # doctest: +SKIP_OUTPUT_CHECK
     1.1
 
-    >>> hl.eval(hl.float32(1))  # doctest: +NOTEST
+    >>> hl.eval(hl.float32(1))  # doctest: +SKIP_OUTPUT_CHECK
     1.0
 
-    >>> hl.eval(hl.float32(True))  # doctest: +NOTEST
+    >>> hl.eval(hl.float32(True))  # doctest: +SKIP_OUTPUT_CHECK
     1.0
 
     Parameters
@@ -3822,6 +4539,36 @@ def float32(x) -> Float32Expression:
         return x
     else:
         return x._method("toFloat32", tfloat32)
+
+
+@typecheck(x=expr_str)
+def parse_float32(x) -> Float32Expression:
+    """Parse a string as a 32-bit floating point number.
+
+    Examples
+    --------
+
+    >>> hl.eval(hl.parse_float32('1.1'))  # doctest: +SKIP_OUTPUT_CHECK
+    1.1
+
+    >>> hl.eval(hl.parse_float32('asdf'))
+    None
+
+    Notes
+    -----
+    If the input is an invalid floating point number, then result of this call will be missing.
+
+    Parameters
+    ----------
+    x : :class:`.StringExpression`
+
+    Returns
+    -------
+    :class:`.NumericExpression` of type :py:data:`.tfloat32`
+
+    """
+    return x._method("toFloat32OrMissing", tfloat32)
+
 
 @typecheck(x=expr_oneof(expr_numeric, expr_bool, expr_str))
 def int64(x) -> Int64Expression:
@@ -3853,6 +4600,38 @@ def int64(x) -> Int64Expression:
         return x._method("toInt64", tint64)
 
 
+@typecheck(x=expr_str)
+def parse_int64(x) -> Int64Expression:
+    """Parse a string as a 64-bit integer.
+
+    Examples
+    --------
+
+    >>> hl.eval(hl.parse_int64('154'))
+    154
+
+    >>> hl.eval(hl.parse_int64('15.4'))
+    None
+
+    >>> hl.eval(hl.parse_int64('asdf'))
+    None
+
+    Notes
+    -----
+    If the input is an invalid integer, then result of this call will be missing.
+
+    Parameters
+    ----------
+    x : :class:`.StringExpression`
+
+    Returns
+    -------
+    :class:`.NumericExpression` of type :py:data:`.tint64`
+
+    """
+    return x._method("toInt64OrMissing", tint64)
+
+
 @typecheck(x=expr_oneof(expr_numeric, expr_bool, expr_str))
 def int32(x) -> Int32Expression:
     """Convert to a 32-bit integer expression.
@@ -3881,6 +4660,39 @@ def int32(x) -> Int32Expression:
         return x
     else:
         return x._method("toInt32", tint32)
+
+
+@typecheck(x=expr_str)
+def parse_int32(x) -> Int32Expression:
+    """Parse a string as a 32-bit integer.
+
+    Examples
+    --------
+
+    >>> hl.eval(hl.parse_int32('154'))
+    154
+
+    >>> hl.eval(hl.parse_int32('15.4'))
+    None
+
+    >>> hl.eval(hl.parse_int32('asdf'))
+    None
+
+    Notes
+    -----
+    If the input is an invalid integer, then result of this call will be missing.
+
+    Parameters
+    ----------
+    x : :class:`.StringExpression`
+
+    Returns
+    -------
+    :class:`.NumericExpression` of type :py:data:`.tint32`
+
+    """
+    return x._method("toInt32OrMissing", tint32)
+
 
 @typecheck(x=expr_oneof(expr_numeric, expr_bool, expr_str))
 def int(x) -> Int32Expression:
@@ -3913,6 +4725,38 @@ def int(x) -> Int32Expression:
     return int32(x)
 
 
+@typecheck(x=expr_str)
+def parse_int(x) -> Int32Expression:
+    """Parse a string as a 32-bit integer.
+
+    Examples
+    --------
+
+    >>> hl.eval(hl.parse_int('154'))
+    154
+
+    >>> hl.eval(hl.parse_int('15.4'))
+    None
+
+    >>> hl.eval(hl.parse_int('asdf'))
+    None
+
+    Notes
+    -----
+    If the input is an invalid integer, then result of this call will be missing.
+
+    Parameters
+    ----------
+    x : :class:`.StringExpression`
+
+    Returns
+    -------
+    :class:`.NumericExpression` of type :py:data:`.tint32`
+
+    """
+    return parse_int32(x)
+
+
 @typecheck(x=expr_oneof(expr_numeric, expr_bool, expr_str))
 def float(x) -> Float64Expression:
     """Convert to a 64-bit floating point expression.
@@ -3942,6 +4786,35 @@ def float(x) -> Float64Expression:
     :class:`.NumericExpression` of type :py:data:`.tfloat64`
     """
     return float64(x)
+
+
+@typecheck(x=expr_str)
+def parse_float(x) -> Float64Expression:
+    """Parse a string as a 64-bit floating point number.
+
+    Examples
+    --------
+
+    >>> hl.eval(hl.parse_float('1.1'))  # doctest: +SKIP_OUTPUT_CHECK
+    1.1
+
+    >>> hl.eval(hl.parse_float('asdf'))
+    None
+
+    Notes
+    -----
+    If the input is an invalid floating point number, then result of this call will be missing.
+
+    Parameters
+    ----------
+    x : :class:`.StringExpression`
+
+    Returns
+    -------
+    :class:`.NumericExpression` of type :py:data:`.tfloat64`
+
+    """
+    return parse_float64(x)
 
 
 @typecheck(x=expr_oneof(expr_numeric, expr_bool, expr_str))
@@ -3979,6 +4852,42 @@ def bool(x) -> BooleanExpression:
         return x != 0
     else:
         return x._method("toBoolean", tbool)
+
+
+@typecheck(s=expr_str,
+           rna=builtins.bool)
+def reverse_complement(s, rna=False):
+    """Reverses the string and translates base pairs into their complements
+    Examples
+    --------
+    >>> bases = hl.literal('NNGATTACA')
+    >>> hl.eval(hl.reverse_complement(bases))
+    'TGTAATCNN'
+
+    Parameters
+    ----------
+    s : :class:`.StringExpression`
+        Base string.
+    rna : :obj:`bool`
+        If ``True``, pair adenine (A) with uracil (U) instead of thymine (T).
+
+    Returns
+    -------
+    :class:`.StringExpression`
+    """
+    s = s.reverse()
+
+    if rna:
+        pairs = [('A', 'U'), ('U', 'A'), ('T', 'A'), ('G', 'C'), ('C', 'G')]
+    else:
+        pairs = [('A', 'T'), ('T', 'A'), ('G', 'C'), ('C', 'G')]
+
+    d = {}
+    for b1, b2 in pairs:
+        d[b1] = b2
+        d[b1.lower()] = b2.lower()
+
+    return s.translate(d)
 
 
 @typecheck(contig=expr_str,
@@ -4028,8 +4937,9 @@ def get_sequence(contig, position, before=0, after=0, reference_genome='default'
 
     if not reference_genome.has_sequence():
         raise TypeError("Reference genome '{}' does not have a sequence loaded. Use 'add_sequence' to load the sequence from a FASTA file.".format(reference_genome.name))
-    return _func("getReferenceSequence({})".format(reference_genome.name), tstr,
-                 contig, position, before, after)
+
+    return _func("getReferenceSequence", tstr, contig, position, before, after, type_args=(tlocus(reference_genome), ))
+
 
 @typecheck(contig=expr_str,
            reference_genome=reference_genome_type)
@@ -4039,10 +4949,10 @@ def is_valid_contig(contig, reference_genome='default') -> BooleanExpression:
     Examples
     --------
 
-    >>> hl.eval(hl.is_valid_contig('1', 'GRCh37'))
+    >>> hl.eval(hl.is_valid_contig('1', reference_genome='GRCh37'))
     True
 
-    >>> hl.eval(hl.is_valid_contig('chr1', 'GRCh37'))
+    >>> hl.eval(hl.is_valid_contig('chr1', reference_genome='GRCh37'))
     False
 
     Parameters
@@ -4054,7 +4964,31 @@ def is_valid_contig(contig, reference_genome='default') -> BooleanExpression:
     -------
     :class:`.BooleanExpression`
     """
-    return _func("isValidContig({})".format(reference_genome.name), tbool, contig)
+    return _func("isValidContig", tbool, contig, type_args=(tlocus(reference_genome), ))
+
+
+@typecheck(contig=expr_str,
+           reference_genome=reference_genome_type)
+def contig_length(contig, reference_genome='default') -> Int32Expression:
+    """Returns the length of `contig` in `reference_genome`.
+
+    Examples
+    --------
+
+    >>> hl.eval(hl.contig_length('5', reference_genome='GRCh37'))
+    180915260
+
+    Parameters
+    ----------
+    contig : :class:`.Expression` of type :py:data:`.tstr`
+    reference_genome : :obj:`str` or :class:`.ReferenceGenome`
+
+    Returns
+    -------
+    :class:`.Int32Expression`
+    """
+    return _func("contigLength", tint32, contig, type_args=(tlocus(reference_genome), ))
+
 
 @typecheck(contig=expr_str,
            position=expr_int32,
@@ -4081,7 +5015,8 @@ def is_valid_locus(contig, position, reference_genome='default') -> BooleanExpre
     -------
     :class:`.BooleanExpression`
     """
-    return _func("isValidLocus({})".format(reference_genome.name), tbool, contig, position)
+    return _func("isValidLocus", tbool, contig, position, type_args=(tlocus(reference_genome), ))
+
 
 @typecheck(locus=expr_locus(), is_female=expr_bool, father=expr_call, mother=expr_call, child=expr_call)
 def mendel_error_code(locus, is_female, father, mother, child):
@@ -4192,8 +5127,8 @@ def mendel_error_code(locus, is_female, father, mother, child):
             .when(locus.in_autosome_or_par() | is_female, auto_cond)
             .when(locus.in_x_nonpar() & (~is_female), hemi_x_cond)
             .when(locus.in_y_nonpar() & (~is_female), hemi_y_cond)
-            .or_missing()
-            )
+            .or_missing())
+
 
 @typecheck(locus=expr_locus(), alleles=expr_array(expr_str))
 def min_rep(locus, alleles):
@@ -4227,6 +5162,7 @@ def min_rep(locus, alleles):
     """
     ret_type = tstruct(locus=locus.dtype, alleles=alleles.dtype)
     return _func('min_rep', ret_type, locus, alleles)
+
 
 @typecheck(x=oneof(expr_locus(), expr_interval(expr_locus())),
            dest_reference_genome=reference_genome_type,
@@ -4294,18 +5230,18 @@ def liftover(x, dest_reference_genome, min_match=0.95, include_strand=False):
 
     if isinstance(x.dtype, tlocus):
         rg = x.dtype.reference_genome
-        method_name = "liftoverLocus({})({})".format(rg.name, dest_reference_genome.name)
+        method_name = "liftoverLocus"
         rtype = tstruct(result=tlocus(dest_reference_genome), is_negative_strand=tbool)
     else:
         rg = x.dtype.point_type.reference_genome
-        method_name = "liftoverLocusInterval({})({})".format(rg.name, dest_reference_genome.name)
+        method_name = "liftoverLocusInterval"
         rtype = tstruct(result=tinterval(tlocus(dest_reference_genome)), is_negative_strand=tbool)
 
     if not rg.has_liftover(dest_reference_genome.name):
         raise TypeError("""Reference genome '{}' does not have liftover to '{}'.
         Use 'add_liftover' to load a liftover chain file.""".format(rg.name, dest_reference_genome.name))
 
-    expr = _func(method_name, rtype, x, to_expr(min_match, tfloat))
+    expr = _func(method_name, rtype, x, to_expr(min_match, tfloat64))
     if not include_strand:
         expr = expr.result
     return expr
@@ -4313,8 +5249,11 @@ def liftover(x, dest_reference_genome, min_match=0.95, include_strand=False):
 
 @typecheck(f=func_spec(1, expr_float64),
            min=expr_float64,
-           max=expr_float64)
-def uniroot(f: Callable, min, max):
+           max=expr_float64,
+           max_iter=builtins.int,
+           epsilon=builtins.float,
+           tolerance=builtins.float)
+def uniroot(f: Callable, min, max, *, max_iter=1000, epsilon=2.2204460492503131e-16, tolerance=1.220703e-4):
     """Finds a root of the function `f` within the interval `[min, max]`.
 
     Examples
@@ -4329,12 +5268,24 @@ def uniroot(f: Callable, min, max):
 
     If no root can be found, the result of this call will be `NA` (missing).
 
+    :func:`.uniroot` returns an estimate for a root with accuracy
+    `4 * epsilon * abs(x) + tolerance`.
+
+    4*EPSILON*abs(x) + tol
+
     Parameters
     ----------
     f : function ( (arg) -> :class:`.Float64Expression`)
         Must return a :class:`.Float64Expression`.
     min : :class:`.Float64Expression`
     max : :class:`.Float64Expression`
+    max_iter : `int`
+        The maximum number of iterations before giving up.
+    epsilon : `float`
+        The scaling factor in the accuracy of the root found.
+    tolerance : `float`
+        The constant factor in approximate accuracy of the root found.
+
 
     Returns
     -------
@@ -4342,12 +5293,65 @@ def uniroot(f: Callable, min, max):
         The root of the function `f`.
     """
 
-    new_id = Env.get_uid()
-    lambda_result = to_expr(f(construct_variable(new_id, hl.tfloat64)))
+    # Based on:
+    # https://github.com/wch/r-source/blob/e5b21d0397c607883ff25cca379687b86933d730/src/library/stats/src/zeroin.c
 
-    indices, aggregations = unify_all(lambda_result, min, max)
-    ir = Uniroot(new_id, lambda_result._ir, min._ir, max._ir)
-    return construct_expr(ir, lambda_result._type, indices, aggregations)
+    def error_if_missing(x):
+        res = f(x)
+        return (case()
+                .when(is_defined(res), res)
+                .or_error(format("'uniroot': value of f(x) is missing for x = %.1e", x)))
+    wrapped_f = hl.experimental.define_function(error_if_missing, 'float')
+
+    def uniroot(recur, a, b, c, fa, fb, fc, prev, iterations_remaining):
+        tol = 2 * epsilon * abs(b) + tolerance / 2
+        cb = c - b
+        t1 = fb / fc
+        t2 = fb / fa
+        q1 = fa / fc  # = t1 / t2
+        pq = cond(
+            a == c,
+            (cb * t1) / (t1 - 1.0),  # linear
+            -t2 * (cb * q1 * (q1 - t1) - (b - a) * (t1 - 1.0))
+            / ((q1 - 1.0) * (t1 - 1.0) * (t2 - 1.0)))  # quadratic
+
+        interpolated = cond((sign(pq) == sign(cb))
+                            & (.75 * abs(cb) > abs(pq) + tol / 2)  # b + pq within [b, c]
+                            & (abs(pq) < abs(prev / 2)),  # pq not too large
+                            pq, cb / 2)
+
+        new_step = cond(
+            (abs(prev) >= tol) & (abs(fa) > abs(fb)),  # try interpolation
+            interpolated, cb / 2)
+
+        new_b = b + cond(new_step < 0, hl.min(new_step, -tol), hl.max(new_step, tol))
+        new_fb = wrapped_f(new_b)
+
+        return cond(
+            iterations_remaining == 0,
+            null('float'),
+            cond(abs(fc) < abs(fb),
+                 recur(b, c, b, fb, fc, fb, prev, iterations_remaining),
+                 cond((abs(cb / 2) <= tol) | (fb == 0),
+                      b,  # acceptable approximation found
+                      cond(sign(new_fb) == sign(fc),  # use c = b for next iteration if signs match
+                           recur(b, new_b, b, fb, new_fb, fb, new_step, iterations_remaining - 1),
+                           recur(b, new_b, c, fb, new_fb, fc, new_step, iterations_remaining - 1)
+                           ))))
+
+    fmin = wrapped_f(min)
+    fmax = wrapped_f(max)
+    run_loop = hl.experimental.define_function(
+        lambda min, max, fmin, fmax:
+        hl.experimental.loop(uniroot, 'float',
+                             min, max, min, fmin, fmax, fmin, max - min, max_iter),
+        'float', 'float', 'float', 'float')
+
+    return (case()
+            .when(min < max, case()
+                  .when(fmin * fmax <= 0, run_loop(min, max, fmin, fmax))
+                  .or_error(format("'uniroot': sign of endpoints must have opposite signs, got: f(min) = %.1e, f(max) = %.1e", fmin, fmax)))
+            .or_error(format("'uniroot': min must be less than max in call to uniroot, got: min %.1e, max %.1e", min, max)))
 
 
 @typecheck(f=expr_str, args=expr_any)
@@ -4364,7 +5368,7 @@ def format(f, *args):
     'null'
 
     >>> hl.eval(hl.format('%s %s %s', 'hello', hl.tuple([3, hl.locus('1', 2453)]), True))
-    'hello [3,1:2453] true'
+    'hello (3, 1:2453) true'
 
     Notes
     -----
@@ -4434,9 +5438,10 @@ def _shift_op(x, y, op):
     indices, aggregations = unify_all(x, y)
     return hl.bind(lambda x, y: (
         hl.case()
-            .when(y >= word_size, hl.sign(x) if op == '>>' else zero)
-            .when(y > 0, construct_expr(ApplyBinaryOp(op, x._ir, y._ir), t, indices, aggregations))
-            .or_error('cannot shift by a negative value: ' + hl.str(x) + f" {op} " + hl.str(y))), x, y)
+        .when(y >= word_size, hl.sign(x) if op == '>>' else zero)
+        .when(y > 0, construct_expr(ir.ApplyBinaryPrimOp(op, x._ir, y._ir), t, indices, aggregations))
+        .or_error('cannot shift by a negative value: ' + hl.str(x) + f" {op} " + hl.str(y))), x, y)
+
 
 def _bit_op(x, y, op):
     if x.dtype == hl.tint32 and y.dtype == hl.tint32:
@@ -4448,7 +5453,7 @@ def _bit_op(x, y, op):
     y = coercer.coerce(y)
 
     indices, aggregations = unify_all(x, y)
-    return construct_expr(ApplyBinaryOp(op, x._ir, y._ir), t, indices, aggregations)
+    return construct_expr(ir.ApplyBinaryPrimOp(op, x._ir, y._ir), t, indices, aggregations)
 
 
 @typecheck(x=expr_oneof(expr_int32, expr_int64), y=expr_oneof(expr_int32, expr_int64))
@@ -4643,15 +5648,96 @@ def bit_not(x):
     -------
     :class:`.Int32Expression` or :class:`.Int64Expression`
     """
-    return construct_expr(ApplyUnaryOp('~', x._ir), x.dtype, x._indices, x._aggregations)
+    return construct_expr(ir.ApplyUnaryPrimOp('~', x._ir), x.dtype, x._indices, x._aggregations)
+
+
+@typecheck(array=expr_array(expr_numeric), elem=expr_numeric)
+def binary_search(array, elem) -> Int32Expression:
+    """Binary search `array` for the insertion point of `elem`.
+
+    Parameters
+    ----------
+    array : :class:`.Expression` of type :class:`.tarray`
+    elem : :class:`.Expression`
+
+    Returns
+    -------
+    :class:`.Int32Expression`
+
+    Notes
+    -----
+    This function assumes that `array` is sorted in ascending order, and does
+    not perform any sortedness check. Missing values sort last.
+
+    The returned index is the lower bound on the insertion point of `elem` into
+    the ordered array, or the index of the first element in `array` not smaller
+    than `elem`. This is a value between 0 and the length of `array`, inclusive
+    (if all elements in `array` are smaller than `elem`, the returned value is
+    the length of `array` or the index of the first missing value, if one
+    exists).
+
+    If either `elem` or `array` is missing, the result is missing.
+
+    Examples
+    --------
+
+    >>> a = hl.array([0, 2, 4, 8])
+
+    >>> hl.eval(hl.binary_search(a, -1))
+    0
+
+    >>> hl.eval(hl.binary_search(a, 1))
+    1
+
+    >>> hl.eval(hl.binary_search(a, 10))
+    4
+
+    """
+    c = coercer_from_dtype(array.dtype.element_type)
+    if not c.can_coerce(elem.dtype):
+        raise TypeError(f"'binary_search': cannot search an array of type {array.dtype} for a value of type {elem.dtype}")
+    elem = c.coerce(elem)
+    return hl.switch(elem).when_missing(hl.null(hl.tint32)).default(_lower_bound(array, elem))
 
 
 @typecheck(s=expr_str)
 def _escape_string(s):
     return _func("escapeString", hl.tstr, s)
 
-@typecheck(l=expr_any, r=expr_any, tolerance=expr_float64, absolute=expr_bool)
-def _values_similar(l, r, tolerance=1e-6, absolute=False):
-    assert l.dtype == r.dtype
-    return ((is_missing(l) & is_missing(r))
-            | ((is_defined(l) & is_defined(r)) & _func("valuesSimilar", hl.tbool, l, r, tolerance, absolute)))
+
+@typecheck(left=expr_any, right=expr_any, tolerance=expr_float64, absolute=expr_bool)
+def _values_similar(left, right, tolerance=1e-6, absolute=False):
+    assert left.dtype == right.dtype
+    return ((is_missing(left) & is_missing(right))
+            | ((is_defined(left) & is_defined(right)) & _func("valuesSimilar", hl.tbool, left, right, tolerance, absolute)))
+
+
+@typecheck(coords=expr_array(expr_array(expr_float64)), radius=expr_float64)
+def _locus_windows_per_contig(coords, radius):
+    rt = hl.ttuple(hl.tarray(hl.tint32), hl.tarray(hl.tint32))
+    return _func("locus_windows_per_contig", rt, coords, radius)
+
+
+@typecheck(a=expr_array(),
+           seed=nullable(builtins.int))
+def shuffle(a, seed: builtins.int = None) -> ArrayExpression:
+    """Randomly permute an array
+
+    Example
+    -------
+
+    >>> hl.eval(hl.shuffle(hl.range(5)))  # doctest: +SKIP_OUTPUT_CHECK
+    [4, 2, 0, 3, 1]
+
+    Parameters
+    ----------
+    a : :class:`.ArrayExpression`
+        Array to permute.
+    seed : :obj:`int`, optional
+        Random seed.
+
+    Returns
+    -------
+    :class:`.ArrayExpression`
+    """
+    return sorted(a, key=lambda _: hl.rand_unif(0.0, 1.0, seed=seed))

@@ -2,7 +2,7 @@ STATIC_CONFIG = letsencrypt-pod.yaml letsencrypt.sh
 
 .PHONY: $(STATIC_CONFIG) build push start-service run clean
 
-PROJECT = $(shell gcloud config get-value project)
+PROJECT := $(shell gcloud config get-value project)
 DOMAIN ?= hail.is
 
 $(STATIC_CONFIG): %: %.in
@@ -20,7 +20,7 @@ push: build
 	docker push gcr.io/$(PROJECT)/letsencrypt
 
 start-service: service.yaml
-	kubectl apply -f service.yaml
+	kubectl -n default apply -f service.yaml
 
 run: letsencrypt-pod.yaml service.yaml push
 	/bin/bash run-letsencrypt.sh

@@ -1,7 +1,7 @@
 package is.hail.io.compress;
 
 import htsjdk.samtools.util.BlockCompressedFilePointerUtil;
-import org.apache.hadoop.fs.Seekable;
+import is.hail.io.fs.Seekable;
 import org.apache.hadoop.io.compress.SplitCompressionInputStream;
 import org.apache.hadoop.io.compress.SplittableCompressionCodec;
 import java.io.ByteArrayInputStream;
@@ -101,7 +101,12 @@ public class BGzipInputStream extends SplitCompressionInputStream {
         super(in, start, end);
 
         assert (readMode == SplittableCompressionCodec.READ_MODE.BYBLOCK);
-        ((Seekable) in).seek(start);
+        if (in instanceof org.apache.hadoop.fs.Seekable)
+            ((org.apache.hadoop.fs.Seekable) in).seek(start);
+        else {
+            assert(in instanceof Seekable);
+            ((Seekable)in).seek(start);
+        }
         resetState();
         decompressNextBlock();
 
@@ -214,41 +219,60 @@ public class BGzipInputStream extends SplitCompressionInputStream {
     }
 
     public int read() throws IOException {
-        byte b[] = new byte[1];
-        int result = this.read(b, 0, 1);
-        return (result < 0) ? result : (b[0] & 0xff);
+        if (outputBufferSize == 0)
+            return -1; // EOF
+
+        if (outputBufferPos == 0)
+            currentPos = inputBufferInPos + 1;
+
+        int r = outputBuffer[outputBufferPos];
+        outputBufferPos += 1;
+
+        if (outputBufferPos == outputBufferSize)
+            decompressNextBlock();
+
+        return r & 0xff;
     }
 
     public void resetState() throws IOException {
         inputBufferSize = 0;
         inputBufferPos = 0;
-        inputBufferInPos = ((Seekable) in).getPos();
+
+        if (in instanceof org.apache.hadoop.fs.Seekable)
+            inputBufferInPos = ((org.apache.hadoop.fs.Seekable) in).getPos();
+        else {
+            assert (in instanceof Seekable);
+            inputBufferInPos = ((Seekable) in).getPosition();
+        }
 
         outputBufferSize = 0;
         outputBufferPos = 0;
 
         // find first block
         fillInputBuffer();
-        boolean foundBlock = false;
+
+        // the beginning of the file must be a valid bgzip block
+        if (inputBufferInPos == 0) {
+            new BGzipHeader(inputBuffer, 0, inputBufferSize);
+            // inputBufferPos already 0
+            return;
+        }
+
         for (int i = 0; i < inputBufferSize - 1; ++i) {
             if ((inputBuffer[i] & 0xff) == 31
                     && (inputBuffer[i + 1] & 0xff) == 139) {
                 try {
                     new BGzipHeader(inputBuffer, i, inputBufferSize);
-
                     inputBufferPos = i;
-                    foundBlock = true;
-                    break;
+                    return;
                 } catch (ZipException e) {
 
                 }
             }
         }
 
-        if (!foundBlock) {
-            assert (inputBufferSize < BGZF_MAX_BLOCK_SIZE);
-            inputBufferPos = inputBufferSize;
-        }
+        assert (inputBufferSize < BGZF_MAX_BLOCK_SIZE);
+        inputBufferPos = inputBufferSize;
     }
 
     // pos is a virtual file pointer, it is not a strict offset into the compressed data.
@@ -259,7 +283,13 @@ public class BGzipInputStream extends SplitCompressionInputStream {
         final long compOff = BlockCompressedFilePointerUtil.getBlockAddress(pos);
         final int uncompOff = BlockCompressedFilePointerUtil.getBlockOffset(pos);
         if (inputBufferInPos != compOff) {
-            ((Seekable) in).seek(compOff);
+            if (in instanceof org.apache.hadoop.fs.Seekable)
+                ((org.apache.hadoop.fs.Seekable) in).seek(compOff);
+            else {
+                assert(in instanceof Seekable);
+                ((Seekable) in).seek(compOff);
+            }
+
             inputBufferSize = 0;
             inputBufferPos = 0;
             inputBufferInPos = compOff;

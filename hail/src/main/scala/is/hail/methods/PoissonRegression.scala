@@ -1,37 +1,37 @@
 package is.hail.methods
 
 import breeze.linalg._
+import is.hail.HailContext
 import is.hail.annotations._
 import is.hail.expr.ir.functions.MatrixToTableFunction
-import is.hail.expr.ir.{MatrixValue, TableValue}
-import is.hail.expr.types.virtual.{TFloat64, TStruct}
-import is.hail.expr.types.{MatrixType, TableType}
+import is.hail.expr.ir.{ExecuteContext, MatrixValue, TableValue}
+import is.hail.types.virtual.{TFloat64, TStruct}
+import is.hail.types.{MatrixType, TableType}
 import is.hail.rvd.RVDType
 import is.hail.stats._
 import is.hail.utils._
-import org.apache.spark.storage.StorageLevel
 
 case class PoissonRegression(
   test: String,
   yField: String,
   xField: String,
-  covFields: Array[String],
-  passThrough: Array[String]) extends MatrixToTableFunction {
+  covFields: Seq[String],
+  passThrough: Seq[String]) extends MatrixToTableFunction {
 
-  def typeInfo(childType: MatrixType, childRVDType: RVDType): (TableType, RVDType) = {
+  override def typ(childType: MatrixType): TableType = {
     val poisRegTest = PoissonRegressionTest.tests(test)
     val passThroughType = TStruct(passThrough.map(f => f -> childType.rowType.field(f).typ): _*)
-    val tableType = TableType(childType.rowKeyStruct ++ passThroughType ++ poisRegTest.schema, childType.rowKey, TStruct())
-    (tableType, tableType.canonicalRVDType)
+    TableType(childType.rowKeyStruct ++ passThroughType ++ poisRegTest.schema, childType.rowKey, TStruct.empty)
   }
 
   def preservesPartitionCounts: Boolean = true
 
-  def execute(mv: MatrixValue): TableValue = {
+  def execute(ctx: ExecuteContext, mv: MatrixValue): TableValue = {
     val poisRegTest = PoissonRegressionTest.tests(test)
-    val (tableType, newRVDType) = typeInfo(mv.typ, mv.rvd.typ)
+    val tableType = typ(mv.typ)
+    val newRVDType = tableType.canonicalRVDType
 
-    val (y, cov, completeColIdx) = RegressionUtils.getPhenoCovCompleteSamples(mv, yField, covFields)
+    val (y, cov, completeColIdx) = RegressionUtils.getPhenoCovCompleteSamples(mv, yField, covFields.toArray)
 
     if (!y.forall(yi => math.floor(yi) == yi && yi >= 0))
       fatal(s"For poisson regression, y must be numeric with all values non-negative integers")
@@ -58,51 +58,47 @@ case class PoissonRegression(
         else
           "Newton iteration failed to converge"))
 
-    val sc = mv.sparkContext
-    val completeColIdxBc = sc.broadcast(completeColIdx)
+    val backend = HailContext.backend
+    val completeColIdxBc = backend.broadcast(completeColIdx)
 
-    val yBc = sc.broadcast(y)
-    val XBc = sc.broadcast(new DenseMatrix[Double](n, k + 1, cov.toArray ++ Array.ofDim[Double](n)))
-    val nullFitBc = sc.broadcast(nullFit)
-    val poisRegTestBc = sc.broadcast(poisRegTest)
+    val yBc = backend.broadcast(y)
+    val XBc = backend.broadcast(new DenseMatrix[Double](n, k + 1, cov.toArray ++ Array.ofDim[Double](n)))
+    val nullFitBc = backend.broadcast(nullFit)
+    val poisRegTestBc = backend.broadcast(poisRegTest)
 
-    val fullRowType = mv.typ.rvRowType.physicalType
-    val entryArrayType = mv.typ.entryArrayType.physicalType
-    val entryType = mv.typ.entryType.physicalType
+    val fullRowType = mv.rvRowPType
+    val entryArrayType = mv.entryArrayPType
+    val entryType = mv.entryPType
     val fieldType = entryType.field(xField).typ
 
-    assert(fieldType.virtualType.isOfType(TFloat64()))
+    assert(fieldType.virtualType == TFloat64)
 
-    val entryArrayIdx = mv.typ.entriesIdx
+    val entryArrayIdx = mv.entriesIdx
     val fieldIdx = entryType.fieldIdx(xField)
 
-    val copiedFieldIndices = (mv.typ.rowKey ++ passThrough).map(mv.typ.rvRowType.fieldIdx(_)).toArray
+    val copiedFieldIndices = (mv.typ.rowKey ++ passThrough).map(mv.rvRowType.fieldIdx(_)).toArray
 
-    val newRVD = mv.rvd.mapPartitions(newRVDType) { it =>
-      val rvb = new RegionValueBuilder()
-      val rv2 = RegionValue()
+    val newRVD = mv.rvd.mapPartitions(newRVDType) { (ctx, it) =>
+      val rvb = ctx.rvb
 
       val missingCompleteCols = new ArrayBuilder[Int]()
 
       val X = XBc.value.copy
-      it.map { rv =>
+      it.map { ptr =>
         RegressionUtils.setMeanImputedDoubles(X.data, n * k, completeColIdxBc.value, missingCompleteCols,
-          rv, fullRowType, entryArrayType, entryType, entryArrayIdx, fieldIdx)
+          ptr, fullRowType, entryArrayType, entryType, entryArrayIdx, fieldIdx)
 
-        rvb.set(rv.region)
         rvb.start(newRVDType.rowType)
         rvb.startStruct()
-        rvb.addFields(fullRowType, rv, copiedFieldIndices)
+        rvb.addFields(fullRowType, ctx.r, ptr, copiedFieldIndices)
         poisRegTestBc.value
           .test(X, yBc.value, nullFitBc.value, "poisson")
           .addToRVB(rvb)
         rvb.endStruct()
-
-        rv2.set(rv.region, rvb.end())
-        rv2
+        rvb.end()
       }
-    }.persist(StorageLevel.MEMORY_AND_DISK)
+    }
 
-    TableValue(tableType, BroadcastRow.empty(sc), newRVD)
+    TableValue(ctx, tableType, BroadcastRow.empty(ctx), newRVD)
   }
 }

@@ -17,6 +17,7 @@ Methods
 
     export_elasticsearch
     export_gen
+    export_bgen
     export_plink
     export_vcf
     get_vcf_metadata
@@ -29,6 +30,7 @@ Methods
     import_plink
     import_table
     import_vcf
+    import_gvcfs
     index_bgen
     read_matrix_table
     read_table
@@ -39,6 +41,10 @@ Methods
 .. autosummary::
 
     linear_mixed_model
+    linear_mixed_regression_rows
+    linear_regression_rows
+    logistic_regression_rows
+    poisson_regression_rows
     pca
     row_correlation
 
@@ -65,13 +71,13 @@ Methods
     realized_relationship_matrix
     sample_qc
     skat
+    lambda_gc
     split_multi
     split_multi_hts
     transmission_disequilibrium_test
     trio_matrix
     variant_qc
     vep
-    window_by_locus
 
 
 .. rubric:: Miscellaneous

@@ -1,8 +1,7 @@
 package is.hail.annotations
 
 import is.hail.asm4s._
-import is.hail.expr.types.physical.PType
-import is.hail.expr.types.virtual.Type
+import is.hail.types.physical.PType
 
 object UnsafeUtils {
   def arrayElementSize(t: PType): Long = roundUpAlignment(t.byteSize, t.alignment)
@@ -18,4 +17,10 @@ object UnsafeUtils {
     assert((alignment & (alignment - 1)) == 0) // power of 2
     (offset + (alignment - 1)) & ~(alignment - 1)
   }
+
+  def packBitsToBytes(nBits: Int): Int =
+    (nBits + 7) >>> 3
+
+  def packBitsToBytes(nBits: Code[Int]): Code[Int] =
+    (nBits + 7) >>> 3
 }

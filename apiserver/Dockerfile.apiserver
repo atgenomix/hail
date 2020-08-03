@@ -1,5 +1,0 @@
-FROM hail-base
-
-COPY apiserver /apiserver
-
-CMD ["/bin/bash", "-c", "source activate hail; python /apiserver/apiserver.py"]

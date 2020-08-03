@@ -1,6 +1,4 @@
-from hail.typecheck import *
-from hail.utils.java import *
-from hail.expr.types import hail_type
+from hail.typecheck import typecheck_method, lazy, nullable, anytype
 import hail as hl
 
 interval_type = lazy()
@@ -22,13 +20,24 @@ class Interval(object):
         Interval includes start.
     includes_end : :obj:`bool`
         Interval includes end.
+
+    Note
+    ----
+    This object refers to the Python value returned by taking or collecting
+    Hail expressions, e.g. ``mt.interval.take(5)``. This is rare; it is much
+    more common to manipulate the :class:`.IntervalExpression` object, which is
+    constructed using the following functions:
+
+     - :func:`.interval`
+     - :func:`.locus_interval`
+     - :func:`.parse_locus_interval`
     """
 
     @typecheck_method(start=anytype,
                       end=anytype,
                       includes_start=bool,
                       includes_end=bool,
-                      point_type=nullable(hail_type))
+                      point_type=nullable(lambda: hl.expr.types.hail_type))
     def __init__(self, start, end, includes_start=True, includes_end=False, point_type=None):
         if point_type is None:
             from hail.expr.expressions import impute_type, unify_types_limited
@@ -45,7 +54,7 @@ class Interval(object):
         self._includes_end = includes_end
 
     def __str__(self):
-        if isinstance(self._start, Locus) and self._start.contig == self._end.contig:
+        if isinstance(self._start, hl.genetics.Locus) and self._start.contig == self._end.contig:
             bounds = f'{self._start}-{self._end.position}'
         else:
             bounds = f'{self._start}-{self._end}'
@@ -191,5 +200,6 @@ class Interval(object):
         """
 
         return hl.eval(hl.literal(self, hl.tinterval(self._point_type)).overlaps(interval))
+
 
 interval_type.set(Interval)

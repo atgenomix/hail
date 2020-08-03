@@ -1,0 +1,9 @@
+<suite name="SuiteAll" verbose="1">
+    <test name="TestAll">  
+        <packages>
+          <package name="is.hail.*">
+            <exclude name="is.hail.services.*"></exclude>
+	  </package>
+        </packages>
+    </test>
+</suite>

@@ -1,12 +1,115 @@
-from typing import *
+from typing import Tuple
+import numpy as np
 
+import hail
+import hail as hl
 from hail.expr import expressions
-from hail.expr.types import *
-from hail.ir import *
-from hail.typecheck import linked_list
-from hail.utils.java import *
+from hail.expr.types import HailType, is_numeric, is_compound, tint32, \
+    tint64, tfloat32, tfloat64, tstr, tbool, tarray, \
+    tndarray, tset, tdict, tstruct, ttuple, tinterval, \
+    tlocus, tcall, from_numpy
+from hail import ir
+from hail.typecheck import typecheck_method, nullable, anyfunc, linked_list
+from hail.utils.java import Env
 from hail.utils.linkedlist import LinkedList
-from .indices import *
+from .indices import Indices, Aggregation
+
+from hail.expr.types import summary_type
+
+
+class Summary(object):
+    def __init__(self, type, count, summ_fields, nested, header=None):
+        self.count = count
+        self.summ_fields = summ_fields
+        self.nested = nested
+        self.type = type
+        self.header = header
+
+    @staticmethod
+    def pct(x):
+        return f'{x*100:.2f}%'
+
+    @staticmethod
+    def format(x):
+        if isinstance(x, float):
+            return f'{x:.2f}'
+        else:
+            return str(x)
+
+    def __str__(self):
+        return self._ascii_string(depth=0, prefix=None)
+
+    def __repr__(self):
+        return self.__str__()
+
+    def _repr_html_(self):
+        return self._html_string(prefix=None)
+
+    def _ascii_string(self, depth, prefix):
+        spacing = '  ' * depth
+
+        summary = ''
+        if self.header:
+            summary += f'\n{spacing}{self.header}'
+
+        if prefix is not None:
+            summary += f'\n\n{spacing}- {prefix} ({summary_type(self.type)}):'
+
+        if len(self.summ_fields) > 0:
+            max_n_len = max(len(n) for n in self.summ_fields.keys())
+            for name, v in self.summ_fields.items():
+                summary += f'\n{spacing}  {name.rjust(max_n_len)}: {self.format(v)}'
+        for name, field in self.nested.items():
+            if prefix is not None:
+                name = f'{prefix}{name}'
+            summary += field._ascii_string(depth + 1, prefix=name)
+
+        return summary
+
+    def _html_string(self, prefix):
+        import html
+        summary = ''
+        if self.header:
+            summary += f'<p>{self.header}</p>'
+        if prefix is not None:
+            summary += f'<b>{html.escape(prefix)}</b> (<i>{html.escape(summary_type(self.type))}</i>):'
+
+        summary += '<ul>'
+        if len(self.summ_fields) > 0:
+            summary += '<table><tbody>'
+            for name, v in self.summ_fields.items():
+                summary += f'<tr><td>{html.escape(name)}</td><td>{html.escape(self.format(v))}</td></tr>'
+            summary += '</tbody></table>'
+        for name, field in self.nested.items():
+            if prefix is not None:
+                name = f'{prefix}{name}'
+            summary += '<li>' + field._html_string(prefix=name) + '</li>'
+        summary += '</ul>'
+
+        return summary
+
+
+class NamedSummary(object):
+    def __init__(self, summary, name, header):
+        self.header = header
+        self.name = name
+        self.summary = summary
+
+    def __str__(self):
+        s = self.summary._ascii_string(depth=0, prefix=self.name)
+        if self.header:
+            s = f'{self.header}\n======' + s
+        return s
+
+    def __repr__(self):
+        return self.__str__()
+
+    def _repr_html_(self):
+        import html
+        s = self.summary._html_string(prefix=self.name)
+        if self.header:
+            s = f'<h3>{html.escape(self.header)}</h3>' + s
+        return s
 
 
 class ExpressionException(Exception):
@@ -24,7 +127,7 @@ class ExpressionWarning(Warning):
 def impute_type(x):
     from hail.genetics import Locus, Call
     from hail.utils import Interval, Struct
-    
+
     if isinstance(x, Expression):
         return x.dtype
     elif isinstance(x, bool):
@@ -82,6 +185,11 @@ def impute_type(x):
             raise ExpressionException("Hail does not support heterogeneous dicts: "
                                       "found dict with values of types {} ".format(list(vts)))
         return tdict(unified_key_type, unified_value_type)
+    elif isinstance(x, np.generic):
+        return from_numpy(x.dtype)
+    elif isinstance(x, np.ndarray):
+        element_type = from_numpy(x.dtype)
+        return tndarray(element_type, x.ndim)
     elif x is None:
         raise ExpressionException("Hail cannot impute the type of 'None'")
     elif isinstance(x, (hl.expr.builders.CaseBuilder, hl.expr.builders.SwitchBuilder)):
@@ -96,6 +204,10 @@ def to_expr(e, dtype=None) -> 'Expression':
         if dtype and not dtype == e.dtype:
             raise TypeError("expected expression of type '{}', found expression of type '{}'".format(dtype, e.dtype))
         return e
+    return cast_expr(e, dtype)
+
+
+def cast_expr(e, dtype=None) -> 'Expression':
     if not dtype:
         dtype = impute_type(e)
     x = _to_expr(e, dtype)
@@ -157,8 +269,8 @@ def _to_expr(e, dtype):
                      else hl.literal(element, dtype.element_type)
                      for element in elements]
             indices, aggregations = unify_all(*exprs)
-        ir = MakeArray([e._ir for e in exprs], None)
-        return expressions.construct_expr(ir, dtype, indices, aggregations)
+        x = ir.MakeArray([e._ir for e in exprs], None)
+        return expressions.construct_expr(x, dtype, indices, aggregations)
     elif isinstance(dtype, tset):
         elements = []
         found_expr = False
@@ -174,8 +286,8 @@ def _to_expr(e, dtype):
                      else hl.literal(element, dtype.element_type)
                      for element in elements]
             indices, aggregations = unify_all(*exprs)
-            ir = ToSet(MakeArray([e._ir for e in exprs], None))
-            return expressions.construct_expr(ir, dtype, indices, aggregations)
+            x = ir.ToSet(ir.ToStream(ir.MakeArray([e._ir for e in exprs], None)))
+            return expressions.construct_expr(x, dtype, indices, aggregations)
     elif isinstance(dtype, ttuple):
         elements = []
         found_expr = False
@@ -191,8 +303,8 @@ def _to_expr(e, dtype):
                      else hl.literal(elements[i], dtype.types[i])
                      for i in range(len(elements))]
             indices, aggregations = unify_all(*exprs)
-            ir = MakeTuple([expr._ir for expr in exprs])
-            return expressions.construct_expr(ir, dtype, indices, aggregations)
+            x = ir.MakeTuple([expr._ir for expr in exprs])
+            return expressions.construct_expr(x, dtype, indices, aggregations)
     elif isinstance(dtype, tdict):
         keys = []
         values = []
@@ -214,6 +326,8 @@ def _to_expr(e, dtype):
             key_array = to_expr(keys, tarray(dtype.key_type))
             value_array = to_expr(values, tarray(dtype.value_type))
             return hl.dict(hl.zip(key_array, value_array))
+    elif isinstance(dtype, hl.tndarray):
+        return hl.nd.array(e)
     else:
         raise NotImplementedError(dtype)
 
@@ -231,11 +345,12 @@ def unify_all(*exprs) -> Tuple[Indices, LinkedList]:
             from .expression_utils import get_refs
             for name, inds in get_refs(e, *[e for a in e._aggregations for e in a.exprs]).items():
                 sources[inds.source].append(str(name))
-        raise ExpressionException("Cannot combine expressions from different source objects."
-                                  "\n    Found fields from {n} objects:{fields}".format(
-            n=len(sources),
-            fields=''.join("\n        {}: {}".format(src, fds) for src, fds in sources.items())
-        )) from None
+                raise ExpressionException(
+                    "Cannot combine expressions from different source objects."
+                    "\n    Found fields from {n} objects:{fields}".format(
+                        n=len(sources),
+                        fields=''.join("\n        {}: {}".format(src, fds) for src, fds in sources.items())
+                    )) from None
     first, rest = exprs[0], exprs[1:]
     aggregations = first._aggregations
     for e in rest:
@@ -277,6 +392,7 @@ def unify_types(*ts):
     else:
         return None
 
+
 def unify_exprs(*exprs: 'Expression') -> Tuple:
     assert len(exprs) > 0
     types = {e.dtype for e in exprs}
@@ -293,20 +409,24 @@ def unify_exprs(*exprs: 'Expression') -> Tuple:
     # cannot coerce all types to the same type
     return exprs + (False,)
 
+
 class Expression(object):
     """Base class for Hail expressions."""
 
-    @typecheck_method(ir=IR, type=nullable(HailType), indices=Indices, aggregations=linked_list(Aggregation))
+    __array_ufunc__ = None  # disable NumPy coercions, so Hail coercions take priority
+
+    @typecheck_method(x=ir.IR, type=nullable(HailType), indices=Indices, aggregations=linked_list(Aggregation))
     def __init__(self,
-                 ir: IR,
+                 x: ir.IR,
                  type: HailType,
                  indices: Indices = Indices(),
                  aggregations: LinkedList = LinkedList(Aggregation)):
 
-        self._ir: IR = ir
+        self._ir: ir.IR = x
         self._type = type
         self._indices = indices
         self._aggregations = aggregations
+        self._summary = None
 
     def describe(self, handler=print):
         """Print information about type, index, and dependencies."""
@@ -388,8 +508,19 @@ class Expression(object):
         coercer = expressions.coercer_from_dtype(typ)
         if isinstance(typ, tarray) and not isinstance(self.dtype, tarray):
             return coercer.ec.coerce(self)
+        elif isinstance(typ, tndarray) and not isinstance(self.dtype, tndarray):
+            return coercer.ec.coerce(self)
         else:
             return coercer.coerce(self)
+
+    @staticmethod
+    def _div_ret_type_f(t):
+        assert is_numeric(t)
+        if t == tint32 or t == tint64:
+            return tfloat32
+        else:
+            # Float64 or Float32
+            return t
 
     def _bin_op_numeric_unify_types(self, name, other):
         def numeric_proxy(t):
@@ -401,15 +532,22 @@ class Expression(object):
         def scalar_type(t):
             if isinstance(t, tarray):
                 return numeric_proxy(t.element_type)
+            elif isinstance(t, tndarray):
+                return numeric_proxy(t.element_type)
             else:
                 return numeric_proxy(t)
 
         t = unify_types(scalar_type(self.dtype), scalar_type(other.dtype))
         if t is None:
-            raise NotImplementedError("'{}' {} '{}'".format(
-                self.dtype, name, other.dtype))
+            raise NotImplementedError("'{}' {} '{}'".format(self.dtype, name, other.dtype))
+
         if isinstance(self.dtype, tarray) or isinstance(other.dtype, tarray):
-            t = tarray(t)
+            return tarray(t)
+        elif isinstance(self.dtype, tndarray):
+            return tndarray(t, self.ndim)
+        elif isinstance(other.dtype, tndarray):
+            return tndarray(t, other.ndim)
+
         return t
 
     def _bin_op_numeric(self, name, other, ret_type_f=None):
@@ -420,6 +558,8 @@ class Expression(object):
         if ret_type_f:
             if isinstance(unified_type, tarray):
                 ret_type = tarray(ret_type_f(unified_type.element_type))
+            elif isinstance(unified_type, tndarray):
+                ret_type = tndarray(ret_type_f(unified_type.element_type), unified_type.ndim)
             else:
                 ret_type = ret_type_f(unified_type)
         else:
@@ -430,17 +570,21 @@ class Expression(object):
         return to_expr(other)._bin_op_numeric(name, self, ret_type_f)
 
     def _unary_op(self, name):
-        return expressions.construct_expr(ApplyUnaryOp(name, self._ir), self._type, self._indices, self._aggregations)
+        return expressions.construct_expr(ir.ApplyUnaryPrimOp(name, self._ir), self._type, self._indices, self._aggregations)
 
     def _bin_op(self, name, other, ret_type):
         other = to_expr(other)
         indices, aggregations = unify_all(self, other)
         if (name in {'+', '-', '*', '/', '//'}) and (ret_type in {tint32, tint64, tfloat32, tfloat64}):
-            op = ApplyBinaryOp(name, self._ir, other._ir)
+            op = ir.ApplyBinaryPrimOp(name, self._ir, other._ir)
         elif name in {"==", "!=", "<", "<=", ">", ">="}:
-            op = ApplyComparisonOp(name, self._ir, other._ir)
+            op = ir.ApplyComparisonOp(name, self._ir, other._ir)
         else:
-            op = Apply(name, self._ir, other._ir)
+            d = {
+                '+': 'add', '-': 'sub', '*': 'mul', '/': 'div', '//': 'floordiv',
+                '%': 'mod', '**': 'pow'
+            }
+            op = ir.Apply(d.get(name, name), ret_type, self._ir, other._ir)
         return expressions.construct_expr(op, ret_type, indices, aggregations)
 
     def _bin_op_reverse(self, name, other, ret_type):
@@ -449,32 +593,30 @@ class Expression(object):
     def _method(self, name, ret_type, *args):
         args = tuple(to_expr(arg) for arg in args)
         indices, aggregations = unify_all(self, *args)
-        ir = Apply(name, self._ir, *(a._ir for a in args))
-        return expressions.construct_expr(ir, ret_type, indices, aggregations)
+        x = ir.Apply(name, ret_type, self._ir, *(a._ir for a in args))
+        return expressions.construct_expr(x, ret_type, indices, aggregations)
 
     def _index(self, ret_type, key):
         key = to_expr(key)
-        return self._method("[]", ret_type, key)
+        return self._method("index", ret_type, key)
 
     def _slice(self, ret_type, start=None, stop=None, step=None):
-        ir_args = []
-        if start is not None:
-            start = to_expr(start)
-            ir_args.append(start)
-            start_str = "*"
-        else:
-            start_str = ""
-        if stop is not None:
-            stop = to_expr(stop)
-            ir_args.append(stop)
-            stop_str = "*"
-        else:
-            stop_str = ""
         if step is not None:
             raise NotImplementedError('Variable slice step size is not currently supported')
 
-        mname = "[{}:{}]".format(start_str, stop_str)
-        return self._method(mname, ret_type, *ir_args)
+        if start is not None:
+            start = to_expr(start)
+            if stop is not None:
+                stop = to_expr(stop)
+                return self._method('slice', ret_type, start, stop)
+            else:
+                return self._method('sliceRight', ret_type, start)
+        else:
+            if stop is not None:
+                stop = to_expr(stop)
+                return self._method('sliceLeft', ret_type, stop)
+            else:
+                return self
 
     def _ir_lambda_method(self, irf, f, input_type, ret_type_f, *args):
         args = (to_expr(arg)._ir for arg in args)
@@ -483,8 +625,8 @@ class Expression(object):
             f(expressions.construct_variable(new_id, input_type, self._indices, self._aggregations)))
 
         indices, aggregations = unify_all(self, lambda_result)
-        ir = irf(self._ir, new_id, lambda_result._ir, *args)
-        return expressions.construct_expr(ir, ret_type_f(lambda_result._type), indices, aggregations)
+        x = irf(self._ir, new_id, lambda_result._ir, *args)
+        return expressions.construct_expr(x, ret_type_f(lambda_result._type), indices, aggregations)
 
     @property
     def dtype(self) -> HailType:
@@ -573,72 +715,66 @@ class Expression(object):
         return self._compare_op("!=", other)
 
     def _to_table(self, name):
+        name, ds = self._to_relational(name)
+        if isinstance(ds, hail.MatrixTable):
+            entries = ds.key_cols_by().entries()
+            entries = entries.order_by(*ds.row_key)
+            return name, entries.select(name)
+        else:
+            if len(ds.key) != 0:
+                ds = ds.order_by(*ds.key)
+            return name, ds.select(name)
+
+    def _to_relational(self, fallback_name):
         source = self._indices.source
         axes = self._indices.axes
         if not self._aggregations.empty():
             raise NotImplementedError('cannot convert aggregated expression to table')
+
         if source is None:
-            # scalar expression
-            df = Env.dummy_table()
-            df = df.select(**{name: self})
-            to_return = df
-        elif len(axes) == 0:
-            uid = Env.get_uid()
-            source = source.select_globals(**{uid: self})
-            df = Env.dummy_table()
-            df = df.select(**{name: source.index_globals()[uid]})
-            to_return = df
-        elif len(axes) == 1:
-            if isinstance(source, hail.Table):
-                df = source
-                field_name = source._fields_inverse.get(self)
-                if field_name is not None:
-                    if field_name in source.key:
-                        df = df.select()
-                    else:
-                        df = df.select(field_name)
-                    if field_name != name:
-                        df = df.rename({field_name: name})
-                else:
-                    df = df.select(**{name: self})
-                to_return = df.select_globals()
+            return fallback_name, hl.Table.parallelize([hl.struct(**{fallback_name: self})], n_partitions=1)
+
+        name = source._fields_inverse.get(self)
+        top_level = name is not None
+        if not top_level:
+            name = fallback_name
+        named_self = {name: self}
+        if len(axes) == 0:
+            x = source.select_globals(**named_self)
+            ds = hl.Table.parallelize([x.index_globals()], n_partitions=1)
+        elif isinstance(source, hail.Table):
+            if top_level and name in source.key:
+                named_self = {}
+            ds = source.select(**named_self).select_globals()
+        elif isinstance(source, hail.MatrixTable):
+            if self._indices == source._row_indices:
+                if top_level and name in source.row_key:
+                    named_self = {}
+                ds = source.select_rows(**named_self).select_globals().rows()
+            elif self._indices == source._col_indices:
+                if top_level and name in source.col_key:
+                    named_self = {}
+                ds = source.select_cols(**named_self).select_globals().key_cols_by().cols()
             else:
-                assert isinstance(source, hail.MatrixTable)
-                if self._indices == source._row_indices:
-                    field_name = source._fields_inverse.get(self)
-                    if field_name is not None:
-                        if field_name in source.row_key:
-                            m = source.select_rows()
-                        else:
-                            m = source.select_rows(field_name)
-                        m = m.rename({field_name: name})
-                    else:
-                        m = source.select_rows(**{name: self})
-                    to_return = m.rows().select_globals()
-                else:
-                    field_name = source._fields_inverse.get(self)
-                    if field_name is not None:
-                        if field_name in source.col_key:
-                            m = source.select_cols()
-                        else:
-                            m = source.select_cols(field_name)
-                        m = m.rename({field_name: name})
-                    else:
-                        m = source.select_cols(**{name: self})
-                    to_return = m.key_cols_by().cols().select_globals()
-        else:
-            assert len(axes) == 2
-            assert isinstance(source, hail.MatrixTable)
-            source = source.select_entries(**{name: self}).select_rows().select_cols()
-            to_return = source.key_cols_by().entries().select_globals()
-        assert self.dtype == to_return[name].dtype, f'type mismatch:\n' \
-                                                    f'  Actual:    {self.dtype}\n' \
-                                                    f'  Should be: {to_return[name].dtype}'
-        return to_return
+                assert self._indices == source._entry_indices
+                ds = source.select_entries(**named_self).select_globals().select_cols().select_rows()
+        return name, ds
 
-
-    @typecheck_method(n=int, width=int, truncate=nullable(int), types=bool, handler=anyfunc)
-    def show(self, n=10, width=90, truncate=None, types=True, handler=print):
+    @typecheck_method(n=nullable(int),
+                      width=nullable(int),
+                      truncate=nullable(int),
+                      types=bool,
+                      handler=nullable(anyfunc),
+                      n_rows=nullable(int),
+                      n_cols=nullable(int))
+    def show(self,
+             n=None,
+             width=None,
+             truncate=None,
+             types=True,
+             handler=None,
+             n_rows=None,
+             n_cols=None):
         """Print the first few rows of the table to the console.
 
         Examples
@@ -681,34 +817,155 @@ class Expression(object):
         types : :obj:`bool`
             Print an extra header line with the type of each field.
         """
-        handler(self._show(n, width, truncate, types))
+        kwargs = {
+            'n': n, 'width': width, 'truncate': truncate, 'types': types,
+            'handler': handler, 'n_rows': n_rows, 'n_cols': n_cols}
+        if kwargs.get('n_rows') is None:
+            kwargs['n_rows'] = kwargs['n']
+        del kwargs['n']
+        _, ds = self._to_relational_preserving_rows_and_cols('<expr>')
+        ds.show(**{k: v for k, v in kwargs.items() if v is not None})
 
-    def _show(self, n, width, truncate, types):
-        name = '<expr>'
+    def _to_relational_preserving_rows_and_cols(self, fallback_name):
         source = self._indices.source
         if isinstance(source, hl.Table):
             if self is source.row:
-                return source._show(n, width, truncate, types)
-            elif self is source.key:
-                return source.select()._show(n, width, truncate, types)
-        elif isinstance(source, hl.MatrixTable):
+                return None, source
+            if self is source.key:
+                return None, source.select()
+        if isinstance(source, hl.MatrixTable):
             if self is source.row:
-                return source.rows()._show(n, width, truncate, types)
-            elif self is source.row_key:
-                return source.rows().select()._show(n, width, truncate, types)
+                return None, source.rows()
+            if self is source.row_key:
+                return None, source.rows().select()
             if self is source.col:
-                return source.cols()._show(n, width, truncate, types)
-            elif self is source.col_key:
-                return source.cols().select()._show(n, width, truncate, types)
+                return None, source.key_cols_by().cols()
+            if self is source.col_key:
+                return None, source.key_cols_by().cols().select()
             if self is source.entry:
-                return source.select_rows().select_cols().entries()._show(n, width, truncate, types)
-        if source is not None:
-            name = source._fields_inverse.get(self, name)
-        t = self._to_table(name)
-        if name in t.key:
-            t = t.key_by(name).select()
-        return t._show(n, width, truncate, types)
+                return None, source.select_rows().select_cols()
+        return self._to_relational(fallback_name)
 
+    @typecheck_method(path=str, delimiter=str, missing=str, header=bool)
+    def export(self, path, delimiter='\t', missing='NA', header=True):
+        """Export a field to a text file.
+
+        Examples
+        --------
+
+        >>> small_mt.GT.export('output/gt.tsv')
+        >>> with open('output/gt.tsv', 'r') as f:
+        ...     for line in f:
+        ...         print(line, end='')
+        locus	alleles	0	1	2	3
+        1:1	["A","C"]	0/1	0/1	0/0	0/0
+        1:2	["A","C"]	1/1	0/1	1/1	1/1
+        1:3	["A","C"]	1/1	0/1	0/1	0/0
+        1:4	["A","C"]	1/1	0/1	1/1	1/1
+        <BLANKLINE>
+
+        >>> small_mt.GT.export('output/gt-no-header.tsv', header=False)
+        >>> with open('output/gt-no-header.tsv', 'r') as f:
+        ...     for line in f:
+        ...         print(line, end='')
+        1:1	["A","C"]	0/1	0/1	0/0	0/0
+        1:2	["A","C"]	1/1	0/1	1/1	1/1
+        1:3	["A","C"]	1/1	0/1	0/1	0/0
+        1:4	["A","C"]	1/1	0/1	1/1	1/1
+        <BLANKLINE>
+
+        >>> small_mt.pop.export('output/pops.tsv')
+        >>> with open('output/pops.tsv', 'r') as f:
+        ...     for line in f:
+        ...         print(line, end='')
+        sample_idx	pop
+        0	2
+        1	2
+        2	0
+        3	2
+        <BLANKLINE>
+
+        >>> small_mt.ancestral_af.export('output/ancestral_af.tsv')
+        >>> with open('output/ancestral_af.tsv', 'r') as f:
+        ...     for line in f:
+        ...         print(line, end='')
+        locus	alleles	ancestral_af
+        1:1	["A","C"]	5.3905e-01
+        1:2	["A","C"]	8.6768e-01
+        1:3	["A","C"]	4.3765e-01
+        1:4	["A","C"]	7.6300e-01
+        <BLANKLINE>
+
+        >>> mt = small_mt
+        >>> small_mt.bn.export('output/bn.tsv')
+        >>> with open('output/bn.tsv', 'r') as f:
+        ...     for line in f:
+        ...         print(line, end='')
+        bn
+        {"n_populations":3,"n_samples":4,"n_variants":4,"n_partitions":8,"pop_dist":[1,1,1],"fst":[0.1,0.1,0.1],"mixture":false}
+        <BLANKLINE>
+
+
+        Notes
+        -----
+
+        For entry-indexed expressions, if there is one column key field, the
+        result of calling :func:`hl.str` on that field is used as the column
+        header. Otherwise, each compound column key is converted to JSON and
+        used as a column header. For example:
+
+        >>> small_mt = small_mt.key_cols_by(s=small_mt.sample_idx, family='fam1')
+        >>> small_mt.GT.export('output/gt-no-header.tsv')
+        >>> with open('output/gt-no-header.tsv', 'r') as f:
+        ...     for line in f:
+        ...         print(line, end='')
+        locus	alleles	{"s":0,"family":"fam1"}	{"s":1,"family":"fam1"}	{"s":2,"family":"fam1"}	{"s":3,"family":"fam1"}
+        1:1	["A","C"]	0/1	0/1	0/0	0/0
+        1:2	["A","C"]	1/1	0/1	1/1	1/1
+        1:3	["A","C"]	1/1	0/1	0/1	0/0
+        1:4	["A","C"]	1/1	0/1	1/1	1/1
+        <BLANKLINE>
+
+
+        Parameters
+        ----------
+        path : :obj:`str`
+            The path to which to export.
+        delimiter : :obj:`str`
+            The string for delimiting columns.
+        missing : :obj:`str`
+            The string to output for missing values.
+        header : :obj:`bool`
+            When ``True`` include a header line.
+        """
+        uid = Env.get_uid()
+        self_name, ds = self._to_relational_preserving_rows_and_cols(uid)
+        if isinstance(ds, hl.Table):
+            ds.export(output=path, delimiter=delimiter, header=header)
+        else:
+            assert len(self._indices.axes) == 2
+            entries, cols = Env.get_uid(), Env.get_uid()
+            t = ds.select_cols().localize_entries(entries, cols)
+            t = t.order_by(*t.key)
+            output_col_name = Env.get_uid()
+            entry_array = t[entries]
+            if self_name:
+                entry_array = hl.map(lambda x: x[self_name], entry_array)
+            entry_array = hl.map(lambda x: hl.cond(hl.is_missing(x), missing, hl.str(x)),
+                                 entry_array)
+            file_contents = t.select(
+                **{k: hl.str(t[k]) for k in ds.row_key},
+                **{output_col_name: hl.delimit(entry_array, delimiter)})
+            if header:
+                col_key = t[cols]
+                if len(ds.col_key) == 1:
+                    col_key = hl.map(lambda x: x[0], col_key)
+                column_names = hl.map(hl.str, col_key).collect(_localize=False)[0]
+                header_table = hl.utils.range_table(1).key_by().select(
+                    **{k: k for k in ds.row_key},
+                    **{output_col_name: hl.delimit(column_names, delimiter)})
+                file_contents = header_table.union(file_contents)
+            file_contents.export(path, delimiter=delimiter, header=False)
 
     @typecheck_method(n=int, _localize=bool)
     def take(self, n, _localize=True):
@@ -736,11 +993,11 @@ class Expression(object):
         :obj:`list`
         """
         uid = Env.get_uid()
-        e = self._to_table(uid).take(n, _localize=False).map(lambda r: r[uid])
+        name, t = self._to_table(uid)
+        e = t.take(n, _localize=False).map(lambda r: r[name])
         if _localize:
             return hl.eval(e)
-        else:
-            return e
+        return e
 
     @typecheck_method(_localize=bool)
     def collect(self, _localize=True):
@@ -767,24 +1024,88 @@ class Expression(object):
         :obj:`list`
         """
         uid = Env.get_uid()
-        t = self._to_table(uid).key_by().select(uid)
-
-        e = t.collect(_localize=False).map(lambda r: r[uid])
+        name, t = self._to_table(uid)
+        e = t.collect(_localize=False).map(lambda r: r[name])
         if _localize:
             return hl.eval(e)
-        else:
-            return e
+        return e
 
-    def _aggregation_method(self):
+    def _extra_summary_fields(self, agg_result):
+        return {}
+
+    def _summary_fields(self, agg_result, top):
+        if top:
+            return {}, self._nested_summary(agg_result[2], top)
+        n_missing = agg_result[0]
+        n_defined = agg_result[1]
+        tot = n_missing + n_defined
+        missing_value_str = str(n_missing) if n_missing == 0 else f'{n_missing} ({(n_missing / tot) * 100:.2f}%)'
+        defined_value_str = str(n_defined) if n_defined == 0 else f'{n_defined} ({(n_defined / tot) * 100:.2f}%)'
+        if n_defined == 0:
+            return {'Non-missing': defined_value_str, 'Missing': missing_value_str}, {}
+        return {'Non-missing': defined_value_str, 'Missing': missing_value_str,
+                **self._extra_summary_fields(agg_result[2])}, self._nested_summary(agg_result[2], top)
+
+    def _nested_summary(self, agg_result, top):
+        return {}
+
+    def _summary_aggs(self):
+        return hl.null(hl.tint32)
+
+    def _all_summary_aggs(self):
+        return hl.tuple((
+            hl.agg.filter(hl.is_missing(self), hl.agg.count()),
+            hl.agg.filter(hl.is_defined(self), hl.agg.count()),
+            self._summary_aggs()))
+
+    def _summarize(self, agg_res=None, *, name=None, header=None, top=False):
+        src = self._indices.source
+        summary_header = None
+        if src is None or len(self._indices.axes) == 0:
+            raise ValueError("Cannot summarize a scalar expression")
+        if agg_res is None:
+            count, agg_res = self._aggregation_method()(hl.tuple((hl.agg.count(), self._all_summary_aggs())))
+            summary_header = f'{count} records.'
+        sum_fields, nested = self._summary_fields(agg_res, top)
+        summary = Summary(self._type, agg_res[0], sum_fields, nested, header=summary_header)
+        if name is None and header is None:
+            return summary
+        else:
+            return NamedSummary(summary, name, header)
+
+    def summarize(self, handler=None):
+        """Compute and print summary information about the expression.
+
+        .. include:: _templates/experimental.rst
+        """
+
+        src = self._indices.source
+        if self in src._fields:
+            field_name = src._fields_inverse[self]
+            prefix = field_name
+        else:
+            if self._ir.is_nested_field:
+                prefix = self._ir.name
+            else:
+                prefix = '<expr>'
+
+        if handler is None:
+            handler = hl.utils.default_handler()
+        handler(self._summarize(name=prefix))
+
+    def _selector_and_agg_method(self):
         src = self._indices.source
         assert src is not None
         assert len(self._indices.axes) > 0
         if isinstance(src, hl.MatrixTable):
             if self._indices == src._row_indices:
-                return src.aggregate_rows
+                return src.select_rows, lambda t: t.aggregate_rows
             elif self._indices == src._col_indices:
-                return src.aggregate_cols
+                return src.select_cols, lambda t: t.aggregate_cols
             else:
-                return src.aggregate_entries
+                return src.select_entries, lambda t: t.aggregate_entries
         else:
-            return src.aggregate
+            return src.select, lambda t: t.aggregate
+
+    def _aggregation_method(self):
+        return self._selector_and_agg_method()[1](self._indices.source)

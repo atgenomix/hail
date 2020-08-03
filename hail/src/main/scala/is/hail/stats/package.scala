@@ -1,15 +1,10 @@
 package is.hail
 
-import breeze.linalg.Matrix
-import is.hail.annotations.Annotation
-import is.hail.expr.types._
-import is.hail.expr.types.virtual._
+import is.hail.types.physical.{PCanonicalStruct, PFloat64, PStruct}
 import is.hail.utils._
-import is.hail.variant._
 import net.sourceforge.jdistlib.disttest.{DistributionTest, TestKind}
-import net.sourceforge.jdistlib.{Beta, ChiSquare, Normal, Poisson}
+import net.sourceforge.jdistlib.{Beta, ChiSquare, NonCentralChiSquare, Normal, Poisson}
 import org.apache.commons.math3.distribution.HypergeometricDistribution
-import org.apache.spark.sql.Row
 
 package object stats {
 
@@ -109,7 +104,7 @@ package object stats {
     }
   }
 
-  val hweStruct = TStruct("het_freq_hwe" -> TFloat64(), "p_value" -> TFloat64())
+  val hweStruct = PCanonicalStruct("het_freq_hwe" -> PFloat64(true), "p_value" -> PFloat64(true))
 
   def hardyWeinbergTest(nHomRef: Int, nHet: Int, nHomVar: Int): Array[Double] = {
     if (nHomRef < 0 || nHet < 0 || nHomVar < 0)
@@ -123,7 +118,7 @@ package object stats {
     Array(LH.getNumericalMean / n, LH.exactMidP(nAB))
   }
   
-  val chisqStruct = TStruct("p_value" -> TFloat64(), "odds_ratio" -> TFloat64())
+  val chisqStruct = PCanonicalStruct("p_value" -> PFloat64(true), "odds_ratio" -> PFloat64(true))
   
   def chiSquaredTest(a0: Int, b0: Int, c0: Int, d0: Int): Array[Double] = {
     if (a0 < 0 || b0 < 0 || c0 < 0 || d0 < 0)
@@ -152,11 +147,11 @@ package object stats {
       fisherExactTest(a, b, c, d)
   }
   
-  val fetStruct = TStruct(
-    "p_value" -> TFloat64(),
-    "odds_ratio" -> TFloat64(),
-    "ci_95_lower" -> TFloat64(),
-    "ci_95_upper" -> TFloat64())
+  val fetStruct = PCanonicalStruct(
+    "p_value" -> PFloat64(required = true),
+    "odds_ratio" -> PFloat64(required = true),
+    "ci_95_lower" -> PFloat64(required = true),
+    "ci_95_upper" -> PFloat64(required = true))
 
   def fisherExactTest(a: Int, b: Int, c: Int, d: Int): Array[Double] =
     fisherExactTest(a, b, c, d, 1.0, 0.95, "two.sided")
@@ -330,8 +325,17 @@ package object stats {
   // Returns the x for which p = Prob(Z < x) with Z a standard normal RV
   def qnorm(p: Double): Double = Normal.quantile(p, 0, 1, true, false)
 
+  // Returns the p for which p = Prob(Z < x) with Z a RV having the T distribution with n degrees of freedom
+  def pT(x: Double, n: Double, lower_tail: Boolean, log_p: Boolean): Double =
+    net.sourceforge.jdistlib.T.cumulative(x, n, lower_tail, log_p)
+
+  def pF(x: Double, df1: Double, df2: Double, lower_tail: Boolean, log_p: Boolean): Double =
+    net.sourceforge.jdistlib.F.cumulative(x, df1, df2, lower_tail, log_p)
+
   // Returns the p for which p = Prob(Z^2 > x) with Z^2 a chi-squared RV with df degrees of freedom
   def chiSquaredTail(x: Double, df: Double): Double = ChiSquare.cumulative(x, df, false, false)
+
+  def nonCentralChiSquaredTail(x: Double, df: Double, ncp: Double) = NonCentralChiSquare.cumulative(x, df, ncp, false, false)
 
   // Returns the x for which p = Prob(Z^2 > x) with Z^2 a chi-squared RV with df degrees of freedom
   def inverseChiSquaredTail(p: Double, df: Double): Double = ChiSquare.quantile(p, df, false, false)
@@ -359,7 +363,7 @@ package object stats {
       case 0 => TestKind.TWO_SIDED
       case 1 => TestKind.LOWER
       case 2 => TestKind.GREATER
-      case _ => fatal(s"""Invalid alternative "$alternative". Must be "two_sided", "less" or "greater".""")
+      case _ => fatal(s"""Invalid alternative "$alternative". Must be "two-sided", "less" or "greater".""")
     }
 
     DistributionTest.binomial_test(nSuccess, n, p, kind)(1)

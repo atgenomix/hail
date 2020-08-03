@@ -1,73 +1,60 @@
-.PHONY: build build-test \
-  push push-test \
-  run-docker run \
-  test test-local deploy clean
+PROJECT := $(shell gcloud config get-value project)
+ZONE := us-central1-a
+KUBERNETES_SERVER_URL := https://104.198.230.143
 
-PROJECT = $(shell gcloud config get-value project)
-PY_FILES = $(shell find batch -iname \*.py -not -exec git check-ignore -q {} \; -print)
-PY_CHECKERS = build/flake8 build/pylint
-BATCH_PORT ?= 5000
+BATCH_LATEST = gcr.io/$(PROJECT)/batch:latest
+BATCH_IMAGE = gcr.io/$(PROJECT)/batch:$(shell docker images -q --no-trunc batch | sed -e 's,[^:]*:,,')
 
-clean:
-	-rm -r build
+BATCH_WORKER_LATEST = gcr.io/$(PROJECT)/batch-worker:latest
+BATCH_WORKER_IMAGE = gcr.io/$(PROJECT)/batch-worker:$(shell docker images -q --no-trunc batch-worker | sed -e 's,[^:]*:,,')
 
-build/conda-env: environment.yml
-	conda env update -f environment.yml || conda env create -f environment.yml
-	mkdir -p build && touch $@
+PYTHONPATH := $${PYTHONPATH:+$${PYTHONPATH}:}../hail/python:../gear:../web_common
+PYTHON := PYTHONPATH=$(PYTHONPATH) python3
 
-build/flake8: $(PY_FILES) build/conda-env
-	. ../loadconda && conda activate hail-batch && python -m flake8 batch
-	mkdir -p build && touch $@
+.PHONY: check
+check:
+	$(PYTHON) -m flake8  --config ../setup.cfg batch
+	$(PYTHON) -m pylint --rcfile ../pylintrc batch --score=n
 
-build/pylint: $(PY_FILES) build/conda-env
-	. ../loadconda && conda activate hail-batch && python -m pylint --rcfile batch/pylintrc batch --score=n
-	mkdir -p build && touch $@
-
+.PHONY: build
 build:
-	docker build -t batch .
+	make -C ../docker build
+	-docker pull $(BATCH_LATEST)
+	python3 ../ci/jinja2_render.py '{"service_base_image":{"image":"service-base"}}' Dockerfile Dockerfile.out
+	docker build -t batch -f Dockerfile.out --cache-from batch,$(BATCH_LATEST),service-base ..
+	-docker pull python:3.7-slim-stretch
+	-docker pull $(BATCH_WORKER_LATEST)
+	docker build -t batch-worker -f Dockerfile.worker --cache-from batch-worker,$(BATCH_WORKER_LATEST),python:3.7-slim-stretch ..
 
-build-test:
-	docker build -t batch-test -f Dockerfile.test .
-
-push: IMAGE="gcr.io/$(PROJECT)/batch:$(shell docker images -q --no-trunc batch | sed -e 's,[^:]*:,,')"
+.PHONY: push
 push: build
-	docker tag batch $(IMAGE)
-	docker push $(IMAGE)
-	echo $(IMAGE) > batch-image
+	docker tag batch $(BATCH_LATEST)
+	docker push $(BATCH_LATEST)
+	docker tag batch $(BATCH_IMAGE)
+	docker push $(BATCH_IMAGE)
+	docker tag batch-worker $(BATCH_WORKER_LATEST)
+	docker push $(BATCH_WORKER_LATEST)
+	docker tag batch-worker $(BATCH_WORKER_IMAGE)
+	docker push $(BATCH_WORKER_IMAGE)
 
-push-test: IMAGE="gcr.io/$(PROJECT)/batch-test:$(shell docker images -q --no-trunc batch-test | sed -e 's,[^:]*:,,')"
-push-test: build-test
-	docker tag batch-test $(IMAGE)
-	docker push $(IMAGE)
-	echo $(IMAGE) > batch-test-image
+JINJA_ENVIRONMENT := '{"code":{"sha":"$(shell git rev-parse --short=12 HEAD)"},"deploy":true,"batch_image":{"image":"$(BATCH_IMAGE)"},"batch_worker_image":{"image":"$(BATCH_WORKER_IMAGE)"},"default_ns":{"name":"default"},"batch_pods_ns":{"name":"batch-pods"},"batch_database":{"user_secret_name":"sql-batch-user-config"},"global":{"project":"$(PROJECT)","domain":"$(DOMAIN)","k8s_server_url":"$(KUBERNETES_SERVER_URL)"}}'
 
-run-docker: build
-	docker run -e BATCH_USE_KUBE_CONFIG=1 -i -v $(HOME)/.kube:/root/.kube -p 5000:5000 -t batch
-
-run: build/conda-env
-	. ../loadconda && conda activate hail-batch && python -c 'import batch.server; batch.server.serve('$(BATCH_PORT)')'
-
-run-local: run
-	. ../loadconda && conda activate hail-batch && BATCH_USE_KUBE_CONFIG=1 python -c 'import batch.server; batch.server.serve('$(BATCH_PORT)')'
-
-test: push-test
-	sed -e "s,@image@,$$(cat batch-test-image)," \
-	  < test-batch-pod.yaml.in > test-batch-pod.yaml
-	kubectl create -f test-batch-pod.yaml
-
-ifneq ($(PY_CHECK),false)
-test-local: $(PY_CHECKERS)
-endif
-test-local: build/conda-env
-	. ../loadconda && conda activate hail-batch && POD_NAMESPACE='test' BATCH_USE_KUBE_CONFIG=1 ./test-locally.sh
-
-# local means server and test client are two processes on one machine
-# in-cluster means in a k8s pod (from which we get k8s creds)
-test-local-in-cluster: build/conda-env $(PY_CHECKERS)
-	. ../loadconda && conda activate hail-batch && POD_NAMESPACE='test' ./test-locally.sh
-
+.PHONY: deploy
 deploy: push
-	sed -e "s,@sha@,$$(git rev-parse --short=12 HEAD)," \
-	  -e "s,@image@,$$(cat batch-image)," \
-	  < deployment.yaml.in > deployment.yaml
-	kubectl -n default apply -f deployment.yaml
+	python3 ../ci/jinja2_render.py $(JINJA_ENVIRONMENT) deployment.yaml deployment.yaml.out
+	python3 ../ci/jinja2_render.py $(JINJA_ENVIRONMENT) service-account.yaml service-account.yaml.out
+	python3 ../ci/jinja2_render.py $(JINJA_ENVIRONMENT) service-account-batch-pods.yaml service-account-batch-pods.yaml.out
+	kubectl -n default apply -f service-account.yaml.out
+	kubectl -n default apply -f service-account-batch-pods.yaml.out
+	kubectl -n default apply -f deployment.yaml.out
+
+.PHONY: create-build-worker-image-instance
+create-build-worker-image-instance:
+	-gcloud -q compute --project $(PROJECT) instances delete --zone=$(ZONE) build-batch-worker-image
+	gcloud -q compute --project $(PROJECT) instances create --zone=$(ZONE) build-batch-worker-image --machine-type=n1-standard-1 --network=default --network-tier=PREMIUM --metadata-from-file startup-script=build-batch-worker-image-startup.sh --no-restart-on-failure --maintenance-policy=MIGRATE --scopes=https://www.googleapis.com/auth/cloud-platform --image=ubuntu-minimal-1804-bionic-v20200520 --image-project=ubuntu-os-cloud --boot-disk-size=10GB --boot-disk-type=pd-ssd
+
+.PHONY: create-worker-image
+create-worker-image:
+	-gcloud -q compute --project $(PROJECT) images delete batch-worker-8
+	gcloud -q compute --project $(PROJECT) images create batch-worker-8 --source-disk=build-batch-worker-image --source-disk-zone=$(ZONE)
+	gcloud -q compute --project $(PROJECT) instances delete --zone=$(ZONE) build-batch-worker-image

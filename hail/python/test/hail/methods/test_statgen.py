@@ -17,12 +17,13 @@ tearDownModule = stopTestHailContext
 
 
 class Tests(unittest.TestCase):
+    @skip_unless_spark_backend()
     @unittest.skipIf('HAIL_TEST_SKIP_PLINK' in os.environ, 'Skipping tests requiring plink')
     def test_ibd(self):
         dataset = get_dataset()
 
         def plinkify(ds, min=None, max=None):
-            vcf = utils.new_temp_file(prefix="plink", suffix="vcf")
+            vcf = utils.new_temp_file(prefix="plink", extension="vcf")
             plinkpath = utils.new_temp_file(prefix="plink")
             hl.export_vcf(ds, vcf)
             threshold_string = "{} {}".format("--min {}".format(min) if min else "",
@@ -77,7 +78,7 @@ class Tests(unittest.TestCase):
 
         sex = hl.impute_sex(ds.GT, include_par=True)
 
-        vcf_file = utils.uri_path(utils.new_temp_file(prefix="plink", suffix="vcf"))
+        vcf_file = utils.uri_path(utils.new_temp_file(prefix="plink", extension="vcf"))
         out_file = utils.uri_path(utils.new_temp_file(prefix="plink"))
 
         hl.export_vcf(ds, vcf_file)
@@ -107,7 +108,9 @@ class Tests(unittest.TestCase):
 
         self.assertTrue(hl.impute_sex(ds.GT)._same(hl.impute_sex(ds.GT, aaf='aaf')))
 
-    def test_linreg(self):
+    linreg_functions = [hl.linear_regression_rows, hl._linear_regression_rows_nd]
+
+    def test_linreg_basic(self):
         phenos = hl.import_table(resource('regressionLinear.pheno'),
                                  types={'Pheno': hl.tfloat64},
                                  key='Sample')
@@ -119,27 +122,28 @@ class Tests(unittest.TestCase):
         mt = mt.annotate_cols(pheno=phenos[mt.s].Pheno, cov=covs[mt.s])
         mt = mt.annotate_entries(x=mt.GT.n_alt_alleles()).cache()
 
-        t1 = hl.linear_regression_rows(
-            y=mt.pheno, x=mt.GT.n_alt_alleles(), covariates=[1.0, mt.cov.Cov1, mt.cov.Cov2 + 1 - 1])
-        t1 = t1.select(p=t1.p_value)
+        for linreg_function in self.linreg_functions:
+            t1 = linreg_function(
+                y=mt.pheno, x=mt.GT.n_alt_alleles(), covariates=[1.0, mt.cov.Cov1, mt.cov.Cov2 + 1 - 1])
+            t1 = t1.select(p=t1.p_value)
 
-        t2 = hl.linear_regression_rows(
-            y=mt.pheno, x=mt.x, covariates=[1.0, mt.cov.Cov1, mt.cov.Cov2])
-        t2 = t2.select(p=t2.p_value)
+            t2 = linreg_function(
+                y=mt.pheno, x=mt.x, covariates=[1.0, mt.cov.Cov1, mt.cov.Cov2])
+            t2 = t2.select(p=t2.p_value)
 
-        t3 = hl.linear_regression_rows(
-            y=[mt.pheno], x=mt.x, covariates=[1.0, mt.cov.Cov1, mt.cov.Cov2])
-        t3 = t3.select(p=t3.p_value[0])
+            t3 = linreg_function(
+                y=[mt.pheno], x=mt.x, covariates=[1.0, mt.cov.Cov1, mt.cov.Cov2])
+            t3 = t3.select(p=t3.p_value[0])
 
-        t4 = hl.linear_regression_rows(
-            y=[mt.pheno, mt.pheno], x=mt.x, covariates=[1.0, mt.cov.Cov1, mt.cov.Cov2])
-        t4a = t4.select(p=t4.p_value[0])
-        t4b = t4.select(p=t4.p_value[1])
+            t4 = linreg_function(
+                y=[mt.pheno, mt.pheno], x=mt.x, covariates=[1.0, mt.cov.Cov1, mt.cov.Cov2])
+            t4a = t4.select(p=t4.p_value[0])
+            t4b = t4.select(p=t4.p_value[1])
 
-        self.assertTrue(t1._same(t2))
-        self.assertTrue(t1._same(t3))
-        self.assertTrue(t1._same(t4a))
-        self.assertTrue(t1._same(t4b))
+            self.assertTrue(t1._same(t2))
+            self.assertTrue(t1._same(t3))
+            self.assertTrue(t1._same(t4a))
+            self.assertTrue(t1._same(t4b))
 
     def test_linreg_pass_through(self):
         phenos = hl.import_table(resource('regressionLinear.pheno'),
@@ -257,19 +261,20 @@ class Tests(unittest.TestCase):
 
 
     def test_linear_regression_without_intercept(self):
-        pheno = hl.import_table(resource('regressionLinear.pheno'),
-                                key='Sample',
-                                missing='0',
-                                types={'Pheno': hl.tfloat})
-        mt = hl.import_vcf(resource('regressionLinear.vcf'))
-        ht = hl.linear_regression_rows(y=pheno[mt.s].Pheno,
-                                       x=mt.GT.n_alt_alleles(),
-                                       covariates=[])
-        results = dict(hl.tuple([ht.locus.position, ht.row]).collect())
-        self.assertAlmostEqual(results[1].beta, 1.5, places=6)
-        self.assertAlmostEqual(results[1].standard_error, 1.161895, places=6)
-        self.assertAlmostEqual(results[1].t_stat, 1.290994, places=6)
-        self.assertAlmostEqual(results[1].p_value, 0.25317, places=6)
+        for linreg_function in self.linreg_functions:
+            pheno = hl.import_table(resource('regressionLinear.pheno'),
+                                    key='Sample',
+                                    missing='0',
+                                    types={'Pheno': hl.tfloat})
+            mt = hl.import_vcf(resource('regressionLinear.vcf'))
+            ht = linreg_function(y=pheno[mt.s].Pheno,
+                                 x=mt.GT.n_alt_alleles(),
+                                 covariates=[])
+            results = dict(hl.tuple([ht.locus.position, ht.row]).collect())
+            self.assertAlmostEqual(results[1].beta, 1.5, places=6)
+            self.assertAlmostEqual(results[1].standard_error, 1.161895, places=6)
+            self.assertAlmostEqual(results[1].t_stat, 1.290994, places=6)
+            self.assertAlmostEqual(results[1].p_value, 0.25317, places=6)
 
     # comparing to R:
     # y = c(1, 1, 2, 2, 2, 2)
@@ -290,35 +295,37 @@ class Tests(unittest.TestCase):
                                 types={'Pheno': hl.tfloat})
 
         mt = hl.import_vcf(resource('regressionLinear.vcf'))
-        ht = hl.linear_regression_rows(y=pheno[mt.s].Pheno,
-                                       x=mt.GT.n_alt_alleles(),
-                                       covariates=[1.0] + list(covariates[mt.s].values()))
 
-        results = dict(hl.tuple([ht.locus.position, ht.row]).collect())
+        for linreg_function in self.linreg_functions:
+            ht = linreg_function(y=pheno[mt.s].Pheno,
+                                 x=mt.GT.n_alt_alleles(),
+                                 covariates=[1.0] + list(covariates[mt.s].values()))
 
-        self.assertAlmostEqual(results[1].beta, -0.28589421, places=6)
-        self.assertAlmostEqual(results[1].standard_error, 1.2739153, places=6)
-        self.assertAlmostEqual(results[1].t_stat, -0.22442167, places=6)
-        self.assertAlmostEqual(results[1].p_value, 0.84327106, places=6)
+            results = dict(hl.tuple([ht.locus.position, ht.row]).collect())
 
-        self.assertAlmostEqual(results[2].beta, -0.5417647, places=6)
-        self.assertAlmostEqual(results[2].standard_error, 0.3350599, places=6)
-        self.assertAlmostEqual(results[2].t_stat, -1.616919, places=6)
-        self.assertAlmostEqual(results[2].p_value, 0.24728705, places=6)
+            self.assertAlmostEqual(results[1].beta, -0.28589421, places=6)
+            self.assertAlmostEqual(results[1].standard_error, 1.2739153, places=6)
+            self.assertAlmostEqual(results[1].t_stat, -0.22442167, places=6)
+            self.assertAlmostEqual(results[1].p_value, 0.84327106, places=6)
 
-        self.assertAlmostEqual(results[3].beta, 1.07367185, places=6)
-        self.assertAlmostEqual(results[3].standard_error, 0.6764348, places=6)
-        self.assertAlmostEqual(results[3].t_stat, 1.5872510, places=6)
-        self.assertAlmostEqual(results[3].p_value, 0.2533675, places=6)
+            self.assertAlmostEqual(results[2].beta, -0.5417647, places=6)
+            self.assertAlmostEqual(results[2].standard_error, 0.3350599, places=6)
+            self.assertAlmostEqual(results[2].t_stat, -1.616919, places=6)
+            self.assertAlmostEqual(results[2].p_value, 0.24728705, places=6)
 
-        self.assertTrue(np.isnan(results[6].standard_error))
-        self.assertTrue(np.isnan(results[6].t_stat))
-        self.assertTrue(np.isnan(results[6].p_value))
+            self.assertAlmostEqual(results[3].beta, 1.07367185, places=6)
+            self.assertAlmostEqual(results[3].standard_error, 0.6764348, places=6)
+            self.assertAlmostEqual(results[3].t_stat, 1.5872510, places=6)
+            self.assertAlmostEqual(results[3].p_value, 0.2533675, places=6)
 
-        self.assertTrue(np.isnan(results[7].standard_error))
-        self.assertTrue(np.isnan(results[8].standard_error))
-        self.assertTrue(np.isnan(results[9].standard_error))
-        self.assertTrue(np.isnan(results[10].standard_error))
+            self.assertTrue(np.isnan(results[6].standard_error))
+            self.assertTrue(np.isnan(results[6].t_stat))
+            self.assertTrue(np.isnan(results[6].p_value))
+
+            self.assertTrue(np.isnan(results[7].standard_error))
+            self.assertTrue(np.isnan(results[8].standard_error))
+            self.assertTrue(np.isnan(results[9].standard_error))
+            self.assertTrue(np.isnan(results[10].standard_error))
 
     def test_linear_regression_pl(self):
 
@@ -331,26 +338,29 @@ class Tests(unittest.TestCase):
                                 types={'Pheno': hl.tfloat})
 
         mt = hl.import_vcf(resource('regressionLinear.vcf'))
-        ht = hl.linear_regression_rows(y=pheno[mt.s].Pheno,
-                                       x=hl.pl_dosage(mt.PL),
-                                       covariates=[1.0] + list(covariates[mt.s].values()))
 
-        results = dict(hl.tuple([ht.locus.position, ht.row]).collect())
+        for linreg_function in self.linreg_functions:
 
-        self.assertAlmostEqual(results[1].beta, -0.29166985, places=6)
-        self.assertAlmostEqual(results[1].standard_error, 1.2996510, places=6)
-        self.assertAlmostEqual(results[1].t_stat, -0.22442167, places=6)
-        self.assertAlmostEqual(results[1].p_value, 0.84327106, places=6)
+            ht = linreg_function(y=pheno[mt.s].Pheno,
+                                 x=hl.pl_dosage(mt.PL),
+                                 covariates=[1.0] + list(covariates[mt.s].values()))
 
-        self.assertAlmostEqual(results[2].beta, -0.5499320, places=6)
-        self.assertAlmostEqual(results[2].standard_error, 0.3401110, places=6)
-        self.assertAlmostEqual(results[2].t_stat, -1.616919, places=6)
-        self.assertAlmostEqual(results[2].p_value, 0.24728705, places=6)
+            results = dict(hl.tuple([ht.locus.position, ht.row]).collect())
 
-        self.assertAlmostEqual(results[3].beta, 1.09536219, places=6)
-        self.assertAlmostEqual(results[3].standard_error, 0.6901002, places=6)
-        self.assertAlmostEqual(results[3].t_stat, 1.5872510, places=6)
-        self.assertAlmostEqual(results[3].p_value, 0.2533675, places=6)
+            self.assertAlmostEqual(results[1].beta, -0.29166985, places=6)
+            self.assertAlmostEqual(results[1].standard_error, 1.2996510, places=6)
+            self.assertAlmostEqual(results[1].t_stat, -0.22442167, places=6)
+            self.assertAlmostEqual(results[1].p_value, 0.84327106, places=6)
+
+            self.assertAlmostEqual(results[2].beta, -0.5499320, places=6)
+            self.assertAlmostEqual(results[2].standard_error, 0.3401110, places=6)
+            self.assertAlmostEqual(results[2].t_stat, -1.616919, places=6)
+            self.assertAlmostEqual(results[2].p_value, 0.24728705, places=6)
+
+            self.assertAlmostEqual(results[3].beta, 1.09536219, places=6)
+            self.assertAlmostEqual(results[3].standard_error, 0.6901002, places=6)
+            self.assertAlmostEqual(results[3].t_stat, 1.5872510, places=6)
+            self.assertAlmostEqual(results[3].p_value, 0.2533675, places=6)
 
     def test_linear_regression_with_dosage(self):
 
@@ -362,27 +372,29 @@ class Tests(unittest.TestCase):
                                 missing='0',
                                 types={'Pheno': hl.tfloat})
         mt = hl.import_gen(resource('regressionLinear.gen'), sample_file=resource('regressionLinear.sample'))
-        ht = hl.linear_regression_rows(y=pheno[mt.s].Pheno,
-                                       x=hl.gp_dosage(mt.GP),
-                                       covariates=[1.0] + list(covariates[mt.s].values()))
 
-        results = dict(hl.tuple([ht.locus.position, ht.row]).collect())
+        for linreg_function in self.linreg_functions:
+            ht = linreg_function(y=pheno[mt.s].Pheno,
+                                 x=hl.gp_dosage(mt.GP),
+                                 covariates=[1.0] + list(covariates[mt.s].values()))
 
-        self.assertAlmostEqual(results[1].beta, -0.29166985, places=4)
-        self.assertAlmostEqual(results[1].standard_error, 1.2996510, places=4)
-        self.assertAlmostEqual(results[1].t_stat, -0.22442167, places=6)
-        self.assertAlmostEqual(results[1].p_value, 0.84327106, places=6)
+            results = dict(hl.tuple([ht.locus.position, ht.row]).collect())
 
-        self.assertAlmostEqual(results[2].beta, -0.5499320, places=4)
-        self.assertAlmostEqual(results[2].standard_error, 0.3401110, places=4)
-        self.assertAlmostEqual(results[2].t_stat, -1.616919, places=6)
-        self.assertAlmostEqual(results[2].p_value, 0.24728705, places=6)
+            self.assertAlmostEqual(results[1].beta, -0.29166985, places=4)
+            self.assertAlmostEqual(results[1].standard_error, 1.2996510, places=4)
+            self.assertAlmostEqual(results[1].t_stat, -0.22442167, places=6)
+            self.assertAlmostEqual(results[1].p_value, 0.84327106, places=6)
 
-        self.assertAlmostEqual(results[3].beta, 1.09536219, places=4)
-        self.assertAlmostEqual(results[3].standard_error, 0.6901002, places=4)
-        self.assertAlmostEqual(results[3].t_stat, 1.5872510, places=6)
-        self.assertAlmostEqual(results[3].p_value, 0.2533675, places=6)
-        self.assertTrue(np.isnan(results[6].standard_error))
+            self.assertAlmostEqual(results[2].beta, -0.5499320, places=4)
+            self.assertAlmostEqual(results[2].standard_error, 0.3401110, places=4)
+            self.assertAlmostEqual(results[2].t_stat, -1.616919, places=6)
+            self.assertAlmostEqual(results[2].p_value, 0.24728705, places=6)
+
+            self.assertAlmostEqual(results[3].beta, 1.09536219, places=4)
+            self.assertAlmostEqual(results[3].standard_error, 0.6901002, places=4)
+            self.assertAlmostEqual(results[3].t_stat, 1.5872510, places=6)
+            self.assertAlmostEqual(results[3].p_value, 0.2533675, places=6)
+            self.assertTrue(np.isnan(results[6].standard_error))
 
     def test_linear_regression_equivalence_between_ds_and_gt(self):
         """Test that linear regressions on data converted from dosage to genotype returns the same results"""
@@ -391,12 +403,14 @@ class Tests(unittest.TestCase):
         pheno_t = hl.read_table(resource('small-pheno.t'))
         ds_mt = ds_mt.annotate_cols(**pheno_t[ds_mt.s])
         gt_mt = gt_mt.annotate_cols(**pheno_t[gt_mt.s])
-        ds_results_mt = hl.linear_regression_rows(y=ds_mt.phenotype, x=ds_mt.DS, covariates=[1.0])
-        gt_results_mt = hl.linear_regression_rows(y=gt_mt.phenotype, x=gt_mt.GT.n_alt_alleles(), covariates=[1.0])
-        ds_results_t = ds_results_mt.select(ds_p_value=ds_results_mt.p_value)
-        gt_results_t = gt_results_mt.select(gt_p_value=gt_results_mt.p_value)
-        results_t = ds_results_t.annotate(**gt_results_t[ds_results_t.locus, ds_results_t.alleles])
-        self.assertTrue(all(hl.approx_equal(results_t.ds_p_value, results_t.gt_p_value, nan_same=True).collect()))
+
+        for linreg_function in self.linreg_functions:
+            ds_results_mt = linreg_function(y=ds_mt.phenotype, x=ds_mt.DS, covariates=[1.0])
+            gt_results_mt = linreg_function(y=gt_mt.phenotype, x=gt_mt.GT.n_alt_alleles(), covariates=[1.0])
+            ds_results_t = ds_results_mt.select(ds_p_value=ds_results_mt.p_value)
+            gt_results_t = gt_results_mt.select(gt_p_value=gt_results_mt.p_value)
+            results_t = ds_results_t.annotate(**gt_results_t[ds_results_t.locus, ds_results_t.alleles])
+            self.assertTrue(all(hl.approx_equal(results_t.ds_p_value, results_t.gt_p_value, nan_same=True).collect()))
 
     def test_linear_regression_with_import_fam_boolean(self):
         covariates = hl.import_table(resource('regressionLinear.cov'),
@@ -404,27 +418,29 @@ class Tests(unittest.TestCase):
                                      types={'Cov1': hl.tfloat, 'Cov2': hl.tfloat})
         fam = hl.import_fam(resource('regressionLinear.fam'))
         mt = hl.import_vcf(resource('regressionLinear.vcf'))
-        ht = hl.linear_regression_rows(y=fam[mt.s].is_case,
-                                       x=mt.GT.n_alt_alleles(),
-                                       covariates=[1.0] + list(covariates[mt.s].values()))
 
-        results = dict(hl.tuple([ht.locus.position, ht.row]).collect())
+        for linreg_function in self.linreg_functions:
+            ht = linreg_function(y=fam[mt.s].is_case,
+                                 x=mt.GT.n_alt_alleles(),
+                                 covariates=[1.0] + list(covariates[mt.s].values()))
 
-        self.assertAlmostEqual(results[1].beta, -0.28589421, places=6)
-        self.assertAlmostEqual(results[1].standard_error, 1.2739153, places=6)
-        self.assertAlmostEqual(results[1].t_stat, -0.22442167, places=6)
-        self.assertAlmostEqual(results[1].p_value, 0.84327106, places=6)
+            results = dict(hl.tuple([ht.locus.position, ht.row]).collect())
 
-        self.assertAlmostEqual(results[2].beta, -0.5417647, places=6)
-        self.assertAlmostEqual(results[2].standard_error, 0.3350599, places=6)
-        self.assertAlmostEqual(results[2].t_stat, -1.616919, places=6)
-        self.assertAlmostEqual(results[2].p_value, 0.24728705, places=6)
+            self.assertAlmostEqual(results[1].beta, -0.28589421, places=6)
+            self.assertAlmostEqual(results[1].standard_error, 1.2739153, places=6)
+            self.assertAlmostEqual(results[1].t_stat, -0.22442167, places=6)
+            self.assertAlmostEqual(results[1].p_value, 0.84327106, places=6)
 
-        self.assertTrue(np.isnan(results[6].standard_error))
-        self.assertTrue(np.isnan(results[7].standard_error))
-        self.assertTrue(np.isnan(results[8].standard_error))
-        self.assertTrue(np.isnan(results[9].standard_error))
-        self.assertTrue(np.isnan(results[10].standard_error))
+            self.assertAlmostEqual(results[2].beta, -0.5417647, places=6)
+            self.assertAlmostEqual(results[2].standard_error, 0.3350599, places=6)
+            self.assertAlmostEqual(results[2].t_stat, -1.616919, places=6)
+            self.assertAlmostEqual(results[2].p_value, 0.24728705, places=6)
+
+            self.assertTrue(np.isnan(results[6].standard_error))
+            self.assertTrue(np.isnan(results[7].standard_error))
+            self.assertTrue(np.isnan(results[8].standard_error))
+            self.assertTrue(np.isnan(results[9].standard_error))
+            self.assertTrue(np.isnan(results[10].standard_error))
 
     def test_linear_regression_with_import_fam_quant(self):
         covariates = hl.import_table(resource('regressionLinear.cov'),
@@ -434,27 +450,29 @@ class Tests(unittest.TestCase):
                             quant_pheno=True,
                             missing='0')
         mt = hl.import_vcf(resource('regressionLinear.vcf'))
-        ht = hl.linear_regression_rows(y=fam[mt.s].quant_pheno,
-                                       x=mt.GT.n_alt_alleles(),
-                                       covariates=[1.0] + list(covariates[mt.s].values()))
 
-        results = dict(hl.tuple([ht.locus.position, ht.row]).collect())
+        for linreg_function in self.linreg_functions:
+            ht = linreg_function(y=fam[mt.s].quant_pheno,
+                                 x=mt.GT.n_alt_alleles(),
+                                 covariates=[1.0] + list(covariates[mt.s].values()))
 
-        self.assertAlmostEqual(results[1].beta, -0.28589421, places=6)
-        self.assertAlmostEqual(results[1].standard_error, 1.2739153, places=6)
-        self.assertAlmostEqual(results[1].t_stat, -0.22442167, places=6)
-        self.assertAlmostEqual(results[1].p_value, 0.84327106, places=6)
+            results = dict(hl.tuple([ht.locus.position, ht.row]).collect())
 
-        self.assertAlmostEqual(results[2].beta, -0.5417647, places=6)
-        self.assertAlmostEqual(results[2].standard_error, 0.3350599, places=6)
-        self.assertAlmostEqual(results[2].t_stat, -1.616919, places=6)
-        self.assertAlmostEqual(results[2].p_value, 0.24728705, places=6)
+            self.assertAlmostEqual(results[1].beta, -0.28589421, places=6)
+            self.assertAlmostEqual(results[1].standard_error, 1.2739153, places=6)
+            self.assertAlmostEqual(results[1].t_stat, -0.22442167, places=6)
+            self.assertAlmostEqual(results[1].p_value, 0.84327106, places=6)
 
-        self.assertTrue(np.isnan(results[6].standard_error))
-        self.assertTrue(np.isnan(results[7].standard_error))
-        self.assertTrue(np.isnan(results[8].standard_error))
-        self.assertTrue(np.isnan(results[9].standard_error))
-        self.assertTrue(np.isnan(results[10].standard_error))
+            self.assertAlmostEqual(results[2].beta, -0.5417647, places=6)
+            self.assertAlmostEqual(results[2].standard_error, 0.3350599, places=6)
+            self.assertAlmostEqual(results[2].t_stat, -1.616919, places=6)
+            self.assertAlmostEqual(results[2].p_value, 0.24728705, places=6)
+
+            self.assertTrue(np.isnan(results[6].standard_error))
+            self.assertTrue(np.isnan(results[7].standard_error))
+            self.assertTrue(np.isnan(results[8].standard_error))
+            self.assertTrue(np.isnan(results[9].standard_error))
+            self.assertTrue(np.isnan(results[10].standard_error))
 
     def test_linear_regression_multi_pheno_same(self):
         covariates = hl.import_table(resource('regressionLinear.cov'),
@@ -466,20 +484,22 @@ class Tests(unittest.TestCase):
                                 types={'Pheno': hl.tfloat})
 
         mt = hl.import_vcf(resource('regressionLinear.vcf'))
-        single = hl.linear_regression_rows(y=pheno[mt.s].Pheno,
-                                           x=mt.GT.n_alt_alleles(),
-                                                         covariates=list(covariates[mt.s].values()))
-        multi = hl.linear_regression_rows(y=[pheno[mt.s].Pheno, pheno[mt.s].Pheno],
-                                                        x=mt.GT.n_alt_alleles(),
-                                                        covariates=list(covariates[mt.s].values()))
 
-        def eq(x1, x2):
-            return (hl.is_nan(x1) & hl.is_nan(x2)) | (hl.abs(x1 - x2) < 1e-4)
+        for linreg_function in self.linreg_functions:
+            single = linreg_function(y=pheno[mt.s].Pheno,
+                                     x=mt.GT.n_alt_alleles(),
+                                     covariates=list(covariates[mt.s].values()))
+            multi = linreg_function(y=[pheno[mt.s].Pheno, pheno[mt.s].Pheno],
+                                    x=mt.GT.n_alt_alleles(),
+                                    covariates=list(covariates[mt.s].values()))
 
-        combined = single.annotate(multi = multi[single.key])
-        self.assertTrue(combined.aggregate(hl.agg.all(
-            eq(combined.p_value, combined.multi.p_value[0]) &
-            eq(combined.multi.p_value[0], combined.multi.p_value[1]))))
+            def eq(x1, x2):
+                return (hl.is_nan(x1) & hl.is_nan(x2)) | (hl.abs(x1 - x2) < 1e-4)
+
+            combined = single.annotate(multi = multi[single.key])
+            self.assertTrue(combined.aggregate(hl.agg.all(
+                eq(combined.p_value, combined.multi.p_value[0]) &
+                eq(combined.multi.p_value[0], combined.multi.p_value[1]))))
 
     # comparing to R:
     # x = c(0, 1, 0, 0, 0, 1, 0, 0, 0, 0)
@@ -1024,6 +1044,7 @@ class Tests(unittest.TestCase):
         assert mt.aggregate_rows(hl.agg.all(mt.foo.bar == ht[mt.row_key].bar))
 
 
+    @skip_unless_spark_backend()
     def test_genetic_relatedness_matrix(self):
         n, m = 100, 200
         hl.set_global_seed(0)
@@ -1056,6 +1077,7 @@ class Tests(unittest.TestCase):
         col_filter = col_lengths > 0
         return np.copy(a[:, np.squeeze(col_filter)] / col_lengths[col_filter])
 
+    @skip_unless_spark_backend()
     def test_realized_relationship_matrix(self):
         n, m = 100, 200
         hl.set_global_seed(0)
@@ -1070,6 +1092,7 @@ class Tests(unittest.TestCase):
         rrm = hl.realized_relationship_matrix(mt.GT).to_numpy()
         self.assertTrue(np.allclose(k, rrm))
 
+    @skip_unless_spark_backend()
     def test_row_correlation_vs_hardcode(self):
         data = [{'v': '1:1:A:C', 's': '1', 'GT': hl.Call([0, 0])},
                 {'v': '1:1:A:C', 's': '2', 'GT': hl.Call([0, 0])},
@@ -1091,6 +1114,7 @@ class Tests(unittest.TestCase):
 
         self.assertTrue(np.allclose(actual, expected))
 
+    @skip_unless_spark_backend()
     def test_row_correlation_vs_numpy(self):
         n, m = 11, 10
         hl.set_global_seed(0)
@@ -1107,6 +1131,7 @@ class Tests(unittest.TestCase):
         self.assertTrue(cor.shape[0] > 5 and cor.shape[0] == cor.shape[1])
         self.assertTrue(np.allclose(l, cor))
 
+    @skip_unless_spark_backend()
     def test_ld_matrix(self):
         data = [{'v': '1:1:A:C',       'cm': 0.1, 's': 'a', 'GT': hl.Call([0, 0])},
                 {'v': '1:1:A:C',       'cm': 0.1, 's': 'b', 'GT': hl.Call([0, 0])},
@@ -1173,6 +1198,9 @@ class Tests(unittest.TestCase):
         self.assertEqual(scores.count(), mt.count_cols())
         self.assertEqual(loadings.count(), n_rows)
 
+        assert len(scores.globals) == 0
+        assert len(loadings.globals) == 0
+
         # compute PCA with numpy
         def normalize(a):
             ms = np.mean(a, axis=0, keepdims=True)
@@ -1197,78 +1225,78 @@ class Tests(unittest.TestCase):
         check(hail_scores, np_scores)
         check(hail_loadings, np_loadings)
 
-    def _R_pc_relate(self, mt, maf):
-        plink_file = utils.uri_path(utils.new_temp_file())
-        hl.export_plink(mt, plink_file, ind_id=hl.str(mt.col_key[0]))
-        utils.run_command(["Rscript",
-                           resource("is/hail/methods/runPcRelate.R"),
-                           plink_file,
-                           str(maf)])
+    @skip_unless_spark_backend()
+    def test_pc_relate_against_R_truth(self):
+        mt = hl.import_vcf(resource('pc_relate_bn_input.vcf.bgz'))
+        hail_kin = hl.pc_relate(mt.GT, 0.00, k=2).checkpoint(utils.new_temp_file(extension='ht'))
 
-        types = {
-            'ID1': hl.tstr,
-            'ID2': hl.tstr,
-            'nsnp': hl.tfloat64,
-            'kin': hl.tfloat64,
-            'k0': hl.tfloat64,
-            'k1': hl.tfloat64,
-            'k2': hl.tfloat64
-        }
-        plink_kin = hl.import_table(plink_file + '.out',
-                                    delimiter=' +',
-                                    types=types)
-        return plink_kin.select(i=hl.struct(sample_idx=plink_kin.ID1),
-                                j=hl.struct(sample_idx=plink_kin.ID2),
-                                kin=plink_kin.kin,
-                                ibd0=plink_kin.k0,
-                                ibd1=plink_kin.k1,
-                                ibd2=plink_kin.k2).key_by('i', 'j')
+        r_kin = hl.import_table(resource('pc_relate_r_truth.tsv.bgz'),
+                                types={'i': 'struct{s:str}',
+                                       'j': 'struct{s:str}',
+                                       'kin': 'float',
+                                       'ibd0': 'float',
+                                       'ibd1': 'float',
+                                       'ibd2': 'float'},
+                                key=['i', 'j'])
+        assert r_kin.select("kin")._same(hail_kin.select("kin"), tolerance=1e-3, absolute=True)
+        assert r_kin.select("ibd0")._same(hail_kin.select("ibd0"), tolerance=1.3e-2, absolute=True)
+        assert r_kin.select("ibd1")._same(hail_kin.select("ibd1"), tolerance=2.6e-2, absolute=True)
+        assert r_kin.select("ibd2")._same(hail_kin.select("ibd2"), tolerance=1.3e-2, absolute=True)
 
-    @unittest.skipIf('HAIL_TEST_SKIP_R' in os.environ, 'Skipping tests requiring R')
-    def test_pc_relate_on_balding_nichols_against_R_pc_relate(self):
-        mt = hl.balding_nichols_model(3, 100, 1000)
-        mt = mt.key_cols_by(sample_idx=hl.str(mt.sample_idx))
-        hkin = hl.pc_relate(mt.GT, 0.00, k=2).cache()
-        rkin = self._R_pc_relate(mt, 0.00).cache()
+    @skip_unless_spark_backend()
+    def test_pc_relate_simple_example(self):
+        gs = hl.literal(
+            [[0, 0, 0, 0, 1, 1, 1, 1],
+             [0, 0, 1, 1, 0, 0, 1, 1],
+             [0, 1, 0, 1, 0, 1, 0, 1],
+             [0, 0, 1, 1, 0, 0, 1, 1]])
+        scores = hl.literal([[0, 1], [1, 1], [1, 0], [0, 0]])
+        mt = hl.utils.range_matrix_table(n_rows=8, n_cols=4)
+        mt = mt.annotate_entries(GT=hl.unphased_diploid_gt_index_call(gs[mt.col_idx][mt.row_idx]))
+        mt = mt.annotate_cols(scores=scores[mt.col_idx])
+        pcr = hl.pc_relate(mt.GT, min_individual_maf=0, scores_expr=mt.scores)
 
-        self.assertTrue(rkin.select("kin")._same(hkin.select("kin"), tolerance=1e-3, absolute=True))
-        self.assertTrue(rkin.select("ibd0")._same(hkin.select("ibd0"), tolerance=1.3e-2, absolute=True))
-        self.assertTrue(rkin.select("ibd1")._same(hkin.select("ibd1"), tolerance=2.6e-2, absolute=True))
-        self.assertTrue(rkin.select("ibd2")._same(hkin.select("ibd2"), tolerance=1.3e-2, absolute=True))
+        expected = [
+            hl.Struct(i=0, j=1, kin=-0.14570713364640647,
+                      ibd0=1.4823511628401964, ibd1=-0.38187379109476693, ibd2=-0.10047737174542953),
+            hl.Struct(i=0, j=2, kin=0.16530591922102378,
+                      ibd0=0.5234783206257841, ibd1=0.2918196818643366, ibd2=0.18470199750987923),
+            hl.Struct(i=0, j=3, kin=-0.14570713364640647,
+                      ibd0=1.4823511628401964, ibd1=-0.38187379109476693, ibd2=-0.10047737174542953),
+            hl.Struct(i=1, j=2, kin=-0.14570713364640647,
+                      ibd0=1.4823511628401964, ibd1=-0.38187379109476693, ibd2=-0.10047737174542953),
+            hl.Struct(i=1, j=3, kin=0.14285714285714285,
+                      ibd0=0.7027734170591313, ibd1=0.02302459445316596, ibd2=0.2742019884877027),
+            hl.Struct(i=2, j=3, kin=-0.14570713364640647,
+                      ibd0=1.4823511628401964, ibd1=-0.38187379109476693, ibd2=-0.10047737174542953),
+        ]
+        ht_expected = hl.Table.parallelize(expected)
+        ht_expected = ht_expected.key_by(i=hl.struct(col_idx=ht_expected.i),
+                                         j=hl.struct(col_idx=ht_expected.j))
+        assert ht_expected._same(pcr)
 
+    @skip_unless_spark_backend()
     def test_pcrelate_paths(self):
         mt = hl.balding_nichols_model(3, 50, 100)
-        _, scores2, _ = hl.hwe_normalized_pca(mt.GT, k=2, compute_loadings=False)
         _, scores3, _ = hl.hwe_normalized_pca(mt.GT, k=3, compute_loadings=False)
 
         kin1 = hl.pc_relate(mt.GT, 0.10, k=2, statistics='kin', block_size=64)
-        kin_s1 = hl.pc_relate(mt.GT, 0.10, scores_expr=scores2[mt.col_key].scores,
+        kin2 = hl.pc_relate(mt.GT, 0.05, k=2, min_kinship=0.01, statistics='kin2', block_size=128).cache()
+        kin3 = hl.pc_relate(mt.GT, 0.02, k=3, min_kinship=0.1, statistics='kin20', block_size=64).cache()
+        kin_s1 = hl.pc_relate(mt.GT, 0.10, scores_expr=scores3[mt.col_key].scores[:2],
                               statistics='kin', block_size=32)
 
-        kin2 = hl.pc_relate(mt.GT, 0.05, k=2, min_kinship=0.01, statistics='kin2', block_size=128).cache()
-        kin_s2 = hl.pc_relate(mt.GT, 0.05, scores_expr=scores2[mt.col_key].scores, min_kinship=0.01,
-                              statistics='kin2', block_size=16)
+        assert kin1._same(kin_s1, tolerance=1e-4)
 
-        kin3 = hl.pc_relate(mt.GT, 0.02, k=3, min_kinship=0.1, statistics='kin20', block_size=64).cache()
-        kin_s3 = hl.pc_relate(mt.GT, 0.02, scores_expr=scores3[mt.col_key].scores, min_kinship=0.1,
-                              statistics='kin20', block_size=32)
+        assert kin1.count() == 50 * 49 / 2
 
-        kin4 = hl.pc_relate(mt.GT, 0.01, k=3, statistics='all', block_size=128)
-        kin_s4 = hl.pc_relate(mt.GT, 0.01, scores_expr=scores3[mt.col_key].scores, statistics='all', block_size=16)
+        assert kin2.count() > 0
+        assert kin2.filter(kin2.kin < 0.01).count() == 0
 
-        self.assertTrue(kin1._same(kin_s1, tolerance=1e-4))
-        self.assertTrue(kin2._same(kin_s2, tolerance=1e-4))
-        self.assertTrue(kin3._same(kin_s3, tolerance=1e-4))
-        self.assertTrue(kin4._same(kin_s4, tolerance=1e-2))
+        assert kin3.count() > 0
+        assert kin3.filter(kin3.kin < 0.1).count() == 0
 
-        self.assertTrue(kin1.count() == 50 * 49 / 2)
-
-        self.assertTrue(kin2.count() > 0)
-        self.assertTrue(kin2.filter(kin2.kin < 0.01).count() == 0)
-
-        self.assertTrue(kin3.count() > 0)
-        self.assertTrue(kin3.filter(kin3.kin < 0.1).count() == 0)
-
+    @skip_unless_spark_backend()
     def test_pcrelate_issue_5263(self):
         mt = hl.balding_nichols_model(3, 50, 100)
         expected = hl.pc_relate(mt.GT, 0.10, k=2, statistics='all')
@@ -1301,12 +1329,30 @@ class Tests(unittest.TestCase):
         ds1 = ds1.drop('was_split', 'a_index')
         self.assertTrue(ds1._same(ds2))
 
+    def test_split_multi_shuffle(self):
+        ht = hl.utils.range_table(1)
+        ht = ht.annotate(keys=[hl.struct(locus=hl.locus('1', 1180), alleles=['A', 'C', 'T']),
+                               hl.struct(locus=hl.locus('1', 1180), alleles=['A', 'G'])])
+        ht = ht.explode(ht.keys)
+        ht = ht.key_by(**ht.keys).drop('keys')
+        alleles = hl.split_multi(ht, permit_shuffle=True).alleles.collect()
+        assert alleles == [['A', 'C'], ['A', 'G'], ['A', 'T']]
+
+        ht = ht.annotate_globals(cols = [hl.struct(s='sample1'), hl.struct(s='sample2')])
+        ht = ht.annotate(entries=[hl.struct(GT=hl.call(0, 1)), hl.struct(GT=hl.call(1, 1))])
+        mt = ht._unlocalize_entries('entries', 'cols', ['s'])
+        mt = hl.split_multi_hts(mt, permit_shuffle=True)
+        mt._force_count_rows()
+        assert mt.alleles.collect() == [['A', 'C'], ['A', 'G'], ['A', 'T']]
+
+
     def test_issue_4527(self):
         mt = hl.utils.range_matrix_table(1, 1)
         mt = mt.key_rows_by(locus=hl.locus(hl.str(mt.row_idx+1), mt.row_idx+1), alleles=['A', 'T'])
         mt = hl.split_multi(mt)
         self.assertEqual(1, mt._force_count_rows())
 
+    @skip_unless_spark_backend()
     def test_ld_prune(self):
         r2_threshold = 0.001
         window_size = 5
@@ -1342,6 +1388,7 @@ class Tests(unittest.TestCase):
 
         self.assertEqual(entries.filter(bad_pair).count(), 0)
 
+    @skip_unless_spark_backend()
     def test_ld_prune_inputs(self):
         ds = hl.balding_nichols_model(n_populations=1, n_samples=1, n_variants=1)
         self.assertRaises(ValueError, lambda: hl.ld_prune(ds.GT, memory_per_core=0))
@@ -1349,17 +1396,20 @@ class Tests(unittest.TestCase):
         self.assertRaises(ValueError, lambda: hl.ld_prune(ds.GT, r2=-1.0))
         self.assertRaises(ValueError, lambda: hl.ld_prune(ds.GT, r2=2.0))
 
+    @skip_unless_spark_backend()
     def test_ld_prune_no_prune(self):
         ds = hl.balding_nichols_model(n_populations=1, n_samples=10, n_variants=10, n_partitions=3)
         pruned_table = hl.ld_prune(ds.GT, r2=0.0, bp_window_size=0)
         expected_count = ds.filter_rows(agg.collect_as_set(ds.GT).size() > 1, keep=True).count_rows()
         self.assertEqual(pruned_table.count(), expected_count)
 
+    @skip_unless_spark_backend()
     def test_ld_prune_identical_variants(self):
         ds = hl.import_vcf(resource('ldprune2.vcf'), min_partitions=2)
         pruned_table = hl.ld_prune(ds.GT)
         self.assertEqual(pruned_table.count(), 1)
 
+    @skip_unless_spark_backend()
     def test_ld_prune_maf(self):
         ds = hl.balding_nichols_model(n_populations=1, n_samples=50, n_variants=10, n_partitions=10).cache()
 
@@ -1374,12 +1424,21 @@ class Tests(unittest.TestCase):
 
         self.assertEqual(kept_maf, max(ht.maf.collect()))
 
+    @skip_unless_spark_backend()
     def test_ld_prune_call_expression(self):
         ds = hl.import_vcf(resource("ldprune2.vcf"), min_partitions=2)
         ds = ds.select_entries(foo=ds.GT)
         pruned_table = hl.ld_prune(ds.foo)
         self.assertEqual(pruned_table.count(), 1)
 
+    @skip_unless_spark_backend()
+    def test_ld_prune_missing_entries(self):
+        mt = hl.import_vcf(resource("ldprune2.vcf"), min_partitions=2).add_col_index()
+        mt = mt.filter_entries(mt.col_idx > 1)
+        result = hl.ld_prune(mt.GT)
+        assert result.count() > 0
+
+    @skip_unless_spark_backend()
     def test_ld_prune_with_duplicate_row_keys(self):
         ds = hl.import_vcf(resource('ldprune2.vcf'), min_partitions=2)
         ds_duplicate = ds.annotate_rows(duplicate=[1, 2]).explode_rows('duplicate')

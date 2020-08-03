@@ -1,16 +1,19 @@
 package is.hail.io.bgen
 
+import is.hail.HailContext
 import is.hail.annotations.{Region, _}
-import is.hail.asm4s._
-import is.hail.expr.types._
-import is.hail.expr.types.physical.{PArray, PStruct}
-import is.hail.expr.types.virtual.{TArray, TInterval, Type}
-import is.hail.io.index.IndexReader
+import is.hail.asm4s.{coerce, _}
+import is.hail.backend.BroadcastValue
+import is.hail.expr.ir.{EmitFunctionBuilder, EmitMethodBuilder, EmitRegion, ExecuteContext, ParamType}
+import is.hail.expr.ir.functions.StringFunctions
+import is.hail.types._
+import is.hail.types.physical.{PArray, PCanonicalArray, PStruct, PType}
+import is.hail.types.virtual.{TArray, TInterval, Type}
+import is.hail.io.index.{IndexReader, IndexReaderBuilder}
 import is.hail.io.{ByteArrayReader, HadoopFSDataBinaryReader}
 import is.hail.utils._
 import is.hail.variant.{Call2, ReferenceGenome}
-import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.Path
+import is.hail.io.fs.FS
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.{Partition, SparkContext}
 
@@ -23,17 +26,13 @@ trait BgenPartition extends Partition {
 
   def contigRecoding: Map[String, String]
 
-  def sHadoopConfBc: Broadcast[SerializableHadoopConfiguration]
+  def fsBc: BroadcastValue[FS]
 
   def makeInputStream: HadoopFSDataBinaryReader = {
-    val hadoopPath = new Path(path)
-    val fs = hadoopPath.getFileSystem(sHadoopConfBc.value.value)
-    val bfis = new HadoopFSDataBinaryReader(fs.open(hadoopPath))
-    bfis
+    new HadoopFSDataBinaryReader(fsBc.value.openNoCompression(path))
   }
 
-  def recodeContig(contig: String): String =
-    contigRecoding.getOrElse(contig, contig)
+  def recodeContig(contig: String): String = contigRecoding.getOrElse(contig, contig)
 }
 
 private case class LoadBgenPartition(
@@ -46,7 +45,7 @@ private case class LoadBgenPartition(
   partitionIndex: Int,
   startIndex: Long,
   endIndex: Long,
-  sHadoopConfBc: Broadcast[SerializableHadoopConfiguration]
+  fsBc: BroadcastValue[FS]
 ) extends BgenPartition {
   assert(startIndex <= endIndex)
 
@@ -54,7 +53,7 @@ private case class LoadBgenPartition(
 }
 
 object BgenRDDPartitions extends Logging {
-  def checkFilesDisjoint(hConf: Configuration, fileMetadata: Seq[BgenFileMetadata], keyType: Type): Array[Interval] = {
+  def checkFilesDisjoint(fs: FS, fileMetadata: Seq[BgenFileMetadata], keyType: Type): Array[Interval] = {
     assert(fileMetadata.nonEmpty)
     val pord = keyType.ordering
     val bounds = fileMetadata.map(md => (md.path, md.rangeBounds))
@@ -67,7 +66,7 @@ object BgenRDDPartitions extends Logging {
         val b1 = bounds(i)
         val b2 = bounds(j)
         if (!b1._2.isDisjointFrom(pord, b2._2))
-          overlappingBounds += (b1._1, b1._2, b2._1, b2._2)
+          overlappingBounds += ((b1._1, b1._2, b2._1, b2._2))
         j += 1
       }
       i += 1
@@ -84,16 +83,17 @@ object BgenRDDPartitions extends Logging {
   }
 
   def apply(
-    sc: SparkContext,
+    ctx: ExecuteContext,
+    rg: Option[ReferenceGenome],
     files: Seq[BgenFileMetadata],
     blockSizeInMB: Option[Int],
     nPartitions: Option[Int],
     keyType: Type
   ): (Array[Partition], Array[Interval]) = {
-    val hConf = sc.hadoopConfiguration
-    val sHadoopConfBc = sc.broadcast(new SerializableHadoopConfiguration(hConf))
+    val fs = ctx.fs
+    val fsBc = fs.broadcast
 
-    val fileRangeBounds = checkFilesDisjoint(hConf, files, keyType)
+    val fileRangeBounds = checkFilesDisjoint(fs, files, keyType)
     val intervalOrdering = TInterval(keyType).ordering
 
     val sortedFiles = files.zip(fileRangeBounds)
@@ -119,6 +119,12 @@ object BgenRDDPartitions extends Logging {
 
     val nonEmptyFilesAfterFilter = sortedFiles.filter(_.nVariants > 0)
 
+    val indexReaderBuilder = {
+      val (leafCodec, internalNodeCodec) = BgenSettings.indexCodecSpecs(rg)
+      val (leafPType: PStruct, leafDec) = leafCodec.buildDecoder(ctx, leafCodec.encodedVirtualType)
+      val (intPType: PStruct, intDec) = internalNodeCodec.buildDecoder(ctx, internalNodeCodec.encodedVirtualType)
+      IndexReaderBuilder.withDecoders(leafDec, intDec, BgenSettings.indexKeyType(rg), BgenSettings.indexAnnotationType, leafPType, intPType)
+    }
     if (nonEmptyFilesAfterFilter.isEmpty) {
       (Array.empty, Array.empty)
     } else {
@@ -127,7 +133,7 @@ object BgenRDDPartitions extends Logging {
       var fileIndex = 0
       while (fileIndex < nonEmptyFilesAfterFilter.length) {
         val file = nonEmptyFilesAfterFilter(fileIndex)
-        using(IndexReader(hConf, file.indexPath)) { index =>
+        using(indexReaderBuilder(fs, file.indexPath, 8)) { index =>
           val nPartitions = math.min(fileNPartitions(fileIndex), file.nVariants.toInt)
           val partNVariants = partition(file.nVariants.toInt, nPartitions)
           val partFirstVariantIndex = partNVariants.scan(0)(_ + _).init
@@ -147,7 +153,7 @@ object BgenRDDPartitions extends Logging {
               partitionIndex,
               firstVariantIndex,
               lastVariantIndex,
-              sHadoopConfBc
+              fsBc
             )
 
             rangeBounds += Interval(
@@ -168,54 +174,55 @@ object BgenRDDPartitions extends Logging {
 
 object CompileDecoder {
   def apply(
+    ctx: ExecuteContext,
     settings: BgenSettings
-  ): () => AsmFunction4[Region, BgenPartition, HadoopFSDataBinaryReader, BgenSettings, Long] = {
-    val fb = new Function4Builder[Region, BgenPartition, HadoopFSDataBinaryReader, BgenSettings, Long]
+  ): (Int, Region) => AsmFunction4[Region, BgenPartition, HadoopFSDataBinaryReader, BgenSettings, Long] = {
+    val fb = EmitFunctionBuilder[Region, BgenPartition, HadoopFSDataBinaryReader, BgenSettings, Long](ctx, "bgen_rdd_decoder")
     val mb = fb.apply_method
-    val cp = mb.getArg[BgenPartition](2).load()
-    val cbfis = mb.getArg[HadoopFSDataBinaryReader](3).load()
-    val csettings = mb.getArg[BgenSettings](4).load()
-    val srvb = new StagedRegionValueBuilder(mb, settings.pType)
-    val offset = mb.newLocal[Long]
-    val fileIdx = mb.newLocal[Int]
-    val varid = mb.newLocal[String]
-    val rsid = mb.newLocal[String]
-    val contig = mb.newLocal[String]
-    val contigRecoded = mb.newLocal[String]
-    val position = mb.newLocal[Int]
-    val nAlleles = mb.newLocal[Int]
-    val i = mb.newLocal[Int]
-    val dataSize = mb.newLocal[Int]
-    val invalidLocus = mb.newLocal[Boolean]
-    val data = mb.newLocal[Array[Byte]]
-    val uncompressedSize = mb.newLocal[Int]
-    val input = mb.newLocal[Array[Byte]]
-    val reader = mb.newLocal[ByteArrayReader]
-    val nRow = mb.newLocal[Int]
-    val nAlleles2 = mb.newLocal[Int]
-    val minPloidy = mb.newLocal[Int]
-    val maxPloidy = mb.newLocal[Int]
-    val longPloidy = mb.newLocal[Long]
-    val ploidy = mb.newLocal[Int]
-    val phase = mb.newLocal[Int]
-    val nBitsPerProb = mb.newLocal[Int]
-    val nExpectedBytesProbs = mb.newLocal[Int]
-    val c0 = mb.newLocal[Int]
-    val c1 = mb.newLocal[Int]
-    val c2 = mb.newLocal[Int]
-    val off = mb.newLocal[Int]
-    val d0 = mb.newLocal[Int]
-    val d1 = mb.newLocal[Int]
-    val d2 = mb.newLocal[Int]
-    val c = Code(
+    val region = mb.getCodeParam[Region](1)
+    val cp = mb.getCodeParam[BgenPartition](2)
+    val cbfis = mb.getCodeParam[HadoopFSDataBinaryReader](3)
+    val csettings = mb.getCodeParam[BgenSettings](4)
+
+    val regionField = mb.genFieldThisRef[Region]("region")
+    val srvb = new StagedRegionValueBuilder(mb, settings.rowPType, regionField)
+
+    val offset = mb.newLocal[Long]("offset")
+    val fileIdx = mb.newLocal[Int]("fileIdx")
+    val varid = mb.newLocal[String]("varid")
+    val rsid = mb.newLocal[String]("rsid")
+    val contig = mb.newLocal[String]("contig")
+    val contigRecoded = mb.newLocal[String]("contigRecoded")
+    val position = mb.newLocal[Int]("position")
+    val nAlleles = mb.newLocal[Int]("nAlleles")
+    val i = mb.newLocal[Int]("i")
+    val dataSize = mb.newLocal[Int]("dataSize")
+    val invalidLocus = mb.newLocal[Boolean]("invalidLocus")
+    val data = mb.newLocal[Array[Byte]]("data")
+    val uncompressedSize = mb.newLocal[Int]("uncompressedSize")
+    val input = mb.newLocal[Array[Byte]]("input")
+    val reader = mb.newLocal[ByteArrayReader]("reader")
+    val nRow = mb.newLocal[Int]("nRow")
+    val nAlleles2 = mb.newLocal[Int]("nAlleles2")
+    val minPloidy = mb.newLocal[Int]("minPloidy")
+    val maxPloidy = mb.newLocal[Int]("maxPloidy")
+    val longPloidy = mb.newLocal[Long]("longPloidy")
+    val ploidy = mb.newLocal[Int]("ploidy")
+    val phase = mb.newLocal[Int]("phase")
+    val nBitsPerProb = mb.newLocal[Int]("nBitsPerProb")
+    val nExpectedBytesProbs = mb.newLocal[Int]("nExpectedBytesProbs")
+    val c0 = mb.genFieldThisRef[Int]("c0")
+    val c1 = mb.genFieldThisRef[Int]("c1")
+    val c2 = mb.genFieldThisRef[Int]("c2")
+    val c = Code(Code(FastIndexedSeq(
       offset := cbfis.invoke[Long]("getPosition"),
       fileIdx := cp.invoke[Int]("index"),
-      if (settings.rowFields.varid) {
+      if (settings.hasField("varid")) {
         varid := cbfis.invoke[Int, String]("readLengthAndString", 2)
       } else {
         cbfis.invoke[Int, Unit]("readLengthAndSkipString", 2)
       },
-      if (settings.rowFields.rsid) {
+      if (settings.hasField("rsid")) {
         rsid := cbfis.invoke[Int, String]("readLengthAndString", 2)
       } else {
         cbfis.invoke[Int, Unit]("readLengthAndSkipString", 2)
@@ -226,7 +233,7 @@ object CompileDecoder {
       cp.invoke[Boolean]("skipInvalidLoci").mux(
         Code(
           invalidLocus :=
-            (if (settings.rg.nonEmpty) {
+            (if (settings.rgBc.nonEmpty) {
               !csettings.invoke[Option[ReferenceGenome]]("rg")
                 .invoke[ReferenceGenome]("get")
                 .invoke[String, Int, Boolean]("isValidLocus", contigRecoded, position)
@@ -245,7 +252,7 @@ object CompileDecoder {
             ),
             Code._empty // if locus is valid, continue
           )),
-        if (settings.rg.nonEmpty) {
+        if (settings.rgBc.nonEmpty) {
           // verify the locus is valid before continuing
           csettings.invoke[Option[ReferenceGenome]]("rg")
             .invoke[ReferenceGenome]("get")
@@ -254,83 +261,220 @@ object CompileDecoder {
           Code._empty // if locus is valid continue
         }
       ),
+      regionField := region,
       srvb.start(),
-      srvb.addBaseStruct(settings.pType.field("locus").typ.fundamentalType.asInstanceOf[PStruct], { srvb =>
+      if (settings.hasField("locus"))
         Code(
-          srvb.start(),
-          srvb.addString(contigRecoded),
-          srvb.advance(),
-          srvb.addInt(position))
-      }),
-      srvb.advance(),
+        srvb.addBaseStruct(settings.rowPType.field("locus").typ.fundamentalType.asInstanceOf[PStruct], { srvb =>
+          Code(
+            srvb.start(),
+            srvb.addString(contigRecoded),
+            srvb.advance(),
+            srvb.addInt(position))
+        }),
+        srvb.advance())
+      else Code._empty,
       nAlleles := cbfis.invoke[Int]("readShort"),
       nAlleles.cne(2).mux(
-        Code._fatal(
+        Code._fatal[Unit](
           const("Only biallelic variants supported, found variant with ")
             .concat(nAlleles.toS)),
         Code._empty),
-      srvb.addArray(settings.pType.field("alleles").typ.fundamentalType.asInstanceOf[PArray], { srvb =>
-        Code(
-          srvb.start(nAlleles),
-          i := 0,
-          Code.whileLoop(i < nAlleles,
-            srvb.addString(cbfis.invoke[Int, String]("readLengthAndString", 4)),
-            srvb.advance(),
-            i := i + 1))
-      }),
-      srvb.advance(),
-      if (settings.rowFields.rsid)
+      if (settings.hasField("alleles"))
+        Code(srvb.addArray(settings.rowPType.field("alleles").typ.fundamentalType.asInstanceOf[PArray], { srvb =>
+          Code(
+            srvb.start(nAlleles),
+            i := 0,
+            Code.whileLoop(i < nAlleles,
+              srvb.addString(cbfis.invoke[Int, String]("readLengthAndString", 4)),
+              srvb.advance(),
+              i := i + 1))
+        }),
+          srvb.advance())
+       else Code._empty,
+      if (settings.hasField("rsid"))
         Code(srvb.addString(rsid), srvb.advance())
       else Code._empty,
-      if (settings.rowFields.varid)
+      if (settings.hasField("varid"))
         Code(srvb.addString(varid), srvb.advance())
       else Code._empty,
-      if (settings.rowFields.offset)
+      if (settings.hasField("offset"))
         Code(srvb.addLong(offset), srvb.advance())
       else Code._empty,
-      if (settings.rowFields.fileIdx)
+      if (settings.hasField("file_idx"))
         Code(srvb.addInt(fileIdx), srvb.advance())
       else Code._empty,
       dataSize := cbfis.invoke[Int]("readInt"),
-      settings.entries match {
-        case NoEntries =>
+      settings.entryType match {
+        case None =>
           Code.toUnit(cbfis.invoke[Long, Long]("skipBytes", dataSize.toL))
 
-        case EntriesWithFields(_, _, _) if settings.dropCols =>
-          Code(
-            srvb.addArray(settings.matrixType.entryArrayType.physicalType, { srvb =>
-              srvb.start(0)
-            }),
-            srvb.advance(),
-            Code.toUnit(cbfis.invoke[Long, Long]("skipBytes", dataSize.toL)))
+        case Some(t) =>
+          val entriesArrayType = settings.rowPType.field(MatrixType.entriesIdentifier).typ.asInstanceOf[PArray]
+          val entryType = entriesArrayType.elementType.asInstanceOf[PStruct]
 
-        case EntriesWithFields(gt, gp, dosage) if !(gt || gp || dosage) =>
-          assert(settings.matrixType.entryType.physicalType.byteSize == 0)
-          Code(
-            srvb.addArray(settings.matrixType.entryArrayType.physicalType, { srvb =>
-              Code(
-                srvb.start(settings.nSamples),
-                i := 0,
-                Code.whileLoop(i < settings.nSamples,
-                  srvb.advance(),
-                  i := i + 1))
-            }),
-            srvb.advance(),
-            Code.toUnit(cbfis.invoke[Long, Long]("skipBytes", dataSize.toL)))
+          val includeGT = t.hasField("GT")
+          val includeGP = t.hasField("GP")
+          val includeDosage = t.hasField("dosage")
 
-        case EntriesWithFields(includeGT, includeGP, includeDosage) =>
-          Code(
+          val alreadyMemoized = mb.genFieldThisRef[Boolean]("alreadyMemoized")
+          val memoizedEntryData = mb.genFieldThisRef[Long]("memoizedEntryData")
+
+          val memoTyp = PCanonicalArray(entryType.setRequired(true), required = true)
+          val memoizeAllValues: Code[Unit] = {
+            val memoMB = mb.genEmitMethod("memoizeEntries", FastIndexedSeq[ParamType](), UnitInfo)
+
+            val d0 = memoMB.newLocal[Int]("memoize_entries_d0")
+            val d1 = memoMB.newLocal[Int]("memoize_entries_d1")
+            val d2 = memoMB.newLocal[Int]("memoize_entries_d2")
+
+            val srvb = new StagedRegionValueBuilder(memoMB, memoTyp, fb.partitionRegion)
+
+            memoMB.emit(
+              alreadyMemoized.mux(
+                Code._empty,
+                Code(
+                  srvb.start(1 << 16),
+                  d0 := 0,
+                  Code.whileLoop(d0 < 256,
+                    d1 := 0,
+                    Code.whileLoop(d1 < 256,
+                      d2 := const(255) - d0 - d1,
+                      srvb.addBaseStruct(entryType, { srvb =>
+                        val addGT: Code[Unit] = if (includeGT) {
+
+                          val addGtMB = mb.genEmitMethod("bgen_add_gt",
+                            FastIndexedSeq[ParamType](IntInfo, IntInfo, IntInfo),
+                            UnitInfo)
+                          val d0arg = addGtMB.getCodeParam[Int](1)
+                          val d1arg = addGtMB.getCodeParam[Int](2)
+                          val d2arg = addGtMB.getCodeParam[Int](3)
+
+                          addGtMB.emit(
+                            Code(
+                              (d0arg > d1arg).mux(
+                                (d0arg > d2arg).mux(
+                                  srvb.addInt(c0),
+                                  (d2arg > d0arg).mux(
+                                    srvb.addInt(c2),
+                                    // d0 == d2
+                                    srvb.setMissing())),
+                                // d0 <= d1
+                                (d2arg > d1arg).mux(
+                                  srvb.addInt(c2),
+                                  // d2 <= d1
+                                  (d1arg.ceq(d0arg) || d1arg.ceq(d2arg)).mux(
+                                    srvb.setMissing(),
+                                    srvb.addInt(c1)))),
+                              if (includeGP || includeDosage) srvb.advance() else Code._empty))
+                          addGtMB.invokeCode(d0, d1, d2)
+                        } else Code._empty
+
+                        val addGP: Code[Unit] = if (includeGP) {
+                          val addGpMB = mb.genEmitMethod("bgen_add_gp",
+                            FastIndexedSeq[ParamType](IntInfo, IntInfo, IntInfo),
+                            UnitInfo)
+
+                          val d0arg = addGpMB.getCodeParam[Int](1)
+                          val d1arg = addGpMB.getCodeParam[Int](2)
+                          val d2arg = addGpMB.getCodeParam[Int](3)
+
+                          val divisor = addGpMB.newLocal[Double]("divisor")
+
+                          addGpMB.emit(Code(
+                            srvb.addArray(entryType.field("GP").typ.asInstanceOf[PArray], { srvb =>
+                              Code(
+                                divisor := 255.0,
+                                srvb.start(3),
+                                srvb.addDouble(d0arg.toD / divisor),
+                                srvb.advance(),
+                                srvb.addDouble(d1arg.toD / divisor),
+                                srvb.advance(),
+                                srvb.addDouble(d2arg.toD / divisor))
+                            }),
+                            if (includeDosage) srvb.advance() else Code._empty))
+                          addGpMB.invokeCode(d0, d1, d2)
+                        } else Code._empty
+
+                        val addDosage: Code[Unit] = if (includeDosage) {
+                          val addDosageMB = mb.genEmitMethod("bgen_add_dosage",
+                            FastIndexedSeq[ParamType](IntInfo, IntInfo),
+                            UnitInfo)
+
+                          val d1arg = addDosageMB.getCodeParam[Int](1)
+                          val d2arg = addDosageMB.getCodeParam[Int](2)
+
+                          addDosageMB.emit(srvb.addDouble((d1arg + (d2arg << 1)).toD / 255.0))
+                          addDosageMB.invokeCode(d1, d2)
+                        } else Code._empty
+
+                        Code(srvb.start(), addGT, addGP, addDosage)
+                      }),
+                      srvb.advance(),
+                      d1 := d1 + 1
+                    ),
+                    d0 := d0 + 1
+                ),
+                memoizedEntryData := srvb.end(),
+                alreadyMemoized := true
+              )
+            ))
+            memoMB.invokeCode()
+          }
+
+          val lookupEntry: (Code[Int], Code[Int]) => Code[Long] = {
+            val lookupMB = mb.genEmitMethod("bgen_look_up_add_entry", FastIndexedSeq[ParamType](IntInfo, IntInfo), LongInfo)
+
+            val d0 = lookupMB.getCodeParam[Int](1)
+            val d1 = lookupMB.getCodeParam[Int](2)
+            lookupMB.emit(Code(
+              Code._empty,
+              memoTyp.elementOffset(memoizedEntryData, settings.nSamples, (d0 << 8) | d1)
+            ))
+            lookupMB.invokeCode(_, _)
+          }
+
+          val addEntries: Code[Array[Byte]] => Code[Unit] = {
+            val addEntriesMB = mb.genEmitMethod("bgen_add_entries", FastIndexedSeq[ParamType](typeInfo[Array[Byte]]), UnitInfo)
+            val data = addEntriesMB.getCodeParam[Array[Byte]](1)
+            val i = addEntriesMB.newLocal[Int]("i")
+            val off = addEntriesMB.newLocal[Int]("off")
+            val d0 = addEntriesMB.newLocal[Int]("d0")
+            val d1 = addEntriesMB.newLocal[Int]("d1")
+            addEntriesMB.emit(
+              srvb.addArray(entriesArrayType,
+                { srvb =>
+                  Code(
+                    srvb.start(settings.nSamples),
+                    i := 0,
+                    Code.whileLoop(i < settings.nSamples,
+                      (data(i + 8) & 0x80).cne(0).mux(
+                        srvb.setMissing(),
+                        Code(
+                          off := const(settings.nSamples + 10) + i * 2,
+                          d0 := data(off) & 0xff,
+                          d1 := data(off + 1) & 0xff,
+                          srvb.addIRIntermediate(entryType)(lookupEntry(d0, d1))
+                        )),
+                      srvb.advance(),
+                      i := i + 1))
+                })
+            )
+            addEntriesMB.invokeCode(_)
+          }
+
+          Code(FastIndexedSeq(
             cp.invoke[Boolean]("compressed").mux(
               Code(
                 uncompressedSize := cbfis.invoke[Int]("readInt"),
                 input := cbfis.invoke[Int, Array[Byte]]("readBytes", dataSize - 4),
-                data := Code.invokeScalaObject[Array[Byte], Int, Array[Byte]](
+                data := Code.invokeScalaObject2[Array[Byte], Int, Array[Byte]](
                   BgenRDD.getClass, "decompress", input, uncompressedSize)),
               data := cbfis.invoke[Int, Array[Byte]]("readBytes", dataSize)),
             reader := Code.newInstance[ByteArrayReader, Array[Byte]](data),
             nRow := reader.invoke[Int]("readInt"),
             (nRow.cne(settings.nSamples)).mux(
-              Code._fatal(
+              Code._fatal[Unit](
                 const("Row nSamples is not equal to header nSamples: ")
                   .concat(nRow.toS)
                   .concat(", ")
@@ -338,8 +482,8 @@ object CompileDecoder {
               Code._empty),
             nAlleles2 := reader.invoke[Int]("readShort"),
             (nAlleles.cne(nAlleles2)).mux(
-              Code._fatal(
-                const("""Value for `nAlleles' in genotype probability data storage is
+              Code._fatal[Unit](
+                const("""Value for 'nAlleles' in genotype probability data storage is
                         |not equal to value in variant identifying data. Expected""".stripMargin)
                   .concat(nAlleles.toS)
                   .concat(" but found ")
@@ -353,10 +497,10 @@ object CompileDecoder {
             minPloidy := reader.invoke[Int]("read"),
             maxPloidy := reader.invoke[Int]("read"),
             (minPloidy.cne(2) || maxPloidy.cne(2)).mux(
-              Code._fatal(
-                const("Hail only supports diploid genotypes. Found min ploidy `")
+              Code._fatal[Unit](
+                const("Hail only supports diploid genotypes. Found min ploidy '")
                   .concat(minPloidy.toS)
-                  .concat("' and max ploidy `")
+                  .concat("' and max ploidy '")
                   .concat(maxPloidy.toS)
                   .concat("'.")),
               Code._empty),
@@ -364,7 +508,7 @@ object CompileDecoder {
             Code.whileLoop(i < settings.nSamples,
               ploidy := reader.invoke[Int]("read"),
               ((ploidy & 0x3f).cne(2)).mux(
-                Code._fatal(
+                Code._fatal[Unit](
                   const("Ploidy value must equal to 2. Found ")
                     .concat(ploidy.toS)
                     .concat(".")),
@@ -373,99 +517,46 @@ object CompileDecoder {
             ),
             phase := reader.invoke[Int]("read"),
             (phase.cne(0) && phase.cne(1)).mux(
-              Code._fatal(
+              Code._fatal[Unit](
                 const("Phase value must be 0 or 1. Found ")
                   .concat(phase.toS)
                   .concat(".")),
               Code._empty),
             phase.ceq(1).mux(
-              Code._fatal("Hail does not support phased genotypes."),
+              Code._fatal[Unit]("Hail does not support phased genotypes."),
               Code._empty),
             nBitsPerProb := reader.invoke[Int]("read"),
             (nBitsPerProb < 1 || nBitsPerProb > 32).mux(
-              Code._fatal(
+              Code._fatal[Unit](
                 const("nBits value must be between 1 and 32 inclusive. Found ")
                   .concat(nBitsPerProb.toS)
                   .concat(".")),
               Code._empty),
             (nBitsPerProb.cne(8)).mux(
-              Code._fatal(
+              Code._fatal[Unit](
                 const("Hail only supports 8-bit probabilities, found ")
                   .concat(nBitsPerProb.toS)
                   .concat(".")),
               Code._empty),
             nExpectedBytesProbs := settings.nSamples * 2,
             (reader.invoke[Int]("length").cne(nExpectedBytesProbs + settings.nSamples + 10)).mux(
-              Code._fatal(
-                const("Number of uncompressed bytes `")
+              Code._fatal[Unit](
+                const("Number of uncompressed bytes '")
                   .concat(reader.invoke[Int]("length").toS)
-                  .concat("' does not match the expected size `")
+                  .concat("' does not match the expected size '")
                   .concat(nExpectedBytesProbs.toS)
                   .concat("'.")),
               Code._empty),
             c0 := Call2.fromUnphasedDiploidGtIndex(0),
             c1 := Call2.fromUnphasedDiploidGtIndex(1),
             c2 := Call2.fromUnphasedDiploidGtIndex(2),
-            srvb.addArray(settings.matrixType.entryArrayType.physicalType, { srvb =>
-              Code(
-                srvb.start(settings.nSamples),
-                i := 0,
-                Code.whileLoop(i < settings.nSamples,
-                  (data(i + 8) & 0x80).cne(0).mux(
-                    srvb.setMissing(),
-                    srvb.addBaseStruct(settings.matrixType.entryType.physicalType , { srvb =>
-                      Code(
-                        srvb.start(),
-                        off := const(settings.nSamples + 10) + i * 2,
-                        d0 := data(off) & 0xff,
-                        d1 := data(off + 1) & 0xff,
-                        d2 := const(255) - d0 - d1,
-                        if (includeGT) {
-                          Code(
-                            (d0 > d1).mux(
-                              (d0 > d2).mux(
-                                srvb.addInt(c0),
-                                (d2 > d0).mux(
-                                  srvb.addInt(c2),
-                                  // d0 == d2
-                                  srvb.setMissing())),
-                              // d0 <= d1
-                              (d2 > d1).mux(
-                                srvb.addInt(c2),
-                                // d2 <= d1
-                                (d1.ceq(d0) || d1.ceq(d2)).mux(
-                                  srvb.setMissing(),
-                                  srvb.addInt(c1)))),
-                            srvb.advance())
-                        } else Code._empty,
-                        if (includeGP) {
-                          Code(
-                            srvb.addArray(settings.matrixType.entryType.types(settings.matrixType.entryType.fieldIdx("GP")).asInstanceOf[TArray].physicalType, { srvb =>
-                              Code(
-                                srvb.start(3),
-                                srvb.addDouble(d0.toD / 255.0),
-                                srvb.advance(),
-                                srvb.addDouble(d1.toD / 255.0),
-                                srvb.advance(),
-                                srvb.addDouble(d2.toD / 255.0),
-                                srvb.advance())
-                            }),
-                            srvb.advance())
-                        } else Code._empty,
-                        if (includeDosage) {
-                          val dosage = (d1 + (d2 << 1)).toD / 255.0
-                          Code(
-                            srvb.addDouble(dosage),
-                            srvb.advance())
-                        } else Code._empty)
-                    })),
-                  srvb.advance(),
-                  i := i + 1))
-            }))
-      },
+            memoizeAllValues,
+            addEntries(data)
+            ))
+      })),
       srvb.end())
 
     mb.emit(c)
-    fb.result()
+    fb.resultWithIndex()
   }
 }

@@ -3,7 +3,7 @@ package is.hail.utils
 import is.hail.annotations._
 import is.hail.check._
 import is.hail.expr.ir.IRParser
-import is.hail.expr.types.virtual.TBoolean
+import is.hail.types.virtual.TBoolean
 import org.apache.spark.sql.Row
 import org.json4s.JValue
 import org.json4s.JsonAST.JObject
@@ -11,7 +11,7 @@ import org.json4s.JsonAST.JObject
 import scala.language.implicitConversions
 
 case class IntervalEndpoint(point: Any, sign: Int) extends Serializable {
-  require(-1 <= sign && sign <= 1)
+  require(sign == -1 || sign == 1)
 
   def coarsenLeft(newKeyLen: Int): IntervalEndpoint =
     coarsen(newKeyLen, -1)
@@ -52,6 +52,8 @@ case class IntervalEndpoint(point: Any, sign: Int) extends Serializable {
   * 't2' such that 't.isPrefixOf(t2)' without changing the behavior.
   */
 class Interval(val left: IntervalEndpoint, val right: IntervalEndpoint) extends Serializable {
+  require(left != null)
+  require(right != null)
   def start: Any = left.point
 
   def end: Any = right.point
@@ -60,7 +62,7 @@ class Interval(val left: IntervalEndpoint, val right: IntervalEndpoint) extends 
 
   def includesEnd: Boolean = right.sign > 0
 
-  private def ext(pord: ExtendedOrdering): ExtendedOrdering = pord.intervalEndpointOrdering
+  private def ext(pord: ExtendedOrdering): IntervalEndpointOrdering = pord.intervalEndpointOrdering
 
   def contains(pord: ExtendedOrdering, p: Any): Boolean =
     ext(pord).compare(left, p) < 0 && ext(pord).compare(right, p) > 0
@@ -100,8 +102,8 @@ class Interval(val left: IntervalEndpoint, val right: IntervalEndpoint) extends 
   def toJSON(f: (Any) => JValue): JValue =
     JObject("start" -> f(start),
       "end" -> f(end),
-      "includeStart" -> TBoolean().toJSON(includesStart),
-      "includeEnd" -> TBoolean().toJSON(includesEnd))
+      "includeStart" -> TBoolean.toJSON(includesStart),
+      "includeEnd" -> TBoolean.toJSON(includesEnd))
 
   def isBelow(pord: ExtendedOrdering, other: Interval): Boolean =
     ext(pord).compare(this.right, other.left) <= 0
@@ -212,18 +214,66 @@ object Interval {
           Interval(y, x, s, e)
       }
 
-  def ordering(pord: ExtendedOrdering, startPrimary: Boolean): ExtendedOrdering = new ExtendedOrdering {
+  def ordering(pord: ExtendedOrdering, startPrimary: Boolean, _missingEqual: Boolean = true): ExtendedOrdering = new ExtendedOrdering {
+    val missingEqual = _missingEqual
+
     override def compareNonnull(x: Any, y: Any): Int = {
       val xi = x.asInstanceOf[Interval]
       val yi = y.asInstanceOf[Interval]
 
       if (startPrimary) {
-        val c = pord.intervalEndpointOrdering.compare(xi.left, yi.left)
-        if (c != 0) c else pord.intervalEndpointOrdering.compare(xi.right, yi.right)
+        val c = pord.intervalEndpointOrdering.compareNonnull(xi.left, yi.left)
+        if (c != 0) c else pord.intervalEndpointOrdering.compareNonnull(xi.right, yi.right)
       } else {
-        val c = pord.intervalEndpointOrdering.compare(xi.right, yi.right)
-        if (c != 0) c else pord.intervalEndpointOrdering.compare(xi.left, yi.left)
+        val c = pord.intervalEndpointOrdering.compareNonnull(xi.right, yi.right)
+        if (c != 0) c else pord.intervalEndpointOrdering.compareNonnull(xi.left, yi.left)
       }
     }
+  }
+
+  def union(xs: Array[Interval], ord: IntervalEndpointOrdering): Array[Interval] = {
+
+    val sorted = xs.sortBy(_.left: Any)(ord.toOrdering)
+
+    val ab = new ArrayBuilder[Interval]()
+    var i = 0
+    while (i < sorted.length) {
+      var interval = sorted(i)
+      i += 1
+      while (i < sorted.length && ord.gteq(interval.right, sorted(i).left)) {
+        interval = Interval(interval.left, ordMax(interval.right, sorted(i).right, ord))
+        i += 1
+      }
+
+      ab += interval
+    }
+    ab.result()
+  }
+
+  // assumes that both `x1` and `x2` are both sorted, non-overlapping interval sequences.
+  def intersection(x1: Array[Interval], x2: Array[Interval], ord: IntervalEndpointOrdering): Array[Interval] = {
+
+    var i = 0
+    var j = 0
+    val ab = new ArrayBuilder[Interval]()
+
+    while (!(i >= x1.length || j >= x2.length)) {
+      val l = x1(i)
+      val r = x2(j)
+
+      if (ord.gteq(l.left, r.right))
+        j += 1
+      else if (ord.gteq(r.left, l.right))
+        i += 1
+      else {
+        val overlap = Interval(ordMax(l.left, r.left, ord), ordMin(l.right, r.right, ord))
+        ab += overlap
+        if (ord.lt(l.right, r.right))
+          i += 1
+        else
+          j += 1
+      }
+    }
+    ab.result()
   }
 }

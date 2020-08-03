@@ -1,12 +1,13 @@
 package is.hail.io.plink
 
+import is.hail.expr.ir.ExecuteContext
 import java.io.{OutputStream, OutputStreamWriter}
 
 import is.hail.HailContext
 import is.hail.annotations.Region
 import is.hail.expr.ir.MatrixValue
-import is.hail.expr.types._
-import is.hail.expr.types.physical.{PString, PStruct}
+import is.hail.types._
+import is.hail.types.physical.{PString, PStruct}
 import is.hail.variant._
 import is.hail.utils._
 import org.apache.spark.TaskContext
@@ -58,45 +59,42 @@ object ExportPlink {
     bp.flush()
   }
 
-  def apply(mv: MatrixValue, path: String): Unit = {
-    val hc = HailContext.get
-    val sc = hc.sc
-    val hConf = hc.hadoopConf
+  def apply(ctx: ExecuteContext, mv: MatrixValue, path: String): Unit = {
+    val fs = ctx.fs
+    val fsBc = fs.broadcast
 
-    val tmpBedDir = hConf.getTemporaryFile(hc.tmpDir)
-    val tmpBimDir = hConf.getTemporaryFile(hc.tmpDir)
+    val tmpBedDir = ctx.createTmpPath("export-plink", "bed")
+    val tmpBimDir = ctx.createTmpPath("export-plink", "bim")
 
-    hConf.mkDir(tmpBedDir)
-    hConf.mkDir(tmpBimDir)
-
-    val sHConfBc = sc.broadcast(new SerializableHadoopConfiguration(hConf))
+    fs.mkDir(tmpBedDir)
+    fs.mkDir(tmpBimDir)
 
     val nPartitions = mv.rvd.getNumPartitions
     val d = digitsNeeded(nPartitions)
 
-    val nSamples = mv.colValues.value.length
-    val fullRowType = mv.typ.rvRowType.physicalType
+    val nSamples = mv.colValues.javaValue.length
+    val fullRowType = mv.rvRowPType
 
     val (partFiles, nRecordsWrittenPerPartition) = mv.rvd.mapPartitionsWithIndex { (i, ctx, it) =>
-      val hConf = sHConfBc.value.value
+      val fs = fsBc.value
       val f = partFile(d, i, TaskContext.get)
       val bedPartPath = tmpBedDir + "/" + f
       val bimPartPath = tmpBimDir + "/" + f
       var rowCount = 0L
 
-      hConf.writeTextFile(bimPartPath) { bimOS =>
-        hConf.writeFile(bedPartPath) { bedOS =>
+      using(new OutputStreamWriter(fs.create(bimPartPath))) { bimOS =>
+        using(fs.create(bedPartPath)) { bedOS =>
           val v = new RegionValueVariant(fullRowType)
           val a = new BimAnnotationView(fullRowType)
           val hcv = HardCallView(fullRowType)
           val bp = new BitPacker(2, bedOS)
 
-          it.foreach { rv =>
-            v.setRegion(rv)
-            a.setRegion(rv)
+          it.foreach { ptr =>
+            v.set(ptr)
+            a.set(ptr)
             ExportPlink.writeBimRow(v, a, bimOS)
 
-            hcv.setRegion(rv)
+            hcv.set(ptr)
             ExportPlink.writeBedRow(hcv, bp, nSamples)
             ctx.region.clear()
             rowCount += 1
@@ -109,14 +107,14 @@ object ExportPlink {
 
     val nRecordsWritten = nRecordsWrittenPerPartition.sum
 
-    hConf.writeFile(tmpBedDir + "/_SUCCESS")(out => ())
-    hConf.writeFile(tmpBedDir + "/header")(out => out.write(ExportPlink.bedHeader))
-    hConf.copyMerge(tmpBedDir, path + ".bed", nPartitions, header = true, partFilesOpt = Some(partFiles))
+    using(fs.create(tmpBedDir + "/_SUCCESS"))(_ => ())
+    using(fs.create(tmpBedDir + "/header"))(out => out.write(ExportPlink.bedHeader))
+    fs.copyMerge(tmpBedDir, path + ".bed", nPartitions, header = true, partFilesOpt = Some(partFiles))
 
-    hConf.writeTextFile(tmpBimDir + "/_SUCCESS")(out => ())
-    hConf.copyMerge(tmpBimDir, path + ".bim", nPartitions, header = false, partFilesOpt = Some(partFiles))
+    using(fs.create(tmpBimDir + "/_SUCCESS"))(_ => ())
+    fs.copyMerge(tmpBimDir, path + ".bim", nPartitions, header = false, partFilesOpt = Some(partFiles))
 
-    mv.colsTableValue.export(path + ".fam", header = false)
+    mv.colsTableValue(ctx).export(ctx, path + ".fam", header = false)
 
     info(s"wrote $nRecordsWritten variants and $nSamples samples to '$path'")
   }
@@ -129,30 +127,27 @@ class BimAnnotationView(rowType: PStruct) extends View {
   private val varidIdx = varidField.index
   private val cmPosIdx = cmPosField.index
 
-  private var region: Region = _
   private var varidOffset: Long = _
   private var cmPosOffset: Long = _
 
   private var cachedVarid: String = _
 
-  def setRegion(region: Region, offset: Long) {
-    this.region = region
+  def set(offset: Long) {
+    assert(rowType.isFieldDefined(offset, varidIdx))
+    assert(rowType.isFieldDefined(offset, cmPosIdx))
 
-    assert(rowType.isFieldDefined(region, offset, varidIdx))
-    assert(rowType.isFieldDefined(region, offset, cmPosIdx))
-
-    this.varidOffset = rowType.loadField(region, offset, varidIdx)
-    this.cmPosOffset = rowType.loadField(region, offset, cmPosIdx)
+    this.varidOffset = rowType.loadField(offset, varidIdx)
+    this.cmPosOffset = rowType.loadField(offset, cmPosIdx)
 
     cachedVarid = null
   }
 
   def cmPosition(): Double =
-    region.loadDouble(cmPosOffset)
+    Region.loadDouble(cmPosOffset)
 
   def varid(): String = {
     if (cachedVarid == null)
-      cachedVarid = PString.loadString(region, varidOffset)
+      cachedVarid = varidField.typ.asInstanceOf[PString].loadString(varidOffset)
     cachedVarid
   }
 }
@@ -165,7 +160,7 @@ class BitPacker(nBitsPerItem: Int, os: OutputStream) extends Serializable {
   private var nBitsStaged = 0
 
   def +=(i: Int) {
-    data |= ((i.toUIntFromRep.toLong & bitMask) << nBitsStaged)
+    data |= ((i & 0xffffffffL & bitMask) << nBitsStaged)
     nBitsStaged += nBitsPerItem
     write()
   }

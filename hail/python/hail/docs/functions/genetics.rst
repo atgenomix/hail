@@ -11,6 +11,7 @@ Genetics functions
     parse_locus
     parse_variant
     parse_locus_interval
+    variant_str
     call
     unphased_diploid_gt_index_call
     parse_call
@@ -28,6 +29,7 @@ Genetics functions
     is_strand_ambiguous
     is_valid_contig
     is_valid_locus
+    contig_length
     allele_type
     pl_dosage
     gp_dosage
@@ -35,6 +37,7 @@ Genetics functions
     mendel_error_code
     liftover
     min_rep
+    reverse_complement
 
 .. autofunction:: locus
 .. autofunction:: locus_from_global_position
@@ -42,6 +45,7 @@ Genetics functions
 .. autofunction:: parse_locus
 .. autofunction:: parse_variant
 .. autofunction:: parse_locus_interval
+.. autofunction:: variant_str
 .. autofunction:: call
 .. autofunction:: unphased_diploid_gt_index_call
 .. autofunction:: parse_call
@@ -59,6 +63,7 @@ Genetics functions
 .. autofunction:: is_strand_ambiguous
 .. autofunction:: is_valid_contig
 .. autofunction:: is_valid_locus
+.. autofunction:: contig_length
 .. autofunction:: allele_type
 .. autofunction:: pl_dosage
 .. autofunction:: gp_dosage
@@ -66,3 +71,4 @@ Genetics functions
 .. autofunction:: mendel_error_code
 .. autofunction:: liftover
 .. autofunction:: min_rep
+.. autofunction:: reverse_complement

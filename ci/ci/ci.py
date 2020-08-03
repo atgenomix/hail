@@ -1,416 +1,429 @@
+import traceback
 import json
+import os
 import logging
+import asyncio
+import concurrent.futures
+import aiohttp
+from aiohttp import web
+import aiohttp_session
+import uvloop
+from gidgethub import aiohttp as gh_aiohttp, routing as gh_routing, sansio as gh_sansio
+from hailtop.utils import collect_agen, humanize_timedelta_msecs
+from hailtop.batch_client.aioclient import BatchClient
+from hailtop.config import get_deploy_config
+from hailtop.tls import get_in_cluster_server_ssl_context
+from hailtop.hail_logging import AccessLogger
+from gear import (setup_aiohttp_session, rest_authenticated_developers_only,
+                  web_authenticated_developers_only, check_csrf_token,
+                  create_database_pool)
+from web_common import (setup_aiohttp_jinja2, setup_common_static_routes,
+                        render_template, set_message)
 
-import collections
-import requests
-import threading
-import time
-from batch.client import Job
-from flask import Flask, request, jsonify, render_template, redirect
-from flask_cors import CORS
+from .environment import BUCKET
+from .github import Repo, FQBranch, WatchedBranch, UnwatchedBranch
 
-from .batch_helper import try_to_cancel_job, job_ordering
-from .ci_logging import log
-from .constants import BUILD_JOB_TYPE, GCS_BUCKET, GCS_BUCKET_PREFIX, \
-    DEPLOY_JOB_TYPE
-from .environment import \
-    batch_client, \
-    WATCHED_TARGETS, \
-    REFRESH_INTERVAL_IN_SECONDS
-from .git_state import Repo, FQRef, FQSHA
-from .github import open_pulls, overall_review_state, latest_sha_for_ref
-from .google_storage import \
-    upload_public_gs_file_from_filename, \
-    upload_public_gs_file_from_string
-from .http_helper import BadStatus, get_repo
-from .pr import GitHubPR
-from .prs import PRS
+with open(os.environ.get('HAIL_CI_OAUTH_TOKEN', 'oauth-token/oauth-token'), 'r') as f:
+    oauth_token = f.read().strip()
 
-prs = PRS({k: v for [k, v] in WATCHED_TARGETS})
+log = logging.getLogger('ci')
 
-app = Flask(__name__)
-CORS(app)
+uvloop.install()
 
+deploy_config = get_deploy_config()
 
-@app.errorhandler(BadStatus)
-def handle_invalid_usage(error):
-    log.exception('bad status found when making request')
-    return jsonify(error.data), error.status_code
+watched_branches = [
+    WatchedBranch(index, FQBranch.from_short_str(bss), deployable)
+    for (index, [bss, deployable]) in enumerate(json.loads(os.environ.get('HAIL_WATCHED_BRANCHES', '[]')))
+]
 
-
-@app.route('/status')
-def status():
-    return jsonify(prs.to_json())
+routes = web.RouteTableDef()
 
 
-@app.route('/push', methods=['POST'])
-def github_push():
-    d = request.json
-    if 'zen' in d:
-        log.info(f'received zen: {d["zen"]}')
-        return '', 200
+@routes.get('')
+@routes.get('/')
+@web_authenticated_developers_only()
+async def index(request, userdata):  # pylint: disable=unused-argument
+    app = request.app
+    dbpool = app['dbpool']
+    wb_configs = []
+    for i, wb in enumerate(watched_branches):
+        if wb.prs:
+            pr_configs = []
+            for pr in wb.prs.values():
+                batch_id = pr.batch.id if pr.batch and hasattr(pr.batch, 'id') else None
+                build_state = pr.build_state if await pr.authorized(dbpool) else 'unauthorized'
+                if build_state is None and batch_id is not None:
+                    build_state = 'building'
 
-    ref = d['ref']
-    if ref.startswith('refs/heads'):
-        target_ref = FQRef(Repo.from_gh_json(d['repository']), ref[11:])
-        target = FQSHA(target_ref, d['after'])
-        prs.push(target)
-    else:
-        log.info(
-            f'ignoring ref push {ref} because it does not start with '
-            '"refs/heads/"'
-        )
-    return '', 200
-
-
-@app.route('/pull_request', methods=['POST'])
-def github_pull_request():
-    d = request.json
-    if 'zen' in d:
-        log.info(f'received zen: {d["zen"]}')
-        return '', 200
-
-    assert 'action' in d, d
-    assert 'pull_request' in d, d
-    action = d['action']
-    if action in ('opened', 'synchronize'):
-        target_sha = FQSHA.from_gh_json(d['pull_request']['base']).sha
-        gh_pr = GitHubPR.from_gh_json(d['pull_request'], target_sha)
-        prs.pr_push(gh_pr)
-    elif action == 'closed':
-        gh_pr = GitHubPR.from_gh_json(d['pull_request'])
-        log.info(f'forgetting closed pr {gh_pr.short_str()}')
-        prs.forget(gh_pr.source.ref, gh_pr.target_ref)
-    else:
-        log.info(f'ignoring pull_request with action {action}')
-    return '', 200
-
-
-@app.route('/pull_request_review', methods=['POST'])
-def github_pull_request_review():
-    d = request.json
-    if 'zen' in d:
-        log.info(f'received zen: {d["zen"]}')
-        return '', 200
-
-    action = d['action']
-    gh_pr = GitHubPR.from_gh_json(d['pull_request'])
-
-    if action == 'submitted':
-        state = d['review']['state'].lower()
-        if state == 'changes_requested':
-            prs.review(gh_pr, state)
+                pr_config = {
+                    'number': pr.number,
+                    'title': pr.title,
+                    # FIXME generate links to the merge log
+                    'batch_id': pr.batch.id if pr.batch and hasattr(pr.batch, 'id') else None,
+                    'build_state': build_state,
+                    'review_state': pr.review_state,
+                    'author': pr.author,
+                    'out_of_date': pr.build_state in ['failure', 'success', None] and not pr.is_up_to_date(),
+                }
+                pr_configs.append(pr_config)
         else:
-            # FIXME: track all reviewers, then we don't need to talk to github
-            prs.review(
-                gh_pr,
-                overall_review_state(
-                    get_reviews(gh_pr.target_ref.repo,
-                                gh_pr.number))['state'])
-    elif action == 'dismissed':
-        # FIXME: track all reviewers, then we don't need to talk to github
-        prs.review(
-            gh_pr,
-            overall_review_state(get_reviews(gh_pr.target_ref.repo,
-                                             gh_pr.number))['state'])
-    else:
-        log.info(f'ignoring pull_request_review with action {action}')
-    return '', 200
-
-
-@app.route('/ci_build_done', methods=['POST'])
-def ci_build_done():
-    d = request.json
-    attributes = d['attributes']
-    source = FQSHA.from_json(json.loads(attributes['source']))
-    target = FQSHA.from_json(json.loads(attributes['target']))
-    job = Job(batch_client, d['id'], attributes=attributes, _status=d)
-    receive_ci_job(source, target, job)
-    return '', 200
-
-
-@app.route('/deploy_build_done', methods=['POST'])
-def deploy_build_done():
-    d = request.json
-    attributes = d['attributes']
-    target = FQSHA.from_json(json.loads(attributes['target']))
-    job = Job(batch_client, d['id'], attributes=attributes, _status=d)
-    receive_deploy_job(target, job)
-    return '', 200
-
-
-@app.route('/refresh_batch_state', methods=['POST'])
-def refresh_batch_state():
-    jobs = batch_client.list_jobs()
-    build_jobs = [
-        job for job in jobs
-        if job.attributes and job.attributes.get('type', None) == BUILD_JOB_TYPE
-    ]
-    refresh_ci_build_jobs(build_jobs)
-    deploy_jobs = [
-        job for job in jobs
-        if job.attributes and job.attributes.get('type', None) == DEPLOY_JOB_TYPE
-    ]
-    refresh_deploy_jobs(deploy_jobs)
-    return '', 200
-
-
-def refresh_ci_build_jobs(jobs):
-    jobs = [
-        (FQSHA.from_json(json.loads(job.attributes['source'])),
-         FQSHA.from_json(json.loads(job.attributes['target'])),
-         job)
-        for job in jobs
-    ]
-    jobs = [(s, t, j) for (s, t, j) in jobs if prs.exists(s, t)]
-    latest_jobs = {}
-    for (source, target, job) in jobs:
-        key = (source, target)
-        job2 = latest_jobs.get(key, None)
-        if job2 is None:
-            latest_jobs[key] = job
-        else:
-            if job_ordering(job, job2) > 0:
-                log.info(
-                    f'cancelling {job2.id}, preferring {job.id}'
-                )
-                try_to_cancel_job(job2)
-                latest_jobs[key] = job
-            else:
-                log.info(
-                    f'cancelling {job.id}, preferring {job2.id}'
-                )
-                try_to_cancel_job(job)
-    prs.refresh_from_ci_jobs(latest_jobs)
-
-def refresh_deploy_jobs(jobs):
-    jobs = [
-        (FQSHA.from_json(json.loads(job.attributes['target'])),
-         job)
-        for job in jobs
-        if 'target' in job.attributes
-    ]
-    jobs = [
-        (target, job)
-        for (target, job) in jobs
-        if target.ref in prs.deploy_jobs
-    ]
-    latest_jobs = {}
-    for (target, job) in jobs:
-        job2 = latest_jobs.get(target, None)
-        if job2 is None:
-            latest_jobs[target] = job
-        else:
-            if job_ordering(job, job2) > 0:
-                log.info(
-                    f'cancelling {job2.id}, preferring {job.id}'
-                )
-                try_to_cancel_job(job2)
-                latest_jobs[target] = job
-            else:
-                log.info(
-                    f'cancelling {job.id}, preferring {job2.id}'
-                )
-                try_to_cancel_job(job)
-    prs.refresh_from_deploy_jobs(latest_jobs)
-
-
-@app.route('/force_retest_flat', methods=['POST'])
-def force_retest_flat():
-    d = request.form
-    source = FQRef(Repo(d['source_repo_owner'], d['source_repo_name']), d['source_branch_name'])
-    target = FQRef(Repo(d['target_repo_owner'], d['target_repo_name']), d['target_branch_name'])
-    log.info(f'Request from force_retest_flat to retest PR from {source} to {target}')
-    try:
-        prs.build(source, target)
-    except ValueError as e:
-        log.error(f'Could not retest PR from {source} to {target}:\n  {e}')
-        pass
-    return redirect('/ui')
-
-
-@app.route('/force_retest', methods=['POST'])
-def force_retest():
-    d = request.json
-    source = FQRef.from_json(d['source'])
-    target = FQRef.from_json(d['target'])
-    log.info(f'Request from force_retest to retest PR from {source} to {target}')
-    try:
-        prs.build(source, target)
-        return '', 200
-    except ValueError as e:
-        log.error(f'Could not retest PR from {source} to {target}:\n  {e}')
-        return str(e), 400
-
-
-@app.route('/force_redeploy', methods=['POST'])
-def force_redeploy():
-    d = request.json
-    target = FQRef.from_json(d)
-    if target in prs.watched_target_refs():
-        prs.try_deploy(target)
-        return '', 200
-    else:
-        return f'{target.short_str()} not in {[ref.short_str() for ref in prs.watched_target_refs()]}', 400
-
-
-@app.route('/refresh_github_state', methods=['POST'])
-def refresh_github_state():
-    for target_repo in prs.watched_repos():
-        try:
-            pulls = open_pulls(target_repo)
-            pulls_by_target = collections.defaultdict(list)
-            latest_target_shas = {}
-            for pull in pulls:
-                gh_pr = GitHubPR.from_gh_json(pull)
-                if gh_pr.target_ref not in latest_target_shas:
-                    latest_target_shas[gh_pr.target_ref] = latest_sha_for_ref(gh_pr.target_ref)
-                sha = latest_target_shas[gh_pr.target_ref]
-                gh_pr.target_sha = sha
-                pulls_by_target[gh_pr.target_ref].append(gh_pr)
-            refresh_pulls(target_repo, pulls_by_target)
-            refresh_reviews(pulls_by_target)
-        except Exception as e:
-            log.exception(
-                f'could not refresh state for {target_repo.short_str()} due to {e}')
-    return '', 200
-
-
-def refresh_pulls(target_repo, pulls_by_target):
-    dead_targets = (
-        set(prs.live_target_refs_for_repo(target_repo)) -
-        {x for x in pulls_by_target.keys()}
-    )
-    for dead_target_ref in dead_targets:
-        prs.forget_target(dead_target_ref)
-    for (target_ref, pulls) in pulls_by_target.items():
-        for gh_pr in pulls:
-            prs.pr_push(gh_pr)
-        dead_prs = ({x.source.ref for x in prs.for_target(target_ref)} -
-                    {x.source.ref for x in pulls})
-        if len(dead_prs) != 0:
-            log.info(f'for {target_ref.short_str()}, forgetting {[x.short_str() for x in dead_prs]}')
-            for source_ref in dead_prs:
-                prs.forget(source_ref, target_ref)
-
-
-def refresh_reviews(pulls_by_target):
-    for (_, pulls) in pulls_by_target.items():
-        for gh_pr in pulls:
-            reviews = get_repo(
-                gh_pr.target_ref.repo.qname,
-                'pulls/' + gh_pr.number + '/reviews',
-                status_code=200)
-            state = overall_review_state(reviews)['state']
-            prs.review(gh_pr, state)
-
-
-@app.route('/heal', methods=['POST'])
-def heal():
-    prs.heal()
-    return '', 200
-
-
-@app.route('/healthcheck')
-def healthcheck():
-    return '', 200
-
-
-@app.route('/watched_repo', methods=['POST'])
-def set_deployable():
-    d = request.json
-    target_ref = FQRef.from_json(d['target_ref'])
-    action = d['action']
-    assert action in ('unwatch', 'watch', 'deploy')
-    prs.update_watch_state(target_ref, action)
-    return '', 200
-
-
-@app.route('/ui/')
-def ui_index():
-    targets = {}
-    for target_ref, deployed_sha in prs.latest_deployed.items():
-        targets[target_ref] = {
-            'ref': target_ref,
-            'deployed_sha': deployed_sha,
-            'job': prs.deploy_jobs.get(target_ref, None)
+            pr_configs = None
+        # FIXME recent deploy history
+        wb_config = {
+            'index': i,
+            'branch': wb.branch.short_str(),
+            'sha': wb.sha,
+            # FIXME generate links to the merge log
+            'deploy_batch_id': wb.deploy_batch.id if wb.deploy_batch and hasattr(wb.deploy_batch, 'id') else None,
+            'deploy_state': wb.deploy_state,
+            'repo': wb.branch.repo.short_str(),
+            'prs': pr_configs,
         }
-    return render_template(
-        'index.html',
-        prs_by_target=prs.all_by_target().items(),
-        targets=targets)
+        wb_configs.append(wb_config)
+
+    page_context = {
+        'watched_branches': wb_configs
+    }
+    return await render_template('ci', request, userdata, 'index.html', page_context)
 
 
-@app.route('/ui/job-log/<id>')
-def job_log(id):
-    j = batch_client.get_job(id)
-    return render_template(
-        'job-log.html',
-        id=j.id,
-        log=j.log())
+def wb_and_pr_from_request(request):
+    watched_branch_index = int(request.match_info['watched_branch_index'])
+    pr_number = int(request.match_info['pr_number'])
+
+    if watched_branch_index < 0 or watched_branch_index >= len(watched_branches):
+        raise web.HTTPNotFound()
+    wb = watched_branches[watched_branch_index]
+
+    if not wb.prs or pr_number not in wb.prs:
+        raise web.HTTPNotFound()
+    return wb, wb.prs[pr_number]
 
 
-###############################################################################
+@routes.get('/watched_branches/{watched_branch_index}/pr/{pr_number}')
+@web_authenticated_developers_only()
+async def get_pr(request, userdata):  # pylint: disable=unused-argument
+    wb, pr = wb_and_pr_from_request(request)
+
+    page_context = {}
+    page_context['repo'] = wb.branch.repo.short_str()
+    page_context['wb'] = wb
+    page_context['pr'] = pr
+    # FIXME
+    batch = pr.batch
+    if batch:
+        if hasattr(batch, 'id'):
+            status = await batch.status()
+            jobs = await collect_agen(batch.jobs())
+            for j in jobs:
+                j['duration'] = humanize_timedelta_msecs(j['duration'])
+            page_context['batch'] = status
+            page_context['jobs'] = jobs
+            page_context['artifacts'] = f'/{BUCKET}/build/{batch.attributes["token"]}'
+        else:
+            page_context['exception'] = '\n'.join(
+                traceback.format_exception(None, batch.exception, batch.exception.__traceback__))
+
+    batch_client = request.app['batch_client']
+    batches = batch_client.list_batches(
+        f'test=1 pr={pr.number}')
+    batches = sorted([b async for b in batches], key=lambda b: b.id, reverse=True)
+    page_context['history'] = [await b.status() for b in batches]
+
+    return await render_template('ci', request, userdata, 'pr.html', page_context)
 
 
-def receive_ci_job(source, target, job):
-    upload_public_gs_file_from_string(GCS_BUCKET,
-                                      f'{GCS_BUCKET_PREFIX}ci/{source.sha}/{target.sha}/job.log',
-                                      job.cached_status()['log'])
-    upload_public_gs_file_from_filename(
-        GCS_BUCKET,
-        f'{GCS_BUCKET_PREFIX}ci/{source.sha}/{target.sha}/index.html',
-        'index.html')
-    prs.ci_build_finished(source, target, job)
+async def retry_pr(wb, pr, request):
+    app = request.app
+    session = await aiohttp_session.get_session(request)
+
+    if pr.batch is None:
+        log.info('retry cannot be requested for PR #{pr.number} because it has no batch')
+        set_message(
+            session,
+            f'Retry cannot be requested for PR #{pr.number} because it has no batch.',
+            'error')
+        return
+
+    batch_id = pr.batch.id
+    dbpool = app['dbpool']
+    async with dbpool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute('INSERT INTO invalidated_batches (batch_id) VALUES (%s);', batch_id)
+    await wb.notify_batch_changed(app)
+
+    log.info(f'retry requested for PR: {pr.number}')
+    set_message(session, f'Retry requested for PR #{pr.number}.', 'info')
 
 
-def receive_deploy_job(target, job):
-    upload_public_gs_file_from_string(GCS_BUCKET,
-                                      f'{GCS_BUCKET_PREFIX}deploy/{target.sha}/job.log',
-                                      job.cached_status()['log'])
-    upload_public_gs_file_from_filename(
-        GCS_BUCKET,
-        f'{GCS_BUCKET_PREFIX}deploy/{target.sha}/index.html',
-        'deploy-index.html')
-    prs.deploy_build_finished(target, job)
+@routes.post('/watched_branches/{watched_branch_index}/pr/{pr_number}/retry')
+@check_csrf_token
+@web_authenticated_developers_only(redirect=False)
+async def post_retry_pr(request, userdata):  # pylint: disable=unused-argument
+    wb, pr = wb_and_pr_from_request(request)
+
+    await asyncio.shield(retry_pr(wb, pr, request))
+    return web.HTTPFound(
+        deploy_config.external_url('ci', f'/watched_branches/{wb.index}/pr/{pr.number}'))
 
 
-def get_reviews(repo, pr_number):
-    return get_repo(
-        repo.qname,
-        'pulls/' + pr_number + '/reviews',
-        status_code=200)
+@routes.get('/batches')
+@web_authenticated_developers_only()
+async def get_batches(request, userdata):
+    batch_client = request.app['batch_client']
+    batches = [b async for b in batch_client.list_batches()]
+    statuses = [await b.status() for b in batches]
+    page_context = {
+        'batches': statuses
+    }
+    return await render_template('ci', request, userdata, 'batches.html', page_context)
 
 
-def polling_event_loop():
-    time.sleep(1)
+@routes.get('/batches/{batch_id}')
+@web_authenticated_developers_only()
+async def get_batch(request, userdata):
+    batch_id = int(request.match_info['batch_id'])
+    batch_client = request.app['batch_client']
+    b = await batch_client.get_batch(batch_id)
+    status = await b.status()
+    jobs = await collect_agen(b.jobs())
+    for j in jobs:
+        j['duration'] = humanize_timedelta_msecs(j['duration'])
+    page_context = {
+        'batch': status,
+        'jobs': jobs
+    }
+    return await render_template('ci', request, userdata, 'batch.html', page_context)
+
+
+@routes.get('/batches/{batch_id}/jobs/{job_id}')
+@web_authenticated_developers_only()
+async def get_job(request, userdata):
+    batch_id = int(request.match_info['batch_id'])
+    job_id = int(request.match_info['job_id'])
+    batch_client = request.app['batch_client']
+    job = await batch_client.get_job(batch_id, job_id)
+    page_context = {
+        'batch_id': batch_id,
+        'job_id': job_id,
+        'job_log': await job.log(),
+        'job_status': json.dumps(await job.status(), indent=2),
+        'attempts': await job.attempts()
+    }
+    return await render_template('ci', request, userdata, 'job.html', page_context)
+
+
+@routes.post('/authorize_source_sha')
+@check_csrf_token
+@web_authenticated_developers_only(redirect=False)
+async def post_authorized_source_sha(request, userdata):  # pylint: disable=unused-argument
+    app = request.app
+    dbpool = app['dbpool']
+    post = await request.post()
+    sha = post['sha'].strip()
+    async with dbpool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute('INSERT INTO authorized_shas (sha) VALUES (%s);', sha)
+    log.info(f'authorized sha: {sha}')
+    session = await aiohttp_session.get_session(request)
+    set_message(session, f'SHA {sha} authorized.', 'info')
+    return web.HTTPFound(
+        deploy_config.external_url('ci', '/'))
+
+
+@routes.get('/healthcheck')
+async def healthcheck(request):  # pylint: disable=unused-argument
+    return web.Response(status=200)
+
+gh_router = gh_routing.Router()
+
+
+@gh_router.register('pull_request')
+async def pull_request_callback(event):
+    gh_pr = event.data['pull_request']
+    number = gh_pr['number']
+    target_branch = FQBranch.from_gh_json(gh_pr['base'])
+    for wb in watched_branches:
+        if (wb.prs and number in wb.prs) or (wb.branch == target_branch):
+            await wb.notify_github_changed(event.app)
+
+
+@gh_router.register('push')
+async def push_callback(event):
+    data = event.data
+    ref = data['ref']
+    if ref.startswith('refs/heads/'):
+        branch_name = ref[len('refs/heads/'):]
+        branch = FQBranch(Repo.from_gh_json(data['repository']), branch_name)
+        for wb in watched_branches:
+            if wb.branch == branch or any(pr.branch == branch for pr in wb.prs.values()):
+                await wb.notify_github_changed(event.app)
+
+
+@gh_router.register('pull_request_review')
+async def pull_request_review_callback(event):
+    gh_pr = event.data['pull_request']
+    number = gh_pr['number']
+    for wb in watched_branches:
+        if number in wb.prs:
+            await wb.notify_github_changed(event.app)
+
+
+async def github_callback_handler(request):
+    event = gh_sansio.Event.from_http(request.headers, await request.read())
+    event.app = request.app
+    await gh_router.dispatch(event)
+
+
+@routes.post('/github_callback')
+async def github_callback(request):
+    await asyncio.shield(github_callback_handler(request))
+    return web.Response(status=200)
+
+
+async def batch_callback_handler(request):
+    app = request.app
+    params = await request.json()
+    log.info(f'batch callback {params}')
+    attrs = params.get('attributes')
+    if attrs:
+        target_branch = attrs.get('target_branch')
+        if target_branch:
+            for wb in watched_branches:
+                if wb.branch.short_str() == target_branch:
+                    log.info(f'watched_branch {wb.branch.short_str()} notify batch changed')
+                    await wb.notify_batch_changed(app)
+
+
+@routes.get('/api/v1alpha/deploy_status')
+@rest_authenticated_developers_only
+async def deploy_status(request, userdata):  # pylint: disable=unused-argument
+    batch_client = request.app['batch_client']
+
+    async def get_failure_information(batch):
+        jobs = await collect_agen(batch.jobs())
+        return [
+            {**j,
+             'log': await batch_client.get_job_log(j['batch_id'], j['job_id'])}
+            for j in jobs if j['state'] != 'Success']
+    wb_configs = [{
+        'branch': wb.branch.short_str(),
+        'sha': wb.sha,
+        'deploy_batch_id': wb.deploy_batch.id if wb.deploy_batch and hasattr(wb.deploy_batch, 'id') else None,
+        'deploy_state': wb.deploy_state,
+        'repo': wb.branch.repo.short_str(),
+        'failure_information': None if wb.deploy_state == 'success' else await get_failure_information(wb.deploy_batch)
+    } for wb in watched_branches]
+    return web.json_response(wb_configs)
+
+
+@routes.post('/api/v1alpha/update')
+@rest_authenticated_developers_only
+async def post_update(request, userdata):  # pylint: disable=unused-argument
+    log.info('developer triggered update')
+
+    async def update_all():
+        for wb in watched_branches:
+            await wb.update(request.app)
+
+    await asyncio.ensure_future(update_all())
+    return web.Response(status=200)
+
+
+@routes.post('/api/v1alpha/dev_deploy_branch')
+@rest_authenticated_developers_only
+async def dev_deploy_branch(request, userdata):
+    app = request.app
+    try:
+        params = await request.json()
+    except Exception:
+        message = 'could not read body as JSON'
+        log.info('dev deploy failed: ' + message, exc_info=True)
+        raise web.HTTPBadRequest(text=message)
+
+    try:
+        branch = FQBranch.from_short_str(params['branch'])
+        steps = params['steps']
+    except Exception:
+        message = f'parameters are wrong; check the branch and steps syntax.\n\n{params}'
+        log.info('dev deploy failed: ' + message, exc_info=True)
+        raise web.HTTPBadRequest(text=message)
+
+    gh = app['github_client']
+    request_string = f'/repos/{branch.repo.owner}/{branch.repo.name}/git/refs/heads/{branch.name}'
+
+    try:
+        branch_gh_json = await gh.getitem(request_string)
+        sha = branch_gh_json['object']['sha']
+    except Exception:
+        message = f'error finding {branch} at GitHub'
+        log.info('dev deploy failed: ' + message, exc_info=True)
+        raise web.HTTPBadRequest(text=message)
+
+    unwatched_branch = UnwatchedBranch(branch, sha, userdata)
+
+    batch_client = app['batch_client']
+
+    try:
+        batch_id = await unwatched_branch.deploy(batch_client, steps)
+    except Exception:  # pylint: disable=broad-except
+        message = traceback.format_exc()
+        raise web.HTTPBadGateway(
+            text=f'starting the deploy failed due to\n{message}')
+    return web.json_response({'sha': sha, 'batch_id': batch_id})
+
+
+@routes.post('/api/v1alpha/batch_callback')
+async def batch_callback(request):
+    await asyncio.shield(batch_callback_handler(request))
+    return web.Response(status=200)
+
+
+async def update_loop(app):
     while True:
         try:
-            r = requests.post(
-                'http://127.0.0.1:5000/refresh_github_state',
-                timeout=360)
-            r.raise_for_status()
-            r = requests.post(
-                'http://127.0.0.1:5000/refresh_batch_state',
-                timeout=360)
-            r.raise_for_status()
-            r = requests.post('http://127.0.0.1:5000/heal', timeout=360)
-            r.raise_for_status()
-        except Exception as e:
-            log.error(f'Could not poll due to exception: {e}')
-        time.sleep(REFRESH_INTERVAL_IN_SECONDS)
+            for wb in watched_branches:
+                log.info(f'updating {wb.branch.short_str()}')
+                await wb.update(app)
+        except concurrent.futures.CancelledError:
+            raise
+        except Exception:  # pylint: disable=broad-except
+            log.exception(f'{wb.branch.short_str()} update failed due to exception')
+        await asyncio.sleep(300)
 
 
-def fix_werkzeug_logs():
-    # https://github.com/pallets/flask/issues/1359#issuecomment-291749259
-    werkzeug_logger = logging.getLogger('werkzeug')
-    from werkzeug.serving import WSGIRequestHandler
-    WSGIRequestHandler.log = lambda self, type, message, *args: \
-        getattr(werkzeug_logger, type)('%s %s' % (self.address_string(), message % args))
+async def on_startup(app):
+    app['github_client'] = gh_aiohttp.GitHubAPI(
+        aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=60)),
+        'ci',
+        oauth_token=oauth_token)
+    app['batch_client'] = await BatchClient('ci')
+    app['dbpool'] = await create_database_pool()
+
+    asyncio.ensure_future(update_loop(app))
+
+
+async def on_cleanup(app):
+    dbpool = app['dbpool']
+    dbpool.close()
+    await dbpool.wait_closed()
 
 
 def run():
-    """Main entry point."""
-    fix_werkzeug_logs()
-    threading.Thread(target=polling_event_loop).start()
-    app.run(host='0.0.0.0', threaded=False)
+    app = web.Application()
+    setup_aiohttp_jinja2(app, 'ci')
+    setup_aiohttp_session(app)
+
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+
+    setup_common_static_routes(routes)
+    app.add_routes(routes)
+
+    web.run_app(deploy_config.prefix_application(app, 'ci'),
+                host='0.0.0.0',
+                port=5000,
+                access_log_class=AccessLogger,
+                ssl_context=get_in_cluster_server_ssl_context())

@@ -1,10 +1,4 @@
-/batch.log
-/logs
-/deployment.yaml
-/test-batch-pod.yaml
-/batch-image
-/batch-test-image
+/Dockerfile.out
+/deployment.yaml.out
 flycheck_*.py
 *_flymake.py
-*.pyc
-**/__pycache__

@@ -1,172 +1,176 @@
 package is.hail.expr.ir.functions
 
+import is.hail.annotations.Region
 import is.hail.asm4s._
 import is.hail.expr.ir._
-import is.hail.expr.types.coerce
-import is.hail.expr.types.physical.{PArray, PFloat64}
-import is.hail.expr.types.virtual._
+import is.hail.types.coerce
+import is.hail.types.physical.{PArray, PCode, PFloat64, PType}
+import is.hail.types.virtual._
 import is.hail.utils._
 
 object ArrayFunctions extends RegistryFunctions {
-  def mean(a: IR): IR = {
-    val t = -coerce[TArray](a.typ).elementType
-    val tAccum = TStruct("sum" -> TFloat64(), "n" -> TInt32())
-    val accum = genUID()
-    val v = genUID()
-    val result = genUID()
+  val arrayOps: Array[(String, Type, Type, (IR, IR) => IR)] =
+    Array(
+      ("mul", tnum("T"), tv("T"), ApplyBinaryPrimOp(Multiply(), _, _)),
+      ("div", TInt32, TFloat32, ApplyBinaryPrimOp(FloatingPointDivide(), _, _)),
+      ("div", TInt64, TFloat32, ApplyBinaryPrimOp(FloatingPointDivide(), _, _)),
+      ("div", TFloat32, TFloat32, ApplyBinaryPrimOp(FloatingPointDivide(), _, _)),
+      ("div", TFloat64, TFloat64, ApplyBinaryPrimOp(FloatingPointDivide(), _, _)),
+      ("floordiv", tnum("T"), tv("T"), ApplyBinaryPrimOp(RoundToNegInfDivide(), _, _)),
+      ("add", tnum("T"), tv("T"), ApplyBinaryPrimOp(Add(), _, _)),
+      ("sub", tnum("T"), tv("T"), ApplyBinaryPrimOp(Subtract(), _, _)),
+      ("pow", tnum("T"), TFloat64, (ir1: IR, ir2: IR) => Apply("pow", Seq(), Seq(ir1, ir2), TFloat64)),
+      ("mod", tnum("T"), tv("T"), (ir1: IR, ir2: IR) => Apply("mod", Seq(), Seq(ir1, ir2), ir2.typ)))
 
-    def updateAccum(sum: IR, n: IR): IR =
-      MakeStruct(FastSeq("sum" -> sum, "n" -> n))
-
-    Let(
-      result,
-      ArrayFold(
-        a,
-        MakeStruct(FastSeq("sum" -> F64(0), "n" -> I32(0))),
-        accum,
-        v,
-        updateAccum(
-          ApplyBinaryPrimOp(Add(), GetField(Ref(accum, tAccum), "sum"), Cast(Ref(v, t), TFloat64())),
-          ApplyBinaryPrimOp(Add(), GetField(Ref(accum, tAccum), "n"), I32(1)))),
-      ApplyBinaryPrimOp(FloatingPointDivide(),
-        GetField(Ref(result, tAccum), "sum"),
-        Cast(GetField(Ref(result, tAccum), "n"), TFloat64())))
+  def mean(args: Seq[IR]): IR = {
+    val Seq(a) = args
+    val t = coerce[TArray](a.typ).elementType
+    val elt = genUID()
+    val n = genUID()
+    val sum = genUID()
+    StreamFold2(
+      ToStream(a),
+      FastIndexedSeq((n, I32(0)), (sum, zero(t))),
+      elt,
+      FastIndexedSeq(Ref(n, TInt32) + I32(1), Ref(sum, t) + Ref(elt, t)),
+      Cast(Ref(sum, t), TFloat64) / Cast(Ref(n, TInt32), TFloat64)
+    )
   }
 
-  def isEmpty(a: IR): IR = ApplyComparisonOp(EQ(TInt32()), ArrayLen(a), I32(0))
+  def isEmpty(a: IR): IR = ApplyComparisonOp(EQ(TInt32), ArrayLen(a), I32(0))
 
   def extend(a1: IR, a2: IR): IR = {
     val uid = genUID()
     val typ = a1.typ
-    If(IsNA(a1), NA(typ),
-      If(IsNA(a2), NA(typ),
-        ArrayFlatMap(
-          MakeArray(Seq(a1, a2), TArray(typ)),
+    If(IsNA(a1),
+      NA(typ),
+      If(IsNA(a2),
+        NA(typ),
+        ToArray(StreamFlatMap(
+          MakeStream(Seq(a1, a2), TStream(typ)),
           uid,
-          Ref(uid, a1.typ)
-        )
-      ))
+          ToStream(Ref(uid, a1.typ))))))
+  }
+
+  def exists(a: IR, cond: IR => IR): IR = {
+    val t = coerce[TArray](a.typ).elementType
+    StreamFold(
+      ToStream(a),
+      False(),
+      "acc",
+      "elt",
+      invoke("lor",TBoolean,
+        Ref("acc", TBoolean),
+        cond(Ref("elt", t))))
+  }
+
+  def contains(a: IR, value: IR): IR = {
+    exists(a, elt => ApplyComparisonOp(
+      EQWithNA(elt.typ, value.typ),
+      elt,
+      value))
   }
 
   def sum(a: IR): IR = {
-    val t = -coerce[TArray](a.typ).elementType
+    val t = coerce[TArray](a.typ).elementType
     val sum = genUID()
     val v = genUID()
     val zero = Cast(I64(0), t)
-    ArrayFold(a, zero, sum, v, ApplyBinaryPrimOp(Add(), Ref(sum, t), Ref(v, t)))
+    StreamFold(ToStream(a), zero, sum, v, ApplyBinaryPrimOp(Add(), Ref(sum, t), Ref(v, t)))
   }
 
   def product(a: IR): IR = {
-    val t = -coerce[TArray](a.typ).elementType
+    val t = coerce[TArray](a.typ).elementType
     val product = genUID()
     val v = genUID()
     val one = Cast(I64(1), t)
-    ArrayFold(a, one, product, v, ApplyBinaryPrimOp(Multiply(), Ref(product, t), Ref(v, t)))
+    StreamFold(ToStream(a), one, product, v, ApplyBinaryPrimOp(Multiply(), Ref(product, t), Ref(v, t)))
   }
 
   def registerAll() {
-    registerIR("isEmpty", TArray(tv("T")), TBoolean())(isEmpty)
+    registerIR1("isEmpty", TArray(tv("T")), TBoolean)((_, a) => isEmpty(a))
 
-    registerIR("extend", TArray(tv("T")), TArray(tv("T")), TArray(tv("T")))(extend)
+    registerIR2("extend", TArray(tv("T")), TArray(tv("T")), TArray(tv("T")))((_, a, b) => extend(a, b))
 
-    registerIR("append", TArray(tv("T")), tv("T"), TArray(tv("T"))) { (a, c) =>
+    registerIR2("append", TArray(tv("T")), tv("T"), TArray(tv("T"))) { (_, a, c) =>
       extend(a, MakeArray(Seq(c), TArray(c.typ)))
     }
 
-    val arrayOps: Array[(String, Type, Type, (IR, IR) => IR)] =
-      Array(
-        ("*", tnum("T"), tv("T"), ApplyBinaryPrimOp(Multiply(), _, _)),
-        ("/", TInt32(), TFloat32(), ApplyBinaryPrimOp(FloatingPointDivide(), _, _)),
-        ("/", TInt64(), TFloat32(), ApplyBinaryPrimOp(FloatingPointDivide(), _, _)),
-        ("/", TFloat32(), TFloat32(), ApplyBinaryPrimOp(FloatingPointDivide(), _, _)),
-        ("/", TFloat64(), TFloat64(), ApplyBinaryPrimOp(FloatingPointDivide(), _, _)),
-        ("//", tnum("T"), tv("T"), ApplyBinaryPrimOp(RoundToNegInfDivide(), _, _)),
-        ("+", tnum("T"), tv("T"), ApplyBinaryPrimOp(Add(), _, _)),
-        ("-", tnum("T"), tv("T"), ApplyBinaryPrimOp(Subtract(), _, _)),
-        ("**", tnum("T"), TFloat64(), (ir1: IR, ir2: IR) => Apply("**", Seq(ir1, ir2))),
-        ("%", tnum("T"), tv("T"), (ir1: IR, ir2: IR) => Apply("%", Seq(ir1, ir2))))
+    registerIR2("contains", TArray(tv("T")), tv("T"), TBoolean) { (_, a, e) => contains(a, e) }
 
     for ((stringOp, argType, retType, irOp) <- arrayOps) {
-      registerIR(stringOp, TArray(argType), argType, TArray(retType)) { (a, c) =>
+      registerIR2(stringOp, TArray(argType), argType, TArray(retType)) { (_, a, c) =>
         val i = genUID()
-        ArrayMap(a, i, irOp(Ref(i, c.typ), c))
+        ToArray(StreamMap(ToStream(a), i, irOp(Ref(i, c.typ), c)))
       }
 
-      registerIR(stringOp, argType, TArray(argType), TArray(retType)) { (c, a) =>
+      registerIR2(stringOp, argType, TArray(argType), TArray(retType)) { (_, c, a) =>
         val i = genUID()
-        ArrayMap(a, i, irOp(c, Ref(i, c.typ)))
+        ToArray(StreamMap(ToStream(a), i, irOp(c, Ref(i, c.typ))))
       }
 
-      registerIR(stringOp, TArray(argType), TArray(argType), TArray(retType)) { (array1, array2) =>
+      registerIR2(stringOp, TArray(argType), TArray(argType), TArray(retType)) { (_, array1, array2) =>
         val a1id = genUID()
-        val a1 = Ref(a1id, array1.typ)
+        val e1 = Ref(a1id, coerce[TArray](array1.typ).elementType)
         val a2id = genUID()
-        val a2 = Ref(a2id, array2.typ)
-        val iid = genUID()
-        val i = Ref(iid, TInt32())
-        val body =
-          ArrayMap(ArrayRange(I32(0), ArrayLen(a1), I32(1)), iid,
-            irOp(ArrayRef(a1, i), ArrayRef(a2, i)))
-        val guarded =
-          If(ApplyComparisonOp(EQ(TInt32()), ArrayLen(a1), ArrayLen(a2)),
-            body,
-            Die("Arrays must have same length", body.typ))
-        Let(a1id, array1, Let(a2id, array2, guarded))
+        val e2 = Ref(a2id, coerce[TArray](array2.typ).elementType)
+        ToArray(StreamZip(FastIndexedSeq(ToStream(array1), ToStream(array2)), FastIndexedSeq(a1id, a2id), irOp(e1, e2), ArrayZipBehavior.AssertSameLength))
       }
     }
 
-    registerIR("sum", TArray(tnum("T")), tv("T"))(sum)
+    registerIR1("sum", TArray(tnum("T")), tv("T"))((_, a) => sum(a))
 
-    registerIR("product", TArray(tnum("T")), tv("T"))(product)
+    registerIR1("product", TArray(tnum("T")), tv("T"))((_, a) => product(a))
 
-    def makeMinMaxOp(op: Type => ComparisonOp[Boolean]): IR => IR = {
-      { a =>
-        val t = -coerce[TArray](a.typ).elementType
-        val accum = genUID()
+    def makeMinMaxOp(op: String): Seq[IR] => IR = {
+      { case Seq(a) =>
+        val t = coerce[TArray](a.typ).elementType
         val value = genUID()
-
-        val aUID = genUID()
-        val aRef = Ref(aUID, a.typ)
-        val zVal = If(ApplyComparisonOp(EQ(TInt32()), ArrayLen(aRef), I32(0)), NA(t), ArrayRef(a, I32(0)))
-
-        val body = If(
-          ApplyComparisonOp(op(t), Ref(value, t), Ref(accum, t)),
-          Ref(value, t),
-          Ref(accum, t))
-        Let(aUID, a, ArrayFold(aRef, zVal, accum, value, body))
+        val first = genUID()
+        val acc = genUID()
+        StreamFold2(ToStream(a),
+          FastIndexedSeq((acc, NA(t)), (first, True())),
+          value,
+          FastIndexedSeq(
+            If(Ref(first, TBoolean), Ref(value, t), invoke(op, t, Ref(acc, t), Ref(value, t))),
+            False()
+          ),
+          Ref(acc, t))
       }
     }
 
-    registerIR("min", TArray(tnum("T")), tv("T"))(makeMinMaxOp(LT(_)))
-    registerIR("max", TArray(tnum("T")), tv("T"))(makeMinMaxOp(GT(_)))
+    registerIR("min", Array(TArray(tnum("T"))), tv("T"), inline = true)((_, a) => makeMinMaxOp("min")(a))
+    registerIR("nanmin", Array(TArray(tnum("T"))), tv("T"), inline = true)((_, a) => makeMinMaxOp("nanmin")(a))
+    registerIR("max", Array(TArray(tnum("T"))), tv("T"), inline = true)((_, a) => makeMinMaxOp("max")(a))
+    registerIR("nanmax", Array(TArray(tnum("T"))), tv("T"), inline = true)((_, a) => makeMinMaxOp("nanmax")(a))
 
-    registerIR("mean", TArray(tnum("T")), TFloat64())(mean)
+    registerIR("mean", Array(TArray(tnum("T"))), TFloat64, inline = true)((_, a) => mean(a))
 
-    registerIR("median", TArray(tnum("T")), tv("T")) { array =>
-      val t = -array.typ.asInstanceOf[TArray].elementType
+    registerIR1("median", TArray(tnum("T")), tv("T")) { (_, array) =>
+      val t = array.typ.asInstanceOf[TArray].elementType
       val v = Ref(genUID(), t)
       val a = Ref(genUID(), TArray(t))
-      val size = Ref(genUID(), TInt32())
+      val size = Ref(genUID(), TInt32)
       val lastIdx = size - 1
       val midIdx = lastIdx.floorDiv(2)
       def ref(i: IR) = ArrayRef(a, i)
       def div(a: IR, b: IR): IR = ApplyBinaryPrimOp(BinaryOp.defaultDivideOp(t), a, b)
 
-      Let(a.name, ArraySort(ArrayFilter(array, v.name, !IsNA(v))),
+      Let(a.name, ArraySort(StreamFilter(ToStream(array), v.name, !IsNA(v))),
         If(IsNA(a),
           NA(t),
           Let(size.name,
             ArrayLen(a),
             If(size.ceq(0),
               NA(t),
-              If(invoke("%", size, 2).cne(0),
+              If(invoke("mod", TInt32, size, 2).cne(0),
                 ref(midIdx), // odd number of non-missing elements
                 div(ref(midIdx) + ref(midIdx + 1), Cast(2, t)))))))
     }
-    
+
     def argF(a: IR, op: (Type) => ComparisonOp[Boolean]): IR = {
-      val t = -coerce[TArray](a.typ).elementType
-      val tAccum = TStruct("m" -> t, "midx" -> TInt32())
+      val t = coerce[TArray](a.typ).elementType
+      val tAccum = TStruct("m" -> t, "midx" -> TInt32)
       val accum = genUID()
       val value = genUID()
       val m = genUID()
@@ -176,17 +180,17 @@ object ArrayFunctions extends RegistryFunctions {
         MakeStruct(FastSeq("m" -> min, "midx" -> midx))
 
       val body =
-        Let(value, ArrayRef(a, Ref(idx, TInt32())),
+        Let(value, ArrayRef(a, Ref(idx, TInt32)),
           Let(m, GetField(Ref(accum, tAccum), "m"),
             If(IsNA(Ref(value, t)),
               Ref(accum, tAccum),
               If(IsNA(Ref(m, t)),
-                updateAccum(Ref(value, t), Ref(idx, TInt32())),
+                updateAccum(Ref(value, t), Ref(idx, TInt32)),
                 If(ApplyComparisonOp(op(t), Ref(value, t), Ref(m, t)),
-                  updateAccum(Ref(value, t), Ref(idx, TInt32())),
+                  updateAccum(Ref(value, t), Ref(idx, TInt32)),
                   Ref(accum, tAccum))))))
-      GetField(ArrayFold(
-        ArrayRange(I32(0), ArrayLen(a), I32(1)),
+      GetField(StreamFold(
+        StreamRange(I32(0), ArrayLen(a), I32(1)),
         NA(tAccum),
         accum,
         idx,
@@ -194,13 +198,13 @@ object ArrayFunctions extends RegistryFunctions {
       ), "midx")
     }
 
-    registerIR("argmin", TArray(tv("T")), TInt32())(argF(_, LT(_)))
+    registerIR1("argmin", TArray(tv("T")), TInt32)((_, a) => argF(a, LT(_)))
 
-    registerIR("argmax", TArray(tv("T")), TInt32())(argF(_, GT(_)))
+    registerIR1("argmax", TArray(tv("T")), TInt32)((_, a) => argF(a, GT(_)))
 
     def uniqueIndex(a: IR, op: (Type) => ComparisonOp[Boolean]): IR = {
-      val t = -coerce[TArray](a.typ).elementType
-      val tAccum = TStruct("m" -> t, "midx" -> TInt32(), "count" -> TInt32())
+      val t = coerce[TArray](a.typ).elementType
+      val tAccum = TStruct("m" -> t, "midx" -> TInt32, "count" -> TInt32)
       val accum = genUID()
       val value = genUID()
       val m = genUID()
@@ -211,132 +215,130 @@ object ArrayFunctions extends RegistryFunctions {
         MakeStruct(FastSeq("m" -> m, "midx" -> midx, "count" -> count))
 
       val body =
-        Let(value, ArrayRef(a, Ref(idx, TInt32())),
+        Let(value, ArrayRef(a, Ref(idx, TInt32)),
           Let(m, GetField(Ref(accum, tAccum), "m"),
             If(IsNA(Ref(value, t)),
               Ref(accum, tAccum),
               If(IsNA(Ref(m, t)),
-                updateAccum(Ref(value, t), Ref(idx, TInt32()), I32(1)),
+                updateAccum(Ref(value, t), Ref(idx, TInt32), I32(1)),
                 If(ApplyComparisonOp(op(t), Ref(value, t), Ref(m, t)),
-                  updateAccum(Ref(value, t), Ref(idx, TInt32()), I32(1)),
+                  updateAccum(Ref(value, t), Ref(idx, TInt32), I32(1)),
                   If(ApplyComparisonOp(EQ(t), Ref(value, t), Ref(m, t)),
                     updateAccum(
                       Ref(value, t),
-                      Ref(idx, TInt32()),
+                      Ref(idx, TInt32),
                       ApplyBinaryPrimOp(Add(), GetField(Ref(accum, tAccum), "count"), I32(1))),
                     Ref(accum, tAccum)))))))
 
-      Let(result, ArrayFold(
-        ArrayRange(I32(0), ArrayLen(a), I32(1)),
+      Let(result, StreamFold(
+        StreamRange(I32(0), ArrayLen(a), I32(1)),
         NA(tAccum),
         accum,
         idx,
         body
-      ), If(ApplyComparisonOp(EQ(TInt32()), GetField(Ref(result, tAccum), "count"), I32(1)),
+      ), If(ApplyComparisonOp(EQ(TInt32), GetField(Ref(result, tAccum), "count"), I32(1)),
         GetField(Ref(result, tAccum), "midx"),
-        NA(TInt32())))
+        NA(TInt32)))
     }
 
-    registerIR("uniqueMinIndex", TArray(tv("T")), TInt32())(uniqueIndex(_, LT(_)))
+    registerIR1("uniqueMinIndex", TArray(tv("T")), TInt32)((_, a) => uniqueIndex(a, LT(_)))
 
-    registerIR("uniqueMaxIndex", TArray(tv("T")), TInt32())(uniqueIndex(_, GT(_)))
+    registerIR1("uniqueMaxIndex", TArray(tv("T")), TInt32)((_, a) => uniqueIndex(a, GT(_)))
 
-    registerIR("indexArray", TArray(tv("T")), TInt32(), tv("T")) { (a, i) =>
+    registerIR3("indexArray", TArray(tv("T")), TInt32, TString, tv("T")) { (_, a, i, s) =>
       ArrayRef(
         a,
-        If(ApplyComparisonOp(LT(TInt32()), i, I32(0)),
+        If(ApplyComparisonOp(LT(TInt32), i, I32(0)),
           ApplyBinaryPrimOp(Add(), ArrayLen(a), i),
-          i))
+          i), s)
     }
 
-    registerIR("[:]", TArray(tv("T")), TArray(tv("T"))) { (a) => a }
-
-    registerIR("[*:]", TArray(tv("T")), TInt32(), TArray(tv("T"))) { (a, i) =>
+    registerIR2("sliceRight", TArray(tv("T")), TInt32, TArray(tv("T"))) { (_, a, i) =>
       val idx = genUID()
-      ArrayMap(
-        ArrayRange(
-          If(ApplyComparisonOp(LT(TInt32()), i, I32(0)),
-            UtilFunctions.max(
+      ToArray(StreamMap(
+        StreamRange(
+          If(ApplyComparisonOp(LT(TInt32), i, I32(0)),
+            UtilFunctions.intMax(
               ApplyBinaryPrimOp(Add(), ArrayLen(a), i),
               I32(0)),
             i),
           ArrayLen(a),
           I32(1)),
         idx,
-        ArrayRef(a, Ref(idx, TInt32())))
+        ArrayRef(a, Ref(idx, TInt32))))
     }
 
-    registerIR("[:*]", TArray(tv("T")), TInt32(), TArray(tv("T"))) { (a, i) =>
+    registerIR2("sliceLeft", TArray(tv("T")), TInt32, TArray(tv("T"))) { (_, a, i) =>
       val idx = genUID()
       If(IsNA(a), a,
-        ArrayMap(
-          ArrayRange(
+        ToArray(StreamMap(
+          StreamRange(
             I32(0),
-            If(ApplyComparisonOp(LT(TInt32()), i, I32(0)),
+            If(ApplyComparisonOp(LT(TInt32), i, I32(0)),
               ApplyBinaryPrimOp(Add(), ArrayLen(a), i),
-              UtilFunctions.min(i, ArrayLen(a))),
+              UtilFunctions.intMin(i, ArrayLen(a))),
             I32(1)),
           idx,
-          ArrayRef(a, Ref(idx, TInt32()))))
+          ArrayRef(a, Ref(idx, TInt32)))))
     }
 
-    registerIR("[*:*]", TArray(tv("T")), TInt32(), TInt32(), TArray(tv("T"))) { (a, i, j) =>
+    registerIR3("slice", TArray(tv("T")), TInt32, TInt32, TArray(tv("T"))) { case(_, a, i, j) =>
       val idx = genUID()
-      ArrayMap(
-        ArrayRange(
-          If(ApplyComparisonOp(LT(TInt32()), i, I32(0)),
-            UtilFunctions.max(
+      ToArray(StreamMap(
+        StreamRange(
+          If(ApplyComparisonOp(LT(TInt32), i, I32(0)),
+            UtilFunctions.intMax(
               ApplyBinaryPrimOp(Add(), ArrayLen(a), i),
               I32(0)),
             i),
-          If(ApplyComparisonOp(LT(TInt32()), j, I32(0)),
+          If(ApplyComparisonOp(LT(TInt32), j, I32(0)),
             ApplyBinaryPrimOp(Add(), ArrayLen(a), j),
-            UtilFunctions.min(j, ArrayLen(a))),
+            UtilFunctions.intMin(j, ArrayLen(a))),
           I32(1)),
         idx,
-        ArrayRef(a, Ref(idx, TInt32())))
+        ArrayRef(a, Ref(idx, TInt32))))
     }
 
-    registerIR("flatten", TArray(TArray(tv("T"))), TArray(tv("T"))) { a =>
+    registerIR1("flatten", TArray(TArray(tv("T"))), TArray(tv("T"))) { (_, a) =>
       val elt = Ref(genUID(), coerce[TArray](a.typ).elementType)
-      ArrayFlatMap(a, elt.name, elt)
+      ToArray(StreamFlatMap(ToStream(a), elt.name, ToStream(elt)))
     }
 
-    registerCodeWithMissingness("corr", TArray(TFloat64()), TArray(TFloat64()), TFloat64()) {
-      case (mb, EmitTriplet(setup1, m1, v1), EmitTriplet(setup2, m2, v2)) =>
-        val t1 = PArray(PFloat64())
-        val t2 = PArray(PFloat64())
-        val region = getRegion(mb)
+    registerEmitCode2("corr", TArray(TFloat64), TArray(TFloat64), TFloat64, {
+      (_: Type, _: PType, _: PType) => PFloat64()
+    }) { case (r, rt, EmitCode(setup1, m1, v1), EmitCode(setup2, m2, v2)) =>
+        val t1 = v1.pt.asInstanceOf[PArray]
+        val t2 = v2.pt.asInstanceOf[PArray]
+        val a1 = r.mb.newLocal[Long]()
+        val a2 = r.mb.newLocal[Long]()
+        val xSum = r.mb.newLocal[Double]()
+        val ySum = r.mb.newLocal[Double]()
+        val xSqSum = r.mb.newLocal[Double]()
+        val ySqSum = r.mb.newLocal[Double]()
+        val xySum = r.mb.newLocal[Double]()
+        val n = r.mb.newLocal[Int]()
+        val i = r.mb.newLocal[Int]()
+        val l1 = r.mb.newLocal[Int]()
+        val l2 = r.mb.newLocal[Int]()
+        val x = r.mb.newLocal[Double]()
+        val y = r.mb.newLocal[Double]()
 
-        val xSum = mb.newLocal[Double]
-        val ySum = mb.newLocal[Double]
-        val xSqSum = mb.newLocal[Double]
-        val ySqSum = mb.newLocal[Double]
-        val xySum = mb.newLocal[Double]
-        val n = mb.newLocal[Int]
-        val i = mb.newLocal[Int]
-        val l1 = mb.newLocal[Int]
-        val l2 = mb.newLocal[Int]
-        val x = mb.newLocal[Double]
-        val y = mb.newLocal[Double]
-
-        val a1 = v1.asInstanceOf[Code[Long]]
-        val a2 = v2.asInstanceOf[Code[Long]]
-
-        EmitTriplet(
+        EmitCode(
           Code(
             setup1,
             setup2),
           m1 || m2 || Code(
-            l1 := t1.loadLength(region, a1),
-            l2 := t2.loadLength(region, a2),
+            a1 := v1.tcode[Long],
+            a2 := v2.tcode[Long],
+            l1 := t1.loadLength(a1),
+            l2 := t2.loadLength(a2),
             l1.cne(l2).mux(
-              Code._fatal(new CodeString("'corr': cannot compute correlation between arrays of different lengths: ")
+              Code._fatal[Boolean](new CodeString("'corr': cannot compute correlation between arrays of different lengths: ")
                 .concat(l1.toS)
                 .concat(", ")
                 .concat(l2.toS)),
               l1.ceq(0))),
-          Code(
+          PCode(rt, Code(
             i := 0,
             n := 0,
             xSum := 0d,
@@ -346,28 +348,28 @@ object ArrayFunctions extends RegistryFunctions {
             xySum := 0d,
             Code.whileLoop(i < l1,
               Code(
-                (t1.isElementDefined(region, a1, i) && t2.isElementDefined(region, a2, i)).mux(
+                (t1.isElementDefined(a1, i) && t2.isElementDefined(a2, i)).mux(
                   Code(
-                    x := region.loadDouble(t1.loadElement(region, a1, i)),
+                    x := Region.loadDouble(t1.loadElement(a1, i)),
                     xSum := xSum + x,
                     xSqSum := xSqSum + x * x,
-                    y := region.loadDouble(t2.loadElement(region, a2, i)),
+                    y := Region.loadDouble(t2.loadElement(a2, i)),
                     ySum := ySum + y,
                     ySqSum := ySqSum + y * y,
                     xySum := xySum + x * y,
                     n := n + 1
                   ),
-                  Code._empty[Unit]
+                  Code._empty
                 ),
                 i := i + 1
               )
             ),
-            (n.toD * xySum - xSum * ySum) / Code.invokeScalaObject[Double, Double](
+            (n.toD * xySum - xSum * ySum) / Code.invokeScalaObject1[Double, Double](
               MathFunctions.mathPackageClass,
               "sqrt",
               (n.toD * xSqSum - xSum * xSum) * (n.toD * ySqSum - ySum * ySum))
           )
-        )
+        ))
     }
   }
 }

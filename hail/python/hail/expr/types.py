@@ -1,14 +1,18 @@
 import abc
 import json
 import math
-from collections import Mapping, Sequence
+from collections.abc import Mapping, Sequence
+import pprint
+
+import numpy as np
 
 import hail as hl
 from hail import genetics
-from hail.expr.type_parsing import type_grammar, type_node_visitor
+from hail.expr.nat import NatBase, NatLiteral
+from .type_parsing import type_grammar, type_node_visitor
 from hail.genetics.reference_genome import reference_genome_type
-from hail.typecheck import *
-from hail.utils.java import scala_object, jset, Env, escape_parsable
+from hail.typecheck import typecheck, typecheck_method, oneof, transformed
+from hail.utils.java import escape_parsable
 
 __all__ = [
     'dtype',
@@ -28,10 +32,12 @@ __all__ = [
     'tstr',
     'tbool',
     'tarray',
+    'tstream',
     'tndarray',
     'tset',
     'tdict',
     'tstruct',
+    'tunion',
     'ttuple',
     'tinterval',
     'tlocus',
@@ -40,6 +46,23 @@ __all__ = [
     'tvariable',
     'hts_entry_schema',
 ]
+
+
+def summary_type(t):
+    if isinstance(t, hl.tdict):
+        return f'dict<{summary_type(t.key_type)}, {summary_type(t.value_type)}>'
+    elif isinstance(t, hl.tset):
+        return f'set<{summary_type(t.element_type)}>'
+    elif isinstance(t, hl.tarray):
+        return f'array<{summary_type(t.element_type)}>'
+    elif isinstance(t, hl.tstruct):
+        return f'struct with {len(t)} fields'
+    elif isinstance(t, hl.ttuple):
+        return f'tuple with {len(t)} fields'
+    elif isinstance(t, hl.tinterval):
+        return f'interval<{summary_type(t.point_type)}>'
+    else:
+        return str(t)
 
 
 def dtype(type_str):
@@ -71,7 +94,7 @@ def dtype(type_str):
 
     .. code-block:: text
 
-        type = _ (array / set / dict / struct / tuple / interval / int64 / int32 / float32 / float64 / bool / str / call / str / locus) _
+        type = _ (array / set / dict / struct / union / tuple / interval / int64 / int32 / float32 / float64 / bool / str / call / str / locus) _
         int64 = "int64" / "tint64"
         int32 = "int32" / "tint32" / "int" / "tint"
         float32 = "float32" / "tfloat32"
@@ -81,9 +104,12 @@ def dtype(type_str):
         str = "tstr" / "str"
         locus = ("tlocus" / "locus") _ "[" identifier "]"
         array = ("tarray" / "array") _ "<" type ">"
+        array = ("tstream" / "stream") _ "<" type ">"
+        ndarray = ("tndarray" / "ndarray") _ "<" type, identifier ">"
         set = ("tset" / "set") _ "<" type ">"
         dict = ("tdict" / "dict") _ "<" type "," type ">"
         struct = ("tstruct" / "struct") _ "{" (fields / _) "}"
+        union = ("tunion" / "union") _ "{" (fields / _) "}"
         tuple = ("ttuple" / "tuple") _ "(" ((type ("," type)*) / _) ")"
         fields = field ("," field)*
         field = identifier ":" type
@@ -106,6 +132,36 @@ def dtype(type_str):
     return type_node_visitor.visit(tree)
 
 
+class HailTypeContext(object):
+    def __init__(self, references=set()):
+        self.references = references
+
+    @property
+    def is_empty(self):
+        return len(self.references) == 0
+
+    def _to_json_context(self):
+        if self._json is None:
+            self._json = {
+                'reference_genomes':
+                    {r: hl.get_reference(r)._config for r in self.references}
+            }
+        return self._json
+
+    @classmethod
+    def union(cls, *types):
+        ctxs = [t.get_context() for t in types if not t.get_context().is_empty]
+        if len(ctxs) == 0:
+            return _empty_context
+        if len(ctxs) == 1:
+            return ctxs[0]
+        refs = ctxs[0].references.union(*[ctx.references for ctx in ctxs[1:]])
+        return HailTypeContext(refs)
+
+
+_empty_context = HailTypeContext()
+
+
 class HailType(object):
     """
     Hail type superclass.
@@ -113,6 +169,7 @@ class HailType(object):
 
     def __init__(self):
         super(HailType, self).__init__()
+        self._context = None
 
     def __repr__(self):
         s = str(self).replace("'", "\\'")
@@ -145,13 +202,13 @@ class HailType(object):
         -------
         :obj:`str`
         """
-        l = []
-        l.append(' ' * indent)
-        self._pretty(l, indent, increment)
-        return ''.join(l)
+        b = []
+        b.append(' ' * indent)
+        self._pretty(b, indent, increment)
+        return ''.join(b)
 
-    def _pretty(self, l, indent, increment):
-        l.append(str(self))
+    def _pretty(self, b, indent, increment):
+        b.append(str(self))
 
     @abc.abstractmethod
     def _parsable_string(self):
@@ -204,7 +261,6 @@ class HailType(object):
     def _convert_from_json(self, x):
         return x
 
-
     def _traverse(self, obj, f):
         """Traverse a nested type and object.
 
@@ -228,6 +284,14 @@ class HailType(object):
     @abc.abstractmethod
     def clear(self):
         raise NotImplementedError
+
+    def _get_context(self):
+        return _empty_context
+
+    def get_context(self):
+        if self._context is None:
+            self._context = self._get_context()
+        return self._context
 
 
 hail_type = oneof(HailType, transformed((str, dtype)))
@@ -254,6 +318,7 @@ class _tvoid(HailType):
 
     def clear(self):
         pass
+
 
 class _tint32(HailType):
     """Hail type for signed 32-bit integers.
@@ -301,6 +366,9 @@ class _tint32(HailType):
     def clear(self):
         pass
 
+    def to_numpy(self):
+        return np.int32
+
 
 class _tint64(HailType):
     """Hail type for signed 64-bit integers.
@@ -347,6 +415,9 @@ class _tint64(HailType):
     def clear(self):
         pass
 
+    def to_numpy(self):
+        return np.int64
+
 
 class _tfloat32(HailType):
     """Hail type for 32-bit floating point numbers.
@@ -388,6 +459,9 @@ class _tfloat32(HailType):
     def clear(self):
         pass
 
+    def to_numpy(self):
+        return np.float32
+
 
 class _tfloat64(HailType):
     """Hail type for 64-bit floating point numbers.
@@ -401,6 +475,7 @@ class _tfloat64(HailType):
     def _typecheck_one_level(self, annotation):
         if annotation is not None and not isinstance(annotation, (float, int)):
             raise TypeError("type 'float64' expected Python 'float', but found type '%s'" % type(annotation))
+
     def __str__(self):
         return "float64"
 
@@ -427,6 +502,9 @@ class _tfloat64(HailType):
 
     def clear(self):
         pass
+
+    def to_numpy(self):
+        return np.float64
 
 
 class _tstr(HailType):
@@ -492,6 +570,9 @@ class _tbool(HailType):
     def clear(self):
         pass
 
+    def to_numpy(self):
+        return np.bool
+
 
 class tndarray(HailType):
     """Hail type for n-dimensional arrays.
@@ -510,15 +591,18 @@ class tndarray(HailType):
     ----------
     element_type : :class:`.HailType`
         Element type of array.
+    ndim : int32
+        Number of dimensions.
 
     See Also
     --------
     :class:`.NDArrayExpression`, :func:`.ndarray`
     """
 
-    @typecheck_method(element_type=hail_type)
-    def __init__(self, element_type):
+    @typecheck_method(element_type=hail_type, ndim=oneof(NatBase, int))
+    def __init__(self, element_type, ndim):
         self._element_type = element_type
+        self._ndim = NatLiteral(ndim) if isinstance(ndim, int) else ndim
         super(tndarray, self).__init__()
 
     @property
@@ -532,33 +616,77 @@ class tndarray(HailType):
         """
         return self._element_type
 
+    @property
+    def ndim(self):
+        """NDArray number of dimensions.
+
+        Returns
+        -------
+        :obj:`int`
+            Number of dimensions.
+        """
+        assert isinstance(self._ndim, NatLiteral), "tndarray must be realized with a concrete number of dimensions"
+        return self._ndim.n
+
     def _traverse(self, obj, f):
         if f(self, obj):
-            for elt in obj:
-                self.element_type._traverse(elt, f)
+            for elt in np.nditer(obj, ['zerosize_ok']):
+                self.element_type._traverse(elt.item(), f)
 
     def _typecheck_one_level(self, annotation):
-        raise NotImplementedError
+        if annotation is not None and not isinstance(annotation, np.ndarray):
+            raise TypeError("type 'ndarray' expected Python 'numpy.ndarray', but found type '%s'" % type(annotation))
 
     def __str__(self):
-        return "ndarray<{}>".format(self.element_type)
+        return "ndarray<{}, {}>".format(self.element_type, self.ndim)
 
     def _eq(self, other):
         return isinstance(other, tndarray) and self.element_type == other.element_type
 
-    def _pretty(self, l, indent, increment):
-        l.append('ndarray<')
-        self.element_type._pretty(l, indent, increment)
-        l.append('>')
+    def _pretty(self, b, indent, increment):
+        b.append('ndarray<')
+        self._element_type._pretty(b, indent, increment)
+        b.append(', ')
+        b.append(str(self.ndim))
+        b.append('>')
 
     def _parsable_string(self):
-        return "NDArray[" + self.element_type._parsable_string() + "]"
+        return f'NDArray[{self._element_type._parsable_string()},{self.ndim}]'
 
     def _convert_from_json(self, x):
-        raise NotImplementedError
+        np_type = self.element_type.to_numpy()
+        return np.ndarray(shape=x['shape'], buffer=np.array(x['data'], dtype=np_type), strides=x['strides'], dtype=np_type)
 
     def _convert_to_json(self, x):
-        raise NotImplementedError
+        data = x.flatten("F").tolist()
+
+        strides = []
+        axis_one_step_byte_size = x.itemsize
+        for dimension_size in x.shape:
+            strides.append(axis_one_step_byte_size)
+            axis_one_step_byte_size *= (dimension_size if dimension_size > 0 else 1)
+
+        json_dict = {
+            "shape": x.shape,
+            "strides": strides,
+            "data": data
+        }
+        return json_dict
+
+    def clear(self):
+        self._element_type.clear()
+        self._ndim.clear()
+
+    def unify(self, t):
+        return isinstance(t, tndarray) and \
+            self._element_type.unify(t._element_type) and \
+            self._ndim.unify(t._ndim)
+
+    def subst(self):
+        return tndarray(self._element_type.subst(), self._ndim.subst())
+
+    def _get_context(self):
+        return self.element_type.get_context()
 
 
 class tarray(HailType):
@@ -579,7 +707,7 @@ class tarray(HailType):
     See Also
     --------
     :class:`.ArrayExpression`, :class:`.CollectionExpression`,
-    :func:`.array`, :ref:`sec-collection-functions`
+    :func:`~hail.expr.functions.array`, :ref:`sec-collection-functions`
     """
 
     @typecheck_method(element_type=hail_type)
@@ -614,10 +742,10 @@ class tarray(HailType):
     def _eq(self, other):
         return isinstance(other, tarray) and self.element_type == other.element_type
 
-    def _pretty(self, l, indent, increment):
-        l.append('array<')
-        self.element_type._pretty(l, indent, increment)
-        l.append('>')
+    def _pretty(self, b, indent, increment):
+        b.append('array<')
+        self.element_type._pretty(b, indent, increment)
+        b.append('>')
 
     def _parsable_string(self):
         return "Array[" + self.element_type._parsable_string() + "]"
@@ -639,6 +767,63 @@ class tarray(HailType):
 
     def clear(self):
         self.element_type.clear()
+
+    def _get_context(self):
+        return self.element_type.get_context()
+
+
+class tstream(HailType):
+    @typecheck_method(element_type=hail_type)
+    def __init__(self, element_type):
+        self._element_type = element_type
+        super(tstream, self).__init__()
+
+    @property
+    def element_type(self):
+        return self._element_type
+
+    def _traverse(self, obj, f):
+        if f(self, obj):
+            for elt in obj:
+                self.element_type._traverse(elt, f)
+
+    def _typecheck_one_level(self, annotation):
+        raise TypeError("type 'stream' is not realizable in Python")
+
+    def __str__(self):
+        return "stream<{}>".format(self.element_type)
+
+    def _eq(self, other):
+        return isinstance(other, tstream) and self.element_type == other.element_type
+
+    def _pretty(self, b, indent, increment):
+        b.append('stream<')
+        self.element_type._pretty(b, indent, increment)
+        b.append('>')
+
+    def _parsable_string(self):
+        return "Stream[" + self.element_type._parsable_string() + "]"
+
+    def _convert_from_json(self, x):
+        return [self.element_type._convert_from_json_na(elt) for elt in x]
+
+    def _convert_to_json(self, x):
+        return [self.element_type._convert_to_json_na(elt) for elt in x]
+
+    def _propagate_jtypes(self, jtype):
+        self._element_type._add_jtype(jtype.elementType())
+
+    def unify(self, t):
+        return isinstance(t, tstream) and self.element_type.unify(t.element_type)
+
+    def subst(self):
+        return tstream(self.element_type.subst())
+
+    def clear(self):
+        self.element_type.clear()
+
+    def _get_context(self):
+        return self.element_type.get_context()
 
 
 class tset(HailType):
@@ -694,10 +879,10 @@ class tset(HailType):
     def _eq(self, other):
         return isinstance(other, tset) and self.element_type == other.element_type
 
-    def _pretty(self, l, indent, increment):
-        l.append('set<')
-        self.element_type._pretty(l, indent, increment)
-        l.append('>')
+    def _pretty(self, b, indent, increment):
+        b.append('set<')
+        self.element_type._pretty(b, indent, increment)
+        b.append('>')
 
     def _parsable_string(self):
         return "Set[" + self.element_type._parsable_string() + "]"
@@ -719,6 +904,9 @@ class tset(HailType):
 
     def clear(self):
         self.element_type.clear()
+
+    def _get_context(self):
+        return self.element_type.get_context()
 
 
 class tdict(HailType):
@@ -773,7 +961,7 @@ class tdict(HailType):
 
     @property
     def element_type(self):
-        return tstruct(key = self._key_type, value = self._value_type)
+        return tstruct(key=self._key_type, value=self._value_type)
 
     def _traverse(self, obj, f):
         if f(self, obj):
@@ -792,12 +980,12 @@ class tdict(HailType):
     def _eq(self, other):
         return isinstance(other, tdict) and self.key_type == other.key_type and self.value_type == other.value_type
 
-    def _pretty(self, l, indent, increment):
-        l.append('dict<')
-        self.key_type._pretty(l, indent, increment)
-        l.append(', ')
-        self.value_type._pretty(l, indent, increment)
-        l.append('>')
+    def _pretty(self, b, indent, increment):
+        b.append('dict<')
+        self.key_type._pretty(b, indent, increment)
+        b.append(', ')
+        self.value_type._pretty(b, indent, increment)
+        b.append('>')
 
     def _parsable_string(self):
         return "Dict[{},{}]".format(self.key_type._parsable_string(), self.value_type._parsable_string())
@@ -808,7 +996,7 @@ class tdict(HailType):
 
     def _convert_to_json(self, x):
         return [{'key': self.key_type._convert_to_json(k),
-                 'value':self.value_type._convert_to_json(v)} for k, v in x.items()]
+                 'value': self.value_type._convert_to_json(v)} for k, v in x.items()]
 
     def _propagate_jtypes(self, jtype):
         self._key_type._add_jtype(jtype.keyType())
@@ -825,6 +1013,9 @@ class tdict(HailType):
     def clear(self):
         self.key_type.clear()
         self.value_type.clear()
+
+    def _get_context(self):
+        return HailTypeContext.union(self.key_type, self.value_type)
 
 
 class tstruct(HailType, Mapping):
@@ -849,13 +1040,23 @@ class tstruct(HailType, Mapping):
         super(tstruct, self).__init__()
 
     @property
-    def fields(self):
-        """Struct fields.
+    def types(self):
+        """Struct field types.
 
         Returns
         -------
-        :obj:`tuple` of :class:`.Field`
-            Struct fields.
+        :obj:`tuple` of :class:`.HailType`
+        """
+        return tuple(self._field_types.values())
+
+    @property
+    def fields(self):
+        """Struct field names.
+
+        Returns
+        -------
+        :obj:`tuple` of :obj:`str`
+            Tuple of struct field names.
         """
         return self._fields
 
@@ -898,24 +1099,24 @@ class tstruct(HailType, Mapping):
                 and self._fields == other._fields
                 and all(self[f] == other[f] for f in self._fields))
 
-    def _pretty(self, l, indent, increment):
+    def _pretty(self, b, indent, increment):
         if not self._fields:
-            l.append('struct {}')
+            b.append('struct {}')
             return
 
         pre_indent = indent
         indent += increment
-        l.append('struct {')
+        b.append('struct {')
         for i, (f, t) in enumerate(self.items()):
             if i > 0:
-                l.append(', ')
-            l.append('\n')
-            l.append(' ' * indent)
-            l.append('{}: '.format(escape_parsable(f)))
-            t._pretty(l, indent, increment)
-        l.append('\n')
-        l.append(' ' * pre_indent)
-        l.append('}')
+                b.append(', ')
+            b.append('\n')
+            b.append(' ' * indent)
+            b.append('{}: '.format(escape_parsable(f)))
+            t._pretty(b, indent, increment)
+        b.append('\n')
+        b.append(' ' * pre_indent)
+        b.append('}')
 
     def _parsable_string(self):
         return "Struct{{{}}}".format(
@@ -929,9 +1130,9 @@ class tstruct(HailType, Mapping):
         return {f: t._convert_to_json_na(x[f]) for f, t in self.items()}
 
     def _is_prefix_of(self, other):
-        return (isinstance(other, tstruct) and
-                len(self._fields) <= len(other._fields) and
-                all(x == y for x, y in zip(self._field_types.values(), other._field_types.values())))
+        return (isinstance(other, tstruct)
+                and len(self._fields) <= len(other._fields)
+                and all(x == y for x, y in zip(self._field_types.values(), other._field_types.values())))
 
     def _concat(self, other):
         new_field_types = {}
@@ -971,7 +1172,20 @@ class tstruct(HailType, Mapping):
         return t
 
     def _rename(self, map):
-        return tstruct(**{map.get(f, f): t for f, t in self.items()})
+        seen = {}
+        new_field_types = {}
+
+        for f0, t in self.items():
+            f = map.get(f0, f0)
+            if f in seen:
+                raise ValueError(
+                    "Cannot rename two fields to the same name: attempted to rename {} and {} both to {}".format(
+                        repr(seen[f]), repr(f0), repr(f)))
+            else:
+                seen[f] = f0
+                new_field_types[f] = t
+
+        return tstruct(**new_field_types)
 
     def unify(self, t):
         if not (isinstance(t, tstruct) and len(self) == len(t)):
@@ -988,7 +1202,103 @@ class tstruct(HailType, Mapping):
         for f, t in self.items():
             t.clear()
 
-class ttuple(HailType):
+    def _get_context(self):
+        return HailTypeContext.union(*self.values())
+
+
+class tunion(HailType, Mapping):
+    @typecheck_method(case_types=hail_type)
+    def __init__(self, **case_types):
+        """Tagged union type.  Values of type union represent one of several
+        heterogenous, named cases.
+
+        Parameters
+        ----------
+        cases : keyword args of :class:`.HailType`
+            The union cases.
+
+        """
+
+        super(tunion, self).__init__()
+        self._case_types = case_types
+        self._cases = tuple(case_types)
+
+    @property
+    def cases(self):
+
+        """Return union case names.
+
+        Returns
+        -------
+        :obj:`tuple` of :obj:`str`
+            Tuple of union case names
+        """
+        return self._cases
+
+    @typecheck_method(item=oneof(int, str))
+    def __getitem__(self, item):
+        if isinstance(item, int):
+            item = self._cases[item]
+        return self._case_types[item]
+
+    def __iter__(self):
+        return iter(self._case_types)
+
+    def __len__(self):
+        return len(self._cases)
+
+    def __str__(self):
+        return "union{{{}}}".format(
+            ', '.join('{}: {}'.format(escape_parsable(f), str(t)) for f, t in self.items()))
+
+    def _eq(self, other):
+        return (isinstance(other, tunion)
+                and self._cases == other._cases
+                and all(self[c] == other[c] for c in self._cases))
+
+    def _pretty(self, b, indent, increment):
+        if not self._cases:
+            b.append('union {}')
+            return
+
+        pre_indent = indent
+        indent += increment
+        b.append('union {')
+        for i, (f, t) in enumerate(self.items()):
+            if i > 0:
+                b.append(', ')
+            b.append('\n')
+            b.append(' ' * indent)
+            b.append('{}: '.format(escape_parsable(f)))
+            t._pretty(b, indent, increment)
+        b.append('\n')
+        b.append(' ' * pre_indent)
+        b.append('}')
+
+    def _parsable_string(self):
+        return "Union{{{}}}".format(
+            ','.join('{}:{}'.format(escape_parsable(f), t._parsable_string()) for f, t in self.items()))
+
+    def unify(self, t):
+        if not (isinstance(t, tunion) and len(self) == len(t)):
+            return False
+        for (f1, t1), (f2, t2) in zip(self.items(), t.items()):
+            if not (f1 == f2 and t1.unify(t2)):
+                return False
+        return True
+
+    def subst(self):
+        return tunion(**{f: t.subst() for f, t in self.items()})
+
+    def clear(self):
+        for f, t in self.items():
+            t.clear()
+
+    def _get_context(self):
+        return HailTypeContext.union(*self.values())
+
+
+class ttuple(HailType, Sequence):
     """Hail type for tuples.
 
     In Python, these are represented as :obj:`tuple`.
@@ -1032,6 +1342,17 @@ class ttuple(HailType):
                 raise TypeError("%s expected tuple of size '%i', but found '%s'" %
                                 (self, len(self.types), annotation))
 
+    @typecheck_method(item=int)
+    def __getitem__(self, item):
+        return self._types[item]
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+    def __len__(self):
+        return len(self._types)
+
     def __str__(self):
         return "tuple({})".format(", ".join([str(t) for t in self.types]))
 
@@ -1040,19 +1361,19 @@ class ttuple(HailType):
         return isinstance(other, ttuple) and len(self.types) == len(other.types) and all(
             map(eq, self.types, other.types))
 
-    def _pretty(self, l, indent, increment):
+    def _pretty(self, b, indent, increment):
         pre_indent = indent
         indent += increment
-        l.append('tuple (')
+        b.append('tuple (')
         for i, t in enumerate(self.types):
             if i > 0:
-                l.append(', ')
-            l.append('\n')
-            l.append(' ' * indent)
-            t._pretty(l, indent, increment)
-        l.append('\n')
-        l.append(' ' * pre_indent)
-        l.append(')')
+                b.append(', ')
+            b.append('\n')
+            b.append(' ' * indent)
+            t._pretty(b, indent, increment)
+        b.append('\n')
+        b.append(' ' * pre_indent)
+        b.append(')')
 
     def _parsable_string(self):
         return "Tuple[{}]".format(",".join([t._parsable_string() for t in self.types]))
@@ -1077,6 +1398,9 @@ class ttuple(HailType):
     def clear(self):
         for t in self.types:
             t.clear()
+
+    def _get_context(self):
+        return HailTypeContext.union(*self.types)
 
 
 class _tcall(HailType):
@@ -1103,7 +1427,25 @@ class _tcall(HailType):
         return "Call"
 
     def _convert_from_json(self, x):
-        return hl.Call._from_java(hl.Call._call_jobject().parse(x))
+        if x == '-':
+            return hl.Call([])
+        if x == '|-':
+            return hl.Call([], phased=True)
+        if x[0] == '|':
+            return hl.Call([int(x[1:])], phased=True)
+
+        n = len(x)
+        i = 0
+        while i < n:
+            c = x[i]
+            if c in '|/':
+                break
+            i += 1
+
+        if i == n:
+            return hl.Call([int(x)])
+
+        return hl.Call([int(x[0:i]), int(x[i + 1:])], phased=(c == '|'))
 
     def _convert_to_json(self, x):
         return str(x)
@@ -1170,8 +1512,8 @@ class tlocus(HailType):
             self._rg = hl.default_reference()
         return self._rg
 
-    def _pretty(self, l, indent, increment):
-        l.append('locus<{}>'.format(escape_parsable(self.reference_genome.name)))
+    def _pretty(self, b, indent, increment):
+        b.append('locus<{}>'.format(escape_parsable(self.reference_genome.name)))
 
     def _convert_from_json(self, x):
         return genetics.Locus(x['contig'], x['position'], reference_genome=self.reference_genome)
@@ -1187,6 +1529,9 @@ class tlocus(HailType):
 
     def clear(self):
         pass
+
+    def _get_context(self):
+        return HailTypeContext(references={self.reference_genome.name})
 
 
 class tinterval(HailType):
@@ -1242,10 +1587,10 @@ class tinterval(HailType):
     def _eq(self, other):
         return isinstance(other, tinterval) and self.point_type == other.point_type
 
-    def _pretty(self, l, indent, increment):
-        l.append('interval<')
-        self.point_type._pretty(l, indent, increment)
-        l.append('>')
+    def _pretty(self, b, indent, increment):
+        b.append('interval<')
+        self.point_type._pretty(b, indent, increment)
+        b.append('>')
 
     def _parsable_string(self):
         return "Interval[{}]".format(self.point_type._parsable_string())
@@ -1271,6 +1616,9 @@ class tinterval(HailType):
 
     def clear(self):
         self.point_type.clear()
+
+    def _get_context(self):
+        return self.point_type.get_context()
 
 
 class Box(object):
@@ -1416,11 +1764,29 @@ def is_container(t) -> bool:
 def is_compound(t) -> bool:
     return (is_container(t)
             or isinstance(t, tstruct)
-            or isinstance(t, ttuple))
+            or isinstance(t, tunion)
+            or isinstance(t, ttuple)
+            or isinstance(t, tndarray))
+
 
 def types_match(left, right) -> bool:
     return (len(left) == len(right)
             and all(map(lambda lr: lr[0].dtype == lr[1].dtype, zip(left, right))))
+
+
+def from_numpy(np_dtype):
+    if np_dtype == np.int32:
+        return tint32
+    elif np_dtype == np.int64:
+        return tint64
+    elif np_dtype == np.float32:
+        return tfloat32
+    elif np_dtype == np.float64:
+        return tfloat64
+    elif np_dtype == np.bool:
+        return tbool
+    else:
+        raise ValueError(f"numpy type {np_dtype} could not be converted to a hail type.")
 
 
 class tvariable(HailType):
@@ -1432,6 +1798,7 @@ class tvariable(HailType):
         'float64': lambda x: x == tfloat64,
         'locus': lambda x: isinstance(x, tlocus),
         'struct': lambda x: isinstance(x, tstruct),
+        'union': lambda x: isinstance(x, tunion),
         'tuple': lambda x: isinstance(x, ttuple)
     }
 
@@ -1458,8 +1825,6 @@ class tvariable(HailType):
             s = s + ':' + self.cond
         return s
 
-
-import pprint
 
 _old_printer = pprint.PrettyPrinter
 

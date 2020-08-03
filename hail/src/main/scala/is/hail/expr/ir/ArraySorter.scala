@@ -1,27 +1,27 @@
 package is.hail.expr.ir
 
-import is.hail.annotations.{CodeOrdering, Region, StagedRegionValueBuilder}
-import is.hail.expr.types._
+import is.hail.annotations.{Region, StagedRegionValueBuilder}
 import is.hail.asm4s._
-import is.hail.expr.types.physical.{PArray, PType}
+import is.hail.types.physical.{PCanonicalArray, PType}
 
-class ArraySorter(mb: EmitMethodBuilder, array: StagedArrayBuilder) {
+class ArraySorter(r: EmitRegion, array: StagedArrayBuilder) {
   val typ: PType = array.elt
   val ti: TypeInfo[_] = typeToTypeInfo(typ)
+  val mb: EmitMethodBuilder[_] = r.mb
 
-  def sort(sorter: DependentEmitFunction[_]): Code[Unit] = {
+  def sort(sorter: DependentEmitFunctionBuilder[_]): Code[Unit] = {
     val localF = ti match {
-      case BooleanInfo => mb.newField[AsmFunction2[Boolean, Boolean, Boolean]]
-      case IntInfo => mb.newField[AsmFunction2[Int, Int, Boolean]]
-      case LongInfo => mb.newField[AsmFunction2[Int, Int, Boolean]]
-      case FloatInfo => mb.newField[AsmFunction2[Int, Int, Boolean]]
-      case DoubleInfo => mb.newField[AsmFunction2[Int, Int, Boolean]]
+      case BooleanInfo => mb.genFieldThisRef[AsmFunction2[Boolean, Boolean, Boolean]]()
+      case IntInfo => mb.genFieldThisRef[AsmFunction2[Int, Int, Boolean]]()
+      case LongInfo => mb.genFieldThisRef[AsmFunction2[Int, Int, Boolean]]()
+      case FloatInfo => mb.genFieldThisRef[AsmFunction2[Long, Long, Boolean]]()
+      case DoubleInfo => mb.genFieldThisRef[AsmFunction2[Double, Double, Boolean]]()
     }
-    Code(localF.storeAny(sorter.newInstance()), array.sort(localF))
+    Code(localF.storeAny(Code.checkcast(sorter.newInstance(mb))(localF.ti)), array.sort(localF))
   }
 
   def toRegion(): Code[Long] = {
-    val srvb = new StagedRegionValueBuilder(mb, PArray(typ))
+    val srvb = new StagedRegionValueBuilder(r, PCanonicalArray(typ))
     Code(
       srvb.start(array.size),
       Code.whileLoop(srvb.arrayIdx < array.size,
@@ -33,8 +33,8 @@ class ArraySorter(mb: EmitMethodBuilder, array: StagedArrayBuilder) {
   }
 
   def pruneMissing: Code[Unit] = {
-    val i = mb.newLocal[Int]
-    val n = mb.newLocal[Int]
+    val i = mb.newLocal[Int]()
+    val n = mb.newLocal[Int]()
 
     Code(
       n := 0,
@@ -51,14 +51,15 @@ class ArraySorter(mb: EmitMethodBuilder, array: StagedArrayBuilder) {
   }
 
   def distinctFromSorted(discardNext: (Code[Region], Code[_], Code[Boolean], Code[_], Code[Boolean]) => Code[Boolean]): Code[Unit] = {
-    val i = mb.newLocal[Int]
-    val n = mb.newLocal[Int]
+    val i = mb.newLocal[Int]()
+    val n = mb.newLocal[Int]()
 
     Code(
       i := 0,
       n := 0,
       Code.whileLoop(i < array.size,
-        Code.whileLoop(i < array.size && discardNext(mb.getArg[Region](1), array(n), array.isMissing(n), array(i), array.isMissing(i)),
+        i += 1,
+        Code.whileLoop(i < array.size && discardNext(r.region, array(n), array.isMissing(n), array(i), array.isMissing(i)),
           i += 1),
         n += 1,
         (i < array.size && i.cne(n)).mux(

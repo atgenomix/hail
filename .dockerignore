@@ -2,6 +2,8 @@
 *~
 .*.crc
 *.pyc
+**/hail-*.log
+hail/.bloop/
 hail/.gradle/
 hail/.idea/
 hail/.pytest_cache/
@@ -23,3 +25,4 @@ hail/src/main/resources/build-info.properties
 hail/src/test/resources/example.8bits.bgen.idx
 hail/src/test/resources/example.v11.bgen.idx
 hail/src/test/resources/random.bgen.idx
+ci/repos

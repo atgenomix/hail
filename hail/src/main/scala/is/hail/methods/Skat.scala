@@ -1,19 +1,19 @@
 package is.hail.methods
 
 import is.hail.utils._
-import is.hail.expr.types._
-import is.hail.nativecode.NativeCode
+import is.hail.types._
 import is.hail.stats.{LogisticRegressionModel, RegressionUtils, eigSymD}
-import is.hail.annotations.{Annotation, BroadcastRow, UnsafeRow}
+import is.hail.annotations.{Annotation, BroadcastRow, Region, UnsafeRow}
 import breeze.linalg.{DenseMatrix => BDM, DenseVector => BDV, _}
 import breeze.numerics._
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.Row
 import com.sun.jna.Native
 import com.sun.jna.ptr.IntByReference
-import is.hail.expr.ir.{MatrixValue, TableValue}
+import is.hail.HailContext
+import is.hail.expr.ir.{ExecuteContext, MatrixValue, TableValue}
 import is.hail.expr.ir.functions.MatrixToTableFunction
-import is.hail.expr.types.virtual.{TFloat64, TInt32, TStruct, Type}
+import is.hail.types.virtual.{TFloat64, TInt32, TStruct, Type}
 import is.hail.rvd.RVDType
 
 /*
@@ -117,6 +117,43 @@ object Skat {
 
   def computeGramian(st: Array[SkatTuple], useSmallN: Boolean): (Double, BDM[Double]) =
     if (useSmallN) computeGramianSmallN(st) else computeGramianLargeN(st)
+
+  /** Davies Algorithm original C code
+  *   Citation:
+  *     Davies, Robert B. "The distribution of a linear combination of
+  *     x2 random variables." Applied Statistics 29.3 (1980): 323-333.
+  *   Software Link:
+  *     http://www.robertnz.net/QF.htm
+  */
+  @native
+  def qfWrapper(lb1: Array[Double], nc1: Array[Double], n1: Array[Int], r1: Int,
+    sigma: Double, c1: Double, lim1: Int, acc: Double, trace: Array[Double],
+    ifault: IntByReference): Double
+
+  // NativeCode needs to control the initial loading of the libhail DLL, and
+  // the call to getHailName() guarantees that.
+  Native.register("hail")
+
+  // gramian is the m x m matrix (G * sqrt(W)).t * P_0 * (G * sqrt(W)) which has the same non-zero eigenvalues
+  // as the n x n matrix in the paper P_0^{1/2} * (G * W * G.t) * P_0^{1/2}
+  def computePval(q: Double, gramian: BDM[Double], accuracy: Double, iterations: Int): (Double, Int) = {
+    val allEvals = eigSymD.justEigenvalues(gramian)
+
+    // filter out those eigenvalues below the mean / 100k
+    val threshold = 1e-5 * sum(allEvals) / allEvals.length
+    val evals = allEvals.toArray.dropWhile(_ < threshold) // evals are increasing
+
+    val terms = evals.length
+    val noncentrality = Array.fill[Double](terms)(0.0)
+    val dof = Array.fill[Int](terms)(1)
+    val trace = Array.fill[Double](7)(0.0)
+    val fault = new IntByReference()
+    val s = 0.0
+    val x = qfWrapper(evals, noncentrality, dof, terms, s, q, iterations, accuracy, trace, fault)
+    val pval = 1 - x
+
+    (pval, fault.getValue)
+  }
 }
 
 case class Skat(
@@ -124,7 +161,7 @@ case class Skat(
   weightField: String,
   yField: String,
   xField: String,
-  covFields: Array[String],
+  covFields: Seq[String],
   logistic: Boolean,
   maxSize: Int,
   accuracy: Double,
@@ -132,21 +169,20 @@ case class Skat(
 
   val hardMaxEntriesForSmallN = 64e6 // 8000 x 8000 => 512MB of doubles
 
-  def typeInfo(childType: MatrixType, childRVDType: RVDType): (TableType, RVDType) = {
+  override def typ(childType: MatrixType): TableType = {
     val keyType = childType.rowType.fieldType(keyField)
     val skatSchema = TStruct(
       ("id", keyType),
-      ("size", TInt32()),
-      ("q_stat", TFloat64()),
-      ("p_value", TFloat64()),
-      ("fault", TInt32()))
-    val tableType = TableType(skatSchema, FastIndexedSeq("id"), TStruct())
-    (tableType, tableType.canonicalRVDType)
+      ("size", TInt32),
+      ("q_stat", TFloat64),
+      ("p_value", TFloat64),
+      ("fault", TInt32))
+    TableType(skatSchema, FastIndexedSeq("id"), TStruct.empty)
   }
 
   def preservesPartitionCounts: Boolean = false
 
-  def execute(mv: MatrixValue): TableValue = {
+  def execute(ctx: ExecuteContext, mv: MatrixValue): TableValue = {
 
     if (maxSize <= 0 || maxSize > 46340)
       fatal(s"Maximum group size must be in [1, 46340], got $maxSize")
@@ -158,7 +194,7 @@ case class Skat(
     if (iterations <= 0)
       fatal(s"iterations must be positive, default is 10000, got $iterations")
 
-    val (y, cov, completeColIdx) = RegressionUtils.getPhenoCovCompleteSamples(mv, yField, covFields)
+    val (y, cov, completeColIdx) = RegressionUtils.getPhenoCovCompleteSamples(mv, yField, covFields.toArray)
 
     val n = y.size
     val k = cov.cols
@@ -176,7 +212,7 @@ case class Skat(
     val (keyGsWeightRdd, keyType) =
       computeKeyGsWeightRdd(mv, xField, completeColIdx, keyField, weightField)
 
-    val sc = keyGsWeightRdd.sparkContext
+    val backend = HailContext.backend
 
     def linearSkat(): RDD[Row] = { 
       // fit null model
@@ -192,8 +228,8 @@ case class Skat(
         }
       val sigmaSq = (res dot res) / d
       
-      val resBc = sc.broadcast(res)
-      val QtBc = sc.broadcast(qt)
+      val resBc = backend.broadcast(res)
+      val QtBc = backend.broadcast(qt)
       
       def linearTuple(x: BDV[Double], w: Double): SkatTuple = {
         val xw = x * math.sqrt(w)
@@ -210,7 +246,7 @@ case class Skat(
             val (q, gramian) = Skat.computeGramian(skatTuples, size.toLong * n <= maxEntriesForSmallN)
             
             // using q / sigmaSq since Z.t * Z = gramian / sigmaSq
-            val (pval, fault) = computePval(q / sigmaSq, gramian, accuracy, iterations)
+            val (pval, fault) = Skat.computePval(q / sigmaSq, gramian, accuracy, iterations)
             
             // returning qstat = q / (2 * sigmaSq) to agree with skat R table convention
             Row(key, size, q / (2 * sigmaSq), pval, fault)
@@ -248,9 +284,9 @@ case class Skat(
         } else
           (BDV.fill(n)(0.5), y, new BDM[Double](0, n))
       
-      val sqrtVBc = sc.broadcast(sqrtV)
-      val resBc = sc.broadcast(res)
-      val CinvXtVBc = sc.broadcast(cinvXtV)
+      val sqrtVBc = backend.broadcast(sqrtV)
+      val resBc = backend.broadcast(res)
+      val CinvXtVBc = backend.broadcast(cinvXtV)
   
       def logisticTuple(x: BDV[Double], w: Double): SkatTuple = {
         val xw = x * math.sqrt(w)
@@ -264,7 +300,7 @@ case class Skat(
         if (size <= maxSize) {
           val skatTuples = vs.map((logisticTuple _).tupled).toArray
           val (q, gramian) = Skat.computeGramian(skatTuples, size.toLong * n <= maxEntriesForSmallN)
-          val (pval, fault) = computePval(q, gramian, accuracy, iterations)
+          val (pval, fault) = Skat.computePval(q, gramian, accuracy, iterations)
   
           // returning qstat = q / 2 to agree with skat R table convention
           Row(key, size, q / 2, pval, fault)
@@ -276,9 +312,8 @@ case class Skat(
     
     val skatRdd = if (logistic) logisticSkat() else linearSkat()
 
-    val (tableType, _) = typeInfo(mv.typ, mv.rvd.typ)
-
-    TableValue(tableType, BroadcastRow.empty(sc), skatRdd)
+    val tableType = typ(mv.typ)
+    TableValue(ctx, tableType.rowType, tableType.key, skatRdd)
   }
 
   def computeKeyGsWeightRdd(mv: MatrixValue,
@@ -288,83 +323,46 @@ case class Skat(
     // returns ((key, [(gs_v, weight_v)]), keyType)
     weightField: String): (RDD[(Annotation, Iterable[(BDV[Double], Double)])], Type) = {
 
-    val fullRowType = mv.typ.rvRowType.physicalType
+    val fullRowType = mv.rvRowPType
     val keyStructField = fullRowType.field(keyField)
     val keyIndex = keyStructField.index
     val keyType = keyStructField.typ
 
     val weightStructField = fullRowType.field(weightField)
     val weightIndex = weightStructField.index
-    assert(weightStructField.typ.virtualType.isOfType(TFloat64()))
+    assert(weightStructField.typ.virtualType == TFloat64)
 
-    val sc = mv.sparkContext
-
-    val entryArrayType = mv.typ.entryArrayType.physicalType
-    val entryType = mv.typ.entryType.physicalType
+    val entryArrayType = mv.entryArrayPType
+    val entryType = mv.entryPType
     val fieldType = entryType.field(xField).typ
 
-    assert(fieldType.virtualType.isOfType(TFloat64()))
+    assert(fieldType.virtualType == TFloat64)
 
-    val entryArrayIdx = mv.typ.entriesIdx
+    val entryArrayIdx = mv.entriesIdx
     val fieldIdx = entryType.fieldIdx(xField)    
 
     val n = completeColIdx.length
-    val completeColIdxBc = sc.broadcast(completeColIdx)
+    val completeColIdxBc = HailContext.backend.broadcast(completeColIdx)
 
-    (mv.rvd.boundary.mapPartitions { it => it.flatMap { rv =>
-      val keyIsDefined = fullRowType.isFieldDefined(rv, keyIndex)
-      val weightIsDefined = fullRowType.isFieldDefined(rv, weightIndex)
+    // I believe no `boundary` is needed here because `mapPartitions` calls `run` which calls `cleanupRegions`.
+    (mv.rvd.mapPartitions { (ctx, it) => it.flatMap { ptr =>
+      val keyIsDefined = fullRowType.isFieldDefined(ptr, keyIndex)
+      val weightIsDefined = fullRowType.isFieldDefined(ptr, weightIndex)
 
       if (keyIsDefined && weightIsDefined) {
-        val weight = rv.region.loadDouble(fullRowType.loadField(rv, weightIndex))
+        val weight = Region.loadDouble(fullRowType.loadField(ptr, weightIndex))
         if (weight < 0)
           fatal(s"Row weights must be non-negative, got $weight")
-        val key = Annotation.copy(keyType.virtualType, UnsafeRow.read(keyType, rv.region, fullRowType.loadField(rv, keyIndex)))
+        val key = Annotation.copy(keyType.virtualType, UnsafeRow.read(keyType, ctx.r, fullRowType.loadField(ptr, keyIndex)))
         val data = new Array[Double](n)
 
         RegressionUtils.setMeanImputedDoubles(data, 0, completeColIdxBc.value, new ArrayBuilder[Int](),
-          rv, fullRowType, entryArrayType, entryType, entryArrayIdx, fieldIdx)
-        Some(key -> (BDV(data), weight))
+          ptr, fullRowType, entryArrayType, entryType, entryArrayIdx, fieldIdx)
+        Some(key -> (BDV(data) -> weight))
       } else None
     }
     }.groupByKey(), keyType.virtualType)
   }
 
-  /** Davies Algorithm original C code
-  *   Citation:
-  *     Davies, Robert B. "The distribution of a linear combination of
-  *     x2 random variables." Applied Statistics 29.3 (1980): 323-333.
-  *   Software Link:
-  *     http://www.robertnz.net/QF.htm
-  */
-  @native
-  def qfWrapper(lb1: Array[Double], nc1: Array[Double], n1: Array[Int], r1: Int,
-    sigma: Double, c1: Double, lim1: Int, acc: Double, trace: Array[Double],
-    ifault: IntByReference): Double
-
-  // NativeCode needs to control the initial loading of the libhail DLL, and
-  // the call to getHailName() guarantees that.
-  Native.register(NativeCode.getHailName())
-  
-  // gramian is the m x m matrix (G * sqrt(W)).t * P_0 * (G * sqrt(W)) which has the same non-zero eigenvalues
-  // as the n x n matrix in the paper P_0^{1/2} * (G * W * G.t) * P_0^{1/2}
-  def computePval(q: Double, gramian: BDM[Double], accuracy: Double, iterations: Int): (Double, Int) = {
-    val allEvals = eigSymD.justEigenvalues(gramian)
-
-    // filter out those eigenvalues below the mean / 100k
-    val threshold = 1e-5 * sum(allEvals) / allEvals.length
-    val evals = allEvals.toArray.dropWhile(_ < threshold) // evals are increasing
-
-    val terms = evals.length
-    val noncentrality = Array.fill[Double](terms)(0.0)
-    val dof = Array.fill[Int](terms)(1)
-    val trace = Array.fill[Double](7)(0.0)
-    val fault = new IntByReference()
-    val s = 0.0
-    val x = qfWrapper(evals, noncentrality, dof, terms, s, q, iterations, accuracy, trace, fault)
-    val pval = 1 - x
-    
-    (pval, fault.getValue)
-  }
 }
 

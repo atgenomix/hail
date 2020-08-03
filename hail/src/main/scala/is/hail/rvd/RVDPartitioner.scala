@@ -1,12 +1,13 @@
 package is.hail.rvd
 
-import is.hail.annotations.ExtendedOrdering
-import is.hail.expr.types._
-import is.hail.expr.types.virtual.{TArray, TInterval, TStruct}
+import is.hail.annotations._
+import is.hail.expr.ir.Literal
+import is.hail.types.virtual._
 import is.hail.utils._
+import org.apache.commons.lang.builder.HashCodeBuilder
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.sql.Row
 import org.apache.spark.{Partitioner, SparkContext}
-import org.apache.spark.broadcast.Broadcast
 
 class RVDPartitioner(
   val kType: TStruct,
@@ -15,11 +16,17 @@ class RVDPartitioner(
   val rangeBounds: Array[Interval],
   allowedOverlap: Int
 ) {
+  // expensive, for debugging
+  // assert(rangeBounds.forall(SafeRow.isSafe))
+
+  override def toString: String =
+    s"RVDPartitioner($kType, ${rangeBounds.mkString("[", ",\n", "]")})"
+
   def this(
     kType: TStruct,
     rangeBounds: IndexedSeq[Interval],
     allowedOverlap: Int
-  ) = this(kType, rangeBounds.toArray, kType.size)
+  ) = this(kType, rangeBounds.toArray, allowedOverlap)
 
   def this(
     kType: TStruct,
@@ -44,7 +51,7 @@ class RVDPartitioner(
   require(allowedOverlap >= 0 && allowedOverlap <= kType.size)
   require(RVDPartitioner.isValid(kType, rangeBounds, allowedOverlap))
 
-  val kord: ExtendedOrdering = kType.ordering
+  val kord: ExtendedOrdering = PartitionBoundOrdering(kType)
   val intervalKeyLT: (Interval, Any) => Boolean = (i, k) => i.isBelowPosition(kord, k)
   val keyIntervalLT: (Any, Interval) => Boolean = (k, i) => i.isAbovePosition(kord, k)
   val intervalLT: (Interval, Interval) => Boolean = (i1, i2) => i1.isBelow(kord, i2)
@@ -66,12 +73,18 @@ class RVDPartitioner(
 
   override def equals(other: Any): Boolean = other match {
     case that: RVDPartitioner =>
-      this.kType == that.kType && this.rangeBounds == that.rangeBounds
+      this.eq(that) || (this.kType == that.kType && this.rangeBounds.sameElements(that.rangeBounds))
     case _ => false
   }
 
-  @transient
-  @volatile var partitionerBc: Broadcast[RVDPartitioner] = _
+  override def hashCode: Int = {
+    val b = new HashCodeBuilder()
+    b.append(kType)
+    rangeBounds.foreach(b.append)
+    b.toHashCode
+  }
+
+  @transient @volatile var partitionerBc: Broadcast[RVDPartitioner] = _
 
   def broadcast(sc: SparkContext): Broadcast[RVDPartitioner] = {
     if (partitionerBc == null) {
@@ -98,11 +111,17 @@ class RVDPartitioner(
   def coarsenedRangeBounds(newKeyLen: Int): Array[Interval] =
     rangeBounds.map(_.coarsen(newKeyLen))
 
-  def coarsen(newKeyLen: Int): RVDPartitioner =
-    new RVDPartitioner(
-      kType.truncate(newKeyLen),
-      coarsenedRangeBounds(newKeyLen)
-    )
+  def coarsen(newKeyLen: Int): RVDPartitioner = {
+    if (newKeyLen == kType.size)
+      this
+    else {
+      assert(newKeyLen < kType.size)
+      new RVDPartitioner(
+        kType.truncate(newKeyLen),
+        coarsenedRangeBounds(newKeyLen),
+        math.min(allowedOverlap, newKeyLen))
+    }
+  }
 
   def strictify: RVDPartitioner = extendKey(kType)
 
@@ -112,6 +131,14 @@ class RVDPartitioner(
   def extendKey(newKType: TStruct): RVDPartitioner = {
     require(kType isPrefixOf newKType)
     RVDPartitioner.generate(newKType, rangeBounds)
+  }
+
+  def extendKeySamePartitions(newKType: TStruct): RVDPartitioner = {
+    require(kType isPrefixOf newKType)
+    new RVDPartitioner(
+      newKType,
+      rangeBounds,
+      allowedOverlap)
   }
 
   // Operators (produce new partitioners)
@@ -151,29 +178,10 @@ class RVDPartitioner(
   }
 
   def intersect(other: RVDPartitioner): RVDPartitioner = {
-    require(kType isIsomorphicTo other.kType)
+    if (!kType.isIsomorphicTo(other.kType))
+      throw new AssertionError(s"key types not isomorphic: $kType, ${other.kType}")
 
-    val scalaEOrd = kord.intervalEndpointOrdering.toOrdering.asInstanceOf[Ordering[IntervalEndpoint]]
-
-    val left = this.rangeBounds.iterator.buffered
-    val right = other.rangeBounds.iterator.buffered
-    val ab = new ArrayBuilder[Interval]()
-
-    while (left.hasNext && right.hasNext) {
-      val (leader, lagger) =
-        if (scalaEOrd.gt(left.head.left, right.head.left))
-          (left, right)
-        else
-          (right, left)
-      // leader.head.left >= lagger.head.left
-      if (scalaEOrd.lteq(lagger.head.right, leader.head.left))
-        lagger.next()
-      else if (scalaEOrd.lteq(lagger.head.right, leader.head.right))
-        ab += Interval(leader.head.left, lagger.next().right)
-      else
-        ab += leader.next()
-    }
-    new RVDPartitioner(kType, ab.result())
+    new RVDPartitioner(kType, Interval.intersection(this.rangeBounds, other.rangeBounds, kord.intervalEndpointOrdering))
   }
 
   def rename(nameMap: Map[String, String]): RVDPartitioner = new RVDPartitioner(
@@ -184,13 +192,14 @@ class RVDPartitioner(
 
   def copy(
     kType: TStruct = kType,
-    rangeBounds: IndexedSeq[Interval] = rangeBounds
+    rangeBounds: IndexedSeq[Interval] = rangeBounds,
+    allowedOverlap: Int = allowedOverlap
   ): RVDPartitioner =
-    new RVDPartitioner(kType, rangeBounds)
+    new RVDPartitioner(kType, rangeBounds, allowedOverlap)
 
   def coalesceRangeBounds(newPartEnd: IndexedSeq[Int]): RVDPartitioner = {
     val newRangeBounds = (-1 +: newPartEnd.init).zip(newPartEnd).map { case (s, e) =>
-      rangeBounds(s+1).hull(kType.ordering, rangeBounds(e))
+      rangeBounds(s+1).hull(kord, rangeBounds(e))
     }
     copy(rangeBounds = newRangeBounds)
   }
@@ -274,16 +283,100 @@ class RVDPartitioner(
   def overlaps(query: Interval): Boolean = rangeBounds.containsOrdered(query, intervalLT)
 
   def isDisjointFrom(query: Interval): Boolean = !overlaps(query)
+
+  def partitionBoundsIRRepresentation: Literal = {
+    Literal(TArray(RVDPartitioner.intervalIRRepresentation(kType)),
+      rangeBounds.map(i => RVDPartitioner.intervalToIRRepresentation(i, kType.size)).toFastIndexedSeq)
+  }
+
+  def keysIfOneToOne(): Option[IndexedSeq[Row]] = {
+    log.info(s"keysIfOneToOne ${kType} ${this}")
+    if (kType.size == 0) {
+      return None
+    }
+    val lastType = kType.types.last
+    if (lastType != TInt32 && lastType != TInt64) {
+      return None
+    }
+    def singleton(interval: Interval): Option[Row] = {
+      val left = interval.left.point.asInstanceOf[Row]
+      val leftSign = interval.left.sign
+      val right = interval.right.point.asInstanceOf[Row]
+      val rightSign = interval.right.sign
+      var i = 0
+      while (i < kType.types.length - 1) {
+        if (i >= left.length ||
+          i >= right.length ||
+          kType.types(i).ordering.compare(left(i), right(i)) != 0) {
+          return None
+        }
+        i += 1
+      }
+      if (i >= left.length || i >= right.length) {
+        None
+      } else {
+        val someContainedPoints = (leftSign, rightSign) match {
+          case (-1,  1) => Seq(left, right)  // [left, right]
+          case (-1, -1) => Seq(left)         // [left, right)
+          case ( 1,  1) => Seq(right)        // (left, right]
+          case ( 1, -1) => Seq()             // (left, right)
+        }
+
+        (someContainedPoints, left.isNullAt(i), right.isNullAt(i), lastType) match {
+          case (Seq(), _, _, _) =>
+            None
+          case (_, false, true, _) =>
+            None
+          case (_, true, false, _) =>
+            None
+          case (Seq(somePoint), true, true, _) =>
+            Some(somePoint)
+          case (Seq(left, right), true, true, _) =>
+            Some(left) // both null so last field must be equal
+          case (Seq(somePoint), false, false, TInt32) =>
+            val diff = left.getInt(i) - right.getInt(i)
+            if (diff == 1 || diff == -1) {
+              Some(somePoint)
+            } else {
+              None
+            }
+          case (Seq(somePoint), false, false, TInt64) =>
+            val diff = left.getLong(i) - right.getLong(i)
+            if (diff == 1 || diff == -1) {
+              Some(somePoint)
+            } else {
+              None
+            }
+          case (Seq(lPoint, rPoint), false, false, TInt32) =>
+            if (left.getInt(i) == right.getInt(i)) {
+              Some(lPoint) // equal so it doesn't matter
+            } else {
+              None
+            }
+          case (Seq(lPoint, rPoint), false, false, TInt64) =>
+            if (left.getLong(i) == right.getLong(i)) {
+              Some(lPoint) // equal so it doesn't matter
+            } else {
+              None
+            }
+          case x =>
+            throw new AssertionError(s"unexpected case $x")
+        }
+      }
+    }
+
+    anyFailAllFail(rangeBounds.map(singleton))
+  }
 }
 
 object RVDPartitioner {
-  def empty(typ: RVDType): RVDPartitioner = {
-    new RVDPartitioner(typ.kType.virtualType, Array.empty[Interval])
+  def empty(typ: TStruct): RVDPartitioner = {
+    new RVDPartitioner(typ, Array.empty[Interval])
   }
 
   def unkeyed(numPartitions: Int): RVDPartitioner = {
     new RVDPartitioner(
-      TStruct.empty(),
+      TStruct.empty,
       Array.fill(numPartitions)(Interval(Row(), Row(), true, true)),
       0)
   }
@@ -309,7 +402,7 @@ object RVDPartitioner {
     intervals: IndexedSeq[Interval],
     allowedOverlap: Int
   ): RVDPartitioner = {
-    val kord = kType.ordering
+    val kord = PartitionBoundOrdering(kType)
     val eord = kord.intervalEndpointOrdering
     val iord = Interval.ordering(kord, startPrimary = true)
     val pk = allowedOverlap + 1
@@ -349,7 +442,8 @@ object RVDPartitioner {
     require(typ.kType.virtualType.relaxedTypeCheck(max))
     require(keys.forall(typ.kType.virtualType.relaxedTypeCheck))
 
-    val sortedKeys = keys.sorted(typ.kType.virtualType.ordering.toOrdering)
+    val kOrd = PartitionBoundOrdering(typ.kType.virtualType).toOrdering
+    val sortedKeys = keys.sorted(kOrd)
     val step = (sortedKeys.length - 1).toDouble / nPartitions
     val partitionEdges = Array.tabulate(nPartitions - 1) { i =>
       IntervalEndpoint(sortedKeys(((i + 1) * step).toInt), 1)
@@ -372,10 +466,26 @@ object RVDPartitioner {
   ): Boolean = {
     rangeBounds.isEmpty ||
       rangeBounds.zip(rangeBounds.tail).forall { case (left: Interval, right: Interval) =>
-        val r = kType.ordering.intervalEndpointOrdering.lteqWithOverlap(allowedOverlap)(left.right, right.left)
+        val r = PartitionBoundOrdering(kType).intervalEndpointOrdering.lteqWithOverlap(allowedOverlap)(left.right, right.left)
         if (!r)
           log.info(s"invalid partitioner: !lteqWithOverlap($allowedOverlap)(${ left }.right, ${ right }.left)")
         r
       }
+  }
+
+  def intervalIRRepresentation(ts: TStruct): TStruct = {
+    val endpointT = TTuple(ts, TInt32)
+    TStruct("left" -> endpointT, "right" -> endpointT, "includesLeft" -> TBoolean, "includesRight" -> TBoolean)
+  }
+
+  def intervalToIRRepresentation(interval: Interval, len: Int): Row = {
+    def processStruct(r: Row): Row = {
+      Row(Row.fromSeq((0 until len).map(i => if (i >= r.length) null else r.get(i))), r.length)
+    }
+
+    Row(processStruct(interval.left.point.asInstanceOf[Row]),
+      processStruct(interval.right.point.asInstanceOf[Row]),
+      interval.left.sign < 0,
+      interval.right.sign > 0)
   }
 }

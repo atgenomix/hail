@@ -1,15 +1,15 @@
 package is.hail.stats
 
 import breeze.linalg.DenseMatrix
-import is.hail.{SparkSuite, TestUtils}
-import is.hail.utils._
-import is.hail.testUtils._
 import is.hail.TestUtils._
+import is.hail.testUtils._
+import is.hail.utils._
 import is.hail.variant._
+import is.hail.{HailSuite, TestUtils}
 import org.apache.commons.math3.distribution.{ChiSquaredDistribution, NormalDistribution}
 import org.testng.annotations.Test
 
-class StatsSuite extends SparkSuite {
+class StatsSuite extends HailSuite {
 
   @Test def chiSquaredTailTest() {
     val chiSq1 = new ChiSquaredDistribution(1)
@@ -50,22 +50,6 @@ class StatsSuite extends SparkSuite {
     assert(D_==(qnorm(2.753624e-89), -20))
   }
 
-  @Test def vdsFromMatrixTest() {
-    val G = DenseMatrix((0, 1), (2, -1), (0, 1))
-    val vds = vdsFromCallMatrix(hc)(TestUtils.unphasedDiploidGtIndicesToBoxedCall(G))
-
-    val G1 = DenseMatrix.zeros[Int](3, 2)
-
-    vds.variantRDD.collect().foreach{ case (v, (va, gs)) => gs.zipWithIndex.foreach { case (g, i) => G1(i, v.start - 1) = Genotype.call(g).map(Call.nNonRefAlleles).getOrElse(-1) } }
-
-    assert(vds.stringSampleIds == IndexedSeq("0", "1", "2"))
-    assert(vds.variants.collect().toSet == Set(Variant("1", 1, "A", "C"), Variant("1", 2, "A", "C")))
-
-    for (i <- 0 to 2)
-      for (j <- 0 to 1)
-        assert(G(i, j) == G1(i, j))
-  }
-
   @Test def poissonTest() {
     // compare with R
     assert(D_==(dpois(5, 10), 0.03783327))
@@ -93,14 +77,6 @@ class StatsSuite extends SparkSuite {
     assert(D_==(dbeta(.1, 1, 1), 1, tol))
     assert(D_==(dbeta(.2, 4, 7), 1.761608, tol))
     assert(D_==(dbeta(.2, 1, 2), 1.6, tol))
-
-  }
-
-  @Test def binomTestTest() {
-    //Compare against R
-    assert(D_==(binomTest(2, 10, 0.5, 0), 0.10937, tolerance = 1e-4))
-    assert(D_==(binomTest(4 ,10, 0.5, 1), 0.377, tolerance = 1e-3))
-    assert(D_==(binomTest(32, 50, 0.4, 2), 0.0005193, tolerance = 1e-4))
 
   }
 

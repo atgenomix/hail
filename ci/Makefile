@@ -1,88 +1,54 @@
-.PHONY: run restart-proxy restart-batch-proxy restart-all-proxies
-.PHONY: setup-conda-env build-hail-ci push-hail-ci test-locally
-.PHONY: run-service deploy
+ZONE := us-central1-a
+PROJECT := $(shell gcloud config get-value project)
+DOMAIN ?= hail.is
+IP ?= 35.224.105.117
+KUBERNETES_SERVER_URL ?= https://104.198.230.143
 
-PROJECT = $(shell gcloud config get-value project)
+PROJECT := $(shell gcloud config get-value project)
 
-HAIL_CI_LOCAL_BATCH_PORT ?= 8888
+CI_UTILS_LATEST = gcr.io/$(PROJECT)/ci-utils:latest
+CI_UTILS_IMAGE = gcr.io/$(PROJECT)/ci-utils:$(shell docker images -q --no-trunc ci-utils | sed -e 's,[^:]*:,,')
 
-setup-conda-env:
-	conda env create --name hail-ci -f environment.yml
+CI_LATEST = gcr.io/$(PROJECT)/ci:latest
+CI_IMAGE = gcr.io/$(PROJECT)/ci:$(shell docker images -q --no-trunc ci | sed -e 's,[^:]*:,,')
 
-update-conda-env:
-	conda env update --name hail-ci -f environment.yml
+PYTHONPATH := $${PYTHONPATH:+$${PYTHONPATH}:}
+PYTHON := PYTHONPATH=$(PYTHONPATH)../batch:../hail/python:../gear:../web_common python3
 
-build-hail-ci:
-	cd ../ && docker build . -t hail-ci -f ci/Dockerfile
+.PHONY: check
+check:
+	$(PYTHON) -m flake8 ci
+	$(PYTHON) -m pylint --rcfile ../pylintrc ci --score=n
 
-push-hail-ci: IMAGE = gcr.io/$(PROJECT)/hail-ci:$(shell docker images -q --no-trunc hail-ci | head -n 1 | sed -e 's,[^:]*:,,')
-push-hail-ci: build-hail-ci
-	docker tag hail-ci ${IMAGE}
-	docker push ${IMAGE}
-	echo ${IMAGE} > hail-ci-image
-	echo built ${IMAGE}
+.PHONY: build-ci-utils
+build-ci-utils:
+	make -C ../docker build
+	-docker pull $(CI_UTILS_LATEST)
+	python3 jinja2_render.py '{"service_base_image":{"image":"service-base"}}' Dockerfile.ci-utils Dockerfile.ci-utils.out
+	docker build -t ci-utils -f Dockerfile.ci-utils.out --cache-from ci-utils,$(CI_UTILS_LATEST),base .
 
-restart-all-proxies: restart-proxy restart-batch-proxy
+.PHONY: push-ci-utils
+push-ci-utils: build-ci-utils
+	docker tag ci-utils $(CI_UTILS_LATEST)
+	docker push $(CI_UTILS_LATEST)
+	docker tag ci-utils $(CI_UTILS_IMAGE)
+	docker push $(CI_UTILS_IMAGE)
 
-restart-proxy: ZONE = $(shell gcloud compute instances list --filter=name=dk-test --format="value(ZONE)")
-restart-proxy:
-	-kill $(shell cat proxy.pid)
-	-kill -9 $(shell cat proxy.pid)
-	-rm -rf proxy.pid
-	$(shell gcloud compute \
-	  --project "$(PROJECT)" \
-	  ssh \
-	  --zone "$(ZONE)" \
-	  "dk-test" \
-	  --ssh-flag="-R 0.0.0.0:${HAIL_CI_REMOTE_PORT}:127.0.0.1:5000" \
-	  --ssh-flag='-N' \
-	  --ssh-flag='-T' \
-	  --ssh-flag='-v' \
-	  --dry-run) > proxy.log 2>proxy.err & echo $$! > proxy.pid
-	sleep 2 && kill -0 $$(cat proxy.pid)
+.PHONY: build
+build:
+	make -C ../docker build
+	-docker	pull $(CI_LATEST)
+	python3 jinja2_render.py '{"service_base_image":{"image":"service-base"}}' Dockerfile Dockerfile.out
+	docker build -t ci -f Dockerfile.out --cache-from ci,$(CI_LATEST),service-base ..
 
-restart-batch-proxy:
-	-kill $(shell cat batch-proxy.pid)
-	-kill -9 $(shell cat batch-proxy.pid)
-	-rm -rf batch-proxy.pid
-	$(eval BATCH_POD := $(shell kubectl get pods \
-                           -l app=batch \
-                           --field-selector=status.phase==Running \
-                           -o name \
-                         | sed 's:pods/::' \
-                         | head -n 1))
-	kubectl port-forward ${BATCH_POD} 8888:5000 > batch-proxy.log 2>batch-proxy.err & echo $$! > batch-proxy.pid
-	sleep 2 && kill -0 $$(cat batch-proxy.pid)
+.PHONY: push
+push: build
+	docker tag ci $(CI_LATEST)
+	docker push $(CI_LATEST)
+	docker tag ci $(CI_IMAGE)
+	docker push $(CI_IMAGE)
 
-
-
-run-local: HAIL_CI_REMOTE_PORT = 3000
-run-local: PROXY_IP=$(shell gcloud compute instances list --filter=name=dk-test --format="value(EXTERNAL_IP)")
-run-local: restart-all-proxies
-	SELF_HOSTNAME=http://${PROXY_IP}:${HAIL_CI_REMOTE_PORT} \
-	BATCH_SERVER_URL=http://127.0.0.1:${HAIL_CI_LOCAL_BATCH_PORT} \
-	../loadconda && conda activate hail-ci && python run_ci.py
-
-run-local-for-tests: HAIL_CI_REMOTE_PORT = 3001
-run-local-for-tests: PROXY_IP=$(shell gcloud compute instances list --filter=name=dk-test --format="value(EXTERNAL_IP)")
-run-local-for-tests: restart-all-proxies
-	SELF_HOSTNAME=http://${PROXY_IP}:${HAIL_CI_REMOTE_PORT} \
-	BATCH_SERVER_URL=http://127.0.0.1:${HAIL_CI_LOCAL_BATCH_PORT} \
-	WATCHED_TARGETS='[["hail-is/ci-test:master", true]]' \
-	../loadconda && conda activate hail-ci && pip install ./batch && python run_ci.py
-
-test-locally: HAIL_CI_REMOTE_PORT = 3001
-test-locally: PROXY_IP=$(shell gcloud compute instances list --filter=name=dk-test --format="value(EXTERNAL_IP)")
-test-locally: restart-all-proxies
-	SELF_HOSTNAME=http://${PROXY_IP}:${HAIL_CI_REMOTE_PORT} \
-	BATCH_SERVER_URL=http://127.0.0.1:${HAIL_CI_LOCAL_BATCH_PORT} \
-	./test-locally.sh
-
-run-service:
-	kubectl apply -f k8s/service.yaml
-
-deploy: push-hail-ci
-	sed -e "s,@sha@,$(shell git rev-parse --short=12 HEAD)," \
-	  -e "s,@image@,$(shell cat hail-ci-image)," \
-	  < deployment.yaml.in > k8s/deployment.yaml
-	kubectl -n default apply -f k8s
+.PHONY: deploy
+deploy: push push-ci-utils
+	python3 jinja2_render.py '{"code":{"sha":"$(shell git rev-parse --short=12 HEAD)"},"deploy":true,"default_ns":{"name":"default"},"batch_pods_ns":{"name":"batch-pods"},"ci_image":{"image":"$(CI_IMAGE)"},"global":{"project":"$(PROJECT)","zone":"$(ZONE)","ip":"$(IP)","domain":"$(DOMAIN)", "k8s_server_url":"$(KUBERNETES_SERVER_URL)"},"ci_utils_image":{"image":"$(CI_UTILS_IMAGE)"},"ci_database":{"user_secret_name":"sql-ci-user-config"}}' deployment.yaml deployment.yaml.out
+	kubectl -n default apply -f deployment.yaml.out

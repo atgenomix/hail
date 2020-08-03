@@ -1,8 +1,8 @@
 package is.hail.rvd
 
+import is.hail.annotations.{Region, RegionValue, SafeRow, WritableRegionValue}
+import is.hail.types.virtual.Type
 import is.hail.utils._
-import is.hail.annotations.{RegionValue, SafeRow, WritableRegionValue}
-import is.hail.expr.types.virtual.Type
 
 case class RVDPartitionInfo(
   partitionIndex: Int,
@@ -11,7 +11,8 @@ case class RVDPartitionInfo(
   max: Any,
   // min, max: RegionValue[kType]
   samples: Array[Any],
-  sortedness: Int
+  sortedness: Int,
+  contextStr: String
 ) {
   val interval = Interval(min, max, true, true)
 
@@ -30,25 +31,26 @@ object RVDPartitionInfo {
     partitionKey: Int,
     sampleSize: Int,
     partitionIndex: Int,
-    it: Iterator[RegionValue],
+    it: Iterator[Long],
     seed: Int,
     producerContext: RVDContext
   ): RVDPartitionInfo = {
     using(RVDContext.default) { localctx =>
       val kPType = typ.kType
       val pkOrd = typ.copy(key = typ.key.take(partitionKey)).kOrd
-      val minF = WritableRegionValue(kPType, localctx.freshRegion)
-      val maxF = WritableRegionValue(kPType, localctx.freshRegion)
-      val prevF = WritableRegionValue(kPType, localctx.freshRegion)
+      val minF = WritableRegionValue(kPType, localctx.freshRegion())
+      val maxF = WritableRegionValue(kPType, localctx.freshRegion())
+      val prevF = WritableRegionValue(kPType, localctx.freshRegion())
 
       assert(it.hasNext)
       val f0 = it.next()
 
-      minF.set(f0)
-      maxF.set(f0)
-      prevF.set(f0)
+      minF.set(f0, deepCopy = true)
+      maxF.set(f0, deepCopy = true)
+      prevF.set(f0, deepCopy = true)
 
       var sortedness = KSORTED
+      var contextStr = ""
 
       val rng = new java.util.Random(seed)
       val samples = new Array[WritableRegionValue](sampleSize)
@@ -56,7 +58,7 @@ object RVDPartitionInfo {
       var i = 0
 
       if (sampleSize > 0) {
-        samples(0) = WritableRegionValue(kPType, f0, localctx.freshRegion)
+        samples(0) = WritableRegionValue(kPType, f0, localctx.freshRegion())
         i += 1
       }
 
@@ -64,30 +66,35 @@ object RVDPartitionInfo {
       while (it.hasNext) {
         val f = it.next()
 
-        if (typ.kOrd.lt(f, prevF.value)) {
-          if (pkOrd.lt(f, prevF.value)) {
-            if (sortedness > UNSORTED)
-              log.info(s"unsorted: ${ f.pretty(typ.kType) }, ${ prevF.pretty }")
+        if (sortedness > UNSORTED && typ.kOrd.lt(f, prevF.value.offset)) {
+          if (pkOrd.lt(f, prevF.value.offset)) {
+            val curr = Region.pretty(typ.kType, f)
+            val prev = prevF.pretty
+            log.info(s"unsorted: $curr, $prev")
+            contextStr = s"CURRENT=$curr, PREV=$prev"
             sortedness = UNSORTED
-          } else
-            if (sortedness > TSORTED)
-              log.info(s"tsorted: ${ f.pretty(typ.kType) }, ${ prevF.pretty }")
+          } else if (sortedness > TSORTED) {
+            val curr = Region.pretty(typ.kType, f)
+            val prev = prevF.pretty
+            log.info(s"partition-key-sorted: $curr, $prev")
+            contextStr = s"CURRENT=$curr, PREV=$prev"
             sortedness = sortedness.min(TSORTED)
+          }
         }
 
-        if (typ.kOrd.lt(f, minF.value))
-          minF.set(f)
-        if (typ.kOrd.gt(f, maxF.value))
-          maxF.set(f)
+        if (typ.kOrd.lt(f, minF.value.offset))
+          minF.set(f, deepCopy = true)
+        if (typ.kOrd.gt(f, maxF.value.offset))
+          maxF.set(f, deepCopy = true)
 
-        prevF.set(f)
+        prevF.set(f, deepCopy = true)
 
         if (i < sampleSize)
-          samples(i) = WritableRegionValue(kPType, f, localctx.freshRegion)
+          samples(i) = WritableRegionValue(kPType, f, localctx.freshRegion())
         else {
           val j = if (i > 0) rng.nextInt(i) else 0
           if (j < sampleSize)
-            samples(j).set(f)
+            samples(j).set(f, deepCopy = true)
         }
 
         producerContext.region.clear()
@@ -99,7 +106,8 @@ object RVDPartitionInfo {
       RVDPartitionInfo(partitionIndex, i,
         safe(minF.value), safe(maxF.value),
         Array.tabulate[Any](math.min(i, sampleSize))(i => safe(samples(i).value)),
-        sortedness)
+        sortedness,
+        contextStr)
     }
   }
 }

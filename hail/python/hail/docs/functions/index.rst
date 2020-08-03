@@ -23,9 +23,9 @@ These functions are exposed at the top level of the module, e.g. ``hl.case``.
 
 .. autosummary::
 
-    eval
     literal
     cond
+    if_else
     switch
     case
     bind
@@ -63,6 +63,7 @@ These functions are exposed at the top level of the module, e.g. ``hl.case``.
     set
     empty_set
     dict
+    empty_dict
 
 .. rubric:: Collection functions
 
@@ -119,7 +120,9 @@ These functions are exposed at the top level of the module, e.g. ``hl.case``.
 .. autosummary::
 
     min
+    nanmin
     max
+    nanmax
     mean
     median
     product
@@ -128,6 +131,7 @@ These functions are exposed at the top level of the module, e.g. ``hl.case``.
     argmin
     argmax
     corr
+    binary_search
 
 .. rubric:: String functions
 
@@ -135,9 +139,16 @@ These functions are exposed at the top level of the module, e.g. ``hl.case``.
 
     format
     json
+    parse_json
     hamming
     delimit
     entropy
+    parse_int
+    parse_int32
+    parse_int64
+    parse_float
+    parse_float32
+    parse_float64
 
 .. rubric:: Statistical functions
 
@@ -168,6 +179,7 @@ These functions are exposed at the top level of the module, e.g. ``hl.case``.
     rand_norm
     rand_pois
     rand_unif
+    shuffle
 
 .. rubric:: Genetics functions
 
@@ -179,6 +191,7 @@ These functions are exposed at the top level of the module, e.g. ``hl.case``.
     parse_locus
     parse_variant
     parse_locus_interval
+    variant_str
     call
     unphased_diploid_gt_index_call
     parse_call
@@ -195,6 +208,7 @@ These functions are exposed at the top level of the module, e.g. ``hl.case``.
     is_complex
     is_valid_contig
     is_valid_locus
+    contig_length
     allele_type
     pl_dosage
     gp_dosage
@@ -202,3 +216,4 @@ These functions are exposed at the top level of the module, e.g. ``hl.case``.
     mendel_error_code
     liftover
     min_rep
+    reverse_complement

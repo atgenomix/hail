@@ -1,17 +1,17 @@
 package is.hail.methods
 
-import is.hail.SparkSuite
+import is.hail.HailSuite
 import is.hail.check.Prop._
 import is.hail.check.Properties
 import is.hail.expr._
-import is.hail.expr.types.virtual.{TFloat64, TInt32, Type}
+import is.hail.types.virtual.{TFloat64, TInt32, Type}
 import is.hail.expr.ir.IRParser
 import is.hail.utils.StringEscapeUtils._
 import org.json4s._
 import org.json4s.jackson.JsonMethods._
 import org.testng.annotations.Test
 
-class ExprSuite extends SparkSuite {
+class ExprSuite extends HailSuite {
 
   @Test def testTypePretty() {
     // for arbType
@@ -80,7 +80,7 @@ class ExprSuite extends SparkSuite {
         JSONAnnotationImpex.importAnnotation(parse(string), t) == a
       }
 
-      property("table") = forAll(g.filter { case (t, a) => !t.isOfType(TFloat64()) && a != null }.resize(10)) { case (t, a) =>
+      property("table") = forAll(g.filter { case (t, a) => t != TFloat64 && a != null }.resize(10)) { case (t, a) =>
         TableAnnotationImpex.importAnnotation(TableAnnotationImpex.exportAnnotation(a, t), t) == a
       }
     }
@@ -89,7 +89,7 @@ class ExprSuite extends SparkSuite {
   }
 
   @Test def testOrdering() {
-    val intOrd = TInt32().ordering
+    val intOrd = TInt32.ordering
 
     assert(intOrd.compare(-2, -2) == 0)
     assert(intOrd.compare(null, null) == 0)

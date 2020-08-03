@@ -4,8 +4,10 @@ import is.hail.utils._
 import org.apache.spark.sql.Row
 
 object ExtendedOrdering {
-  def extendToNull[S](ord: Ordering[S]): ExtendedOrdering = {
+  def extendToNull[S](ord: Ordering[S], _missingEqual: Boolean = true): ExtendedOrdering = {
     new ExtendedOrdering {
+      val missingEqual = _missingEqual
+
       def compareNonnull(x: T, y: T): Int = ord.compare(x.asInstanceOf[S], y.asInstanceOf[S])
 
       override def ltNonnull(x: T, y: T): Boolean = ord.lt(x.asInstanceOf[S], y.asInstanceOf[S])
@@ -16,8 +18,10 @@ object ExtendedOrdering {
     }
   }
 
-  def iterableOrdering[T](ord: ExtendedOrdering): ExtendedOrdering =
+  def iterableOrdering[T](ord: ExtendedOrdering, _missingEqual: Boolean = true): ExtendedOrdering =
     new ExtendedOrdering {
+      val missingEqual = _missingEqual
+
       def compareNonnull(x: T, y: T): Int = {
         val xit = x.asInstanceOf[Iterable[T]].iterator
         val yit = y.asInstanceOf[Iterable[T]].iterator
@@ -78,49 +82,45 @@ object ExtendedOrdering {
       }
     }
 
-  def sortArrayOrdering(ord: ExtendedOrdering): ExtendedOrdering =
+  def sortArrayOrdering(ord: ExtendedOrdering, _missingEqual: Boolean = true): ExtendedOrdering =
     new ExtendedOrdering {
+      val missingEqual = _missingEqual
+
       private val itOrd = iterableOrdering(ord)
 
       // ord can be null if the element type is a TVariable
-      private val elemOrd = if (ord != null) ord.toOrdering else null
+      val elemOrd = if (ord != null) ord.toOrdering else null
 
       def compareNonnull(x: T, y: T): Int = {
-        val ax = x.asInstanceOf[Array[T]]
-        val ay = y.asInstanceOf[Array[T]]
         itOrd.compareNonnull(
           x.asInstanceOf[Array[T]].sorted(elemOrd).toFastIndexedSeq,
           y.asInstanceOf[Array[T]].sorted(elemOrd).toFastIndexedSeq)
       }
 
       override def ltNonnull(x: T, y: T): Boolean = {
-        val ax = x.asInstanceOf[Array[T]]
-        val ay = y.asInstanceOf[Array[T]]
         itOrd.ltNonnull(
           x.asInstanceOf[Array[T]].sorted(elemOrd).toFastIndexedSeq,
           y.asInstanceOf[Array[T]].sorted(elemOrd).toFastIndexedSeq)
       }
 
       override def lteqNonnull(x: T, y: T): Boolean = {
-        val ax = x.asInstanceOf[Array[T]]
-        val ay = y.asInstanceOf[Array[T]]
         itOrd.lteqNonnull(
           x.asInstanceOf[Array[T]].sorted(elemOrd).toFastIndexedSeq,
           y.asInstanceOf[Array[T]].sorted(elemOrd).toFastIndexedSeq)
       }
 
       override def equivNonnull(x: T, y: T): Boolean = {
-        val ax = x.asInstanceOf[Array[T]]
-        val ay = y.asInstanceOf[Array[T]]
         itOrd.equivNonnull(
           x.asInstanceOf[Array[T]].sorted(elemOrd).toFastIndexedSeq,
           y.asInstanceOf[Array[T]].sorted(elemOrd).toFastIndexedSeq)
       }
     }
 
-  def setOrdering(ord: ExtendedOrdering): ExtendedOrdering =
+  def setOrdering(ord: ExtendedOrdering, _missingEqual: Boolean = true): ExtendedOrdering =
     new ExtendedOrdering {
       private val saOrd = sortArrayOrdering(ord)
+
+      val missingEqual = _missingEqual
 
       def compareNonnull(x: T, y: T): Int = {
         saOrd.compareNonnull(
@@ -147,9 +147,11 @@ object ExtendedOrdering {
       }
     }
 
-  def mapOrdering(ord: ExtendedOrdering): ExtendedOrdering =
+  def mapOrdering(ord: ExtendedOrdering, _missingEqual: Boolean = true): ExtendedOrdering =
     new ExtendedOrdering {
       private val saOrd = sortArrayOrdering(ord)
+
+      val missingEqual = _missingEqual
 
       private def toArrayOfT(x: T): Array[T] =
         x.asInstanceOf[Map[_, _]].iterator.map { case (k, v) => Row(k, v): T }.toArray
@@ -175,15 +177,21 @@ object ExtendedOrdering {
       }
     }
 
-  def rowOrdering(fieldOrd: Array[ExtendedOrdering]): ExtendedOrdering =
-    new ExtendedOrdering { outer =>
+  def rowOrdering(fieldOrd: Array[ExtendedOrdering], _missingEqual: Boolean = true): ExtendedOrdering =
+    new ExtendedOrdering {
+      outer =>
+
+      val missingEqual = _missingEqual
+
       override def compareNonnull(x: T, y: T): Int = {
         val rx = x.asInstanceOf[Row]
         val ry = y.asInstanceOf[Row]
+        val rLen = rx.length
+        assert(rLen == fieldOrd.length)
+        assert(ry.length == fieldOrd.length)
 
-        val commonPrefix = math.min(fieldOrd.length, math.min(rx.length, ry.length))
         var i = 0
-        while (i < commonPrefix) {
+        while (i < rLen) {
           val c = fieldOrd(i).compare(rx.get(i), ry.get(i))
           if (c != 0)
             return c
@@ -197,10 +205,11 @@ object ExtendedOrdering {
       override def ltNonnull(x: T, y: T): Boolean = {
         val rx = x.asInstanceOf[Row]
         val ry = y.asInstanceOf[Row]
+        val rLen = rx.length
+        assert(rLen == ry.length)
 
-        val commonPrefix = math.min(fieldOrd.length, math.min(rx.length, ry.length))
         var i = 0
-        while (i < commonPrefix) {
+        while (i < rLen) {
           val fOrd = fieldOrd(i)
           val rxi = rx.get(i)
           val ryi = ry.get(i)
@@ -219,10 +228,11 @@ object ExtendedOrdering {
       override def lteqNonnull(x: T, y: T): Boolean = {
         val rx = x.asInstanceOf[Row]
         val ry = y.asInstanceOf[Row]
+        val rLen = rx.length
+        assert(rLen == ry.length)
 
-        val commonPrefix = math.min(fieldOrd.length, math.min(rx.length, ry.length))
         var i = 0
-        while (i < commonPrefix) {
+        while (i < rLen) {
           val fOrd = fieldOrd(i)
           val rxi = rx.get(i)
           val ryi = ry.get(i)
@@ -241,10 +251,11 @@ object ExtendedOrdering {
       override def equivNonnull(x: T, y: T): Boolean = {
         val rx = x.asInstanceOf[Row]
         val ry = y.asInstanceOf[Row]
+        val rLen = rx.length
+        assert(rLen == ry.length)
 
-        val commonPrefix = math.min(fieldOrd.length, math.min(rx.length, ry.length))
         var i = 0
-        while (i < commonPrefix) {
+        while (i < rLen) {
           val fOrd = fieldOrd(i)
           val rxi = rx.get(i)
           val ryi = ry.get(i)
@@ -256,56 +267,6 @@ object ExtendedOrdering {
         // equal
         true
       }
-
-      override lazy val intervalEndpointOrdering = new IntervalEndpointOrdering {
-        override def compareIntervalEndpoints(xp: Any, xs: Int, yp: Any, ys: Int): Int = {
-          val xpp = xp.asInstanceOf[Row]
-          val ypp = yp.asInstanceOf[Row]
-          val l = fieldOrd.length
-
-          val c = outer.compare(xpp, ypp)
-          if (c != 0 || xpp == null || ypp == null || (l < xpp.length && l < ypp.length))
-            c
-          else {
-            val cl = xpp.length compare ypp.length
-            if (cl == 0) xs compare ys
-            else if (cl < 0) xs
-            else -ys
-          }
-        }
-
-        // Returns true if for any rows r1 and r2 with r1 < x and r2 > y,
-        // the length of the largest common prefix of r1 and r2 is less than
-        // or equal to 'allowedOverlap'
-        override def lteqWithOverlap(allowedOverlap: Int)(x: IntervalEndpoint, y: IntervalEndpoint): Boolean = {
-          require(allowedOverlap <= fieldOrd.length)
-          val xp = x
-          val yp = y
-          val xpp = xp.point.asInstanceOf[Row]
-          val ypp = yp.point.asInstanceOf[Row]
-          val l = fieldOrd.length
-
-          val prefix = Seq(l, xpp.length, ypp.length, allowedOverlap + 1).min
-          var i = 0
-          while (i < prefix) {
-            val c = fieldOrd(i).compare(xpp.get(i), ypp.get(i))
-            if (c != 0)
-              return c < 0
-            i += 1
-          }
-          val cl = xpp.length compare ypp.length
-          if (allowedOverlap == l)
-            prefix == l ||
-              (cl < 0 && xp.sign < 0) ||
-              (cl > 0 && yp.sign > 0) ||
-              (cl == 0 && xp.sign <= yp.sign)
-          else
-            (xpp.length <= allowedOverlap + 1 || ypp.length <= allowedOverlap + 1) && (
-              (cl < 0 && xp.sign < 0) ||
-                (cl > 0 && yp.sign > 0) ||
-                (cl == 0 && xp.sign <= yp.sign))
-        }
-      }
     }
 }
 
@@ -313,6 +274,8 @@ abstract class ExtendedOrdering extends Serializable {
   outer =>
 
   type T = Any
+
+  val missingEqual: Boolean
 
   def compareNonnull(x: T, y: T): Int
 
@@ -329,7 +292,7 @@ abstract class ExtendedOrdering extends Serializable {
   def compare(x: T, y: T): Int = {
     if (y == null) {
       if (x == null)
-        0
+        if (missingEqual) 0 else -1
       else -1
     } else {
       if (x == null)
@@ -342,7 +305,7 @@ abstract class ExtendedOrdering extends Serializable {
   def lt(x: T, y: T): Boolean = {
     if (y == null) {
       if (x == null)
-        false
+        !missingEqual
       else
         true
     } else {
@@ -355,10 +318,7 @@ abstract class ExtendedOrdering extends Serializable {
 
   def lteq(x: T, y: T): Boolean = {
     if (y == null) {
-      if (x == null)
-        true
-      else
-        true
+      true
     } else {
       if (x == null)
         false
@@ -370,7 +330,7 @@ abstract class ExtendedOrdering extends Serializable {
   def equiv(x: T, y: T): Boolean = {
     if (y == null) {
       if (x == null)
-        true
+        missingEqual
       else
         false
     } else {
@@ -381,12 +341,35 @@ abstract class ExtendedOrdering extends Serializable {
     }
   }
 
-  def gt(x: T, y: T): Boolean = lt(y, x)
+  def gt(x: T, y: T): Boolean = {
+    if (y == null) {
+      false
+    } else {
+      if (x == null)
+        true
+      else
+        gtNonnull(x, y)
+    }
+  }
 
-  def gteq(x: T, y: T): Boolean = lteq(y, x)
+  def gteq(x: T, y: T): Boolean = {
+    if (y == null) {
+      if (x == null)
+        missingEqual
+      else
+        false
+    } else {
+      if (x == null)
+        true
+      else
+        gteqNonnull(x, y)
+    }
+  }
 
   // reverses the sense of the non-null comparison only
   def reverse: ExtendedOrdering = new ExtendedOrdering {
+    val missingEqual = outer.missingEqual
+
     override def reverse: ExtendedOrdering = outer
 
     def compareNonnull(x: T, y: T): Int = outer.compareNonnull(y, x)
@@ -415,7 +398,7 @@ abstract class ExtendedOrdering extends Serializable {
         if (c != 0)
           c
         else
-          xs compare ys
+          Integer.compare(xs, ys)
       }
 
       override def lteqWithOverlap(allowedOverlap: Int)(x: IntervalEndpoint, y: IntervalEndpoint): Boolean = {
@@ -437,6 +420,8 @@ abstract class IntervalEndpointOrdering extends ExtendedOrdering {
   def compareIntervalEndpoints(xp: Any, xs: Int, yp: Any, ys: Int): Int
 
   def lteqWithOverlap(allowedOverlap: Int)(x: IntervalEndpoint, y: IntervalEndpoint): Boolean
+
+  val missingEqual = true
 
   override def compareNonnull(x: Any, y: Any): Int = {
     val xp = if (x.isInstanceOf[IntervalEndpoint]) x.asInstanceOf[IntervalEndpoint].point else x

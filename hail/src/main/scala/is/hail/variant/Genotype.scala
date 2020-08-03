@@ -1,9 +1,8 @@
 package is.hail.variant
 
 import is.hail.annotations.Annotation
-import is.hail.check.{Arbitrary, Gen}
-import is.hail.expr.types._
-import is.hail.expr.types.virtual.{TArray, TCall, TInt32, TStruct}
+import is.hail.check.Gen
+import is.hail.types.virtual.{TArray, TCall, TInt32, TStruct}
 import is.hail.utils._
 import org.apache.spark.sql.Row
 
@@ -48,11 +47,11 @@ class AllelePair(val p: Int) extends AnyVal {
 
 object Genotype {
   val htsGenotypeType: TStruct = TStruct(
-    "GT" -> TCall(),
-    "AD" -> TArray(+TInt32()),
-    "DP" -> TInt32(),
-    "GQ" -> TInt32(),
-    "PL" -> TArray(+TInt32()))
+    "GT" -> TCall,
+    "AD" -> TArray(TInt32),
+    "DP" -> TInt32,
+    "GQ" -> TInt32,
+    "PL" -> TArray(TInt32))
 
   def call(g: Annotation): Option[Call] = {
     if (g == null)
@@ -132,25 +131,6 @@ object Genotype {
     f(1, a(0), 0, 1)
   }
 
-  def unboxedGTFromUIntLinear(a: ArrayUInt): Int = {
-    def f(i: Int, m: UInt, mi: Int, count: Int): Int = {
-      if (i == a.length) {
-        assert(count >= 1)
-        if (count == 1)
-          mi
-        else
-          -1
-      } else if (a(i) > m)
-        f(i + 1, a(i), i, 1)
-      else if (a(i) == m)
-        f(i + 1, m, mi, count + 1)
-      else
-        f(i + 1, m, mi, count)
-    }
-
-    f(1, a(0), 0, 1)
-  }
-
   val maxPhredInTable = 8192
 
   lazy val phredToLinearConversionTable: Array[Double] = (0 to maxPhredInTable).map { i => math.pow(10, i / -10.0) }.toArray
@@ -175,6 +155,14 @@ object Genotype {
     AllelePair(6, 6),
     AllelePair(0, 7), AllelePair(1, 7), AllelePair(2, 7), AllelePair(3, 7), AllelePair(4, 7),
     AllelePair(5, 7), AllelePair(6, 7), AllelePair(7, 7))
+
+  val smallAlleleJ: Array[Int] = smallAllelePair.map(_.j)
+  val smallAlleleK: Array[Int] = smallAllelePair.map(_.k)
+
+  val nCachedAllelePairs: Int = smallAllelePair.length
+
+  def cachedAlleleJ(p: Int): Int = smallAlleleJ(p)
+  def cachedAlleleK(p: Int): Int = smallAlleleK(p)
 
   def allelePairRecursive(i: Int): AllelePair = {
     def f(j: Int, k: Int): AllelePair = if (j <= k)

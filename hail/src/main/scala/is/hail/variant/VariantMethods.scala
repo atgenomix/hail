@@ -10,30 +10,25 @@ object Contig {
 
 object VariantMethods {
 
-  def parse(str: String, rg: RGBase): (Locus, IndexedSeq[String]) = {
+  def parse(str: String, rg: ReferenceGenome): (Locus, IndexedSeq[String]) = {
     val elts = str.split(":")
     val size = elts.length
     if (size < 4)
-      fatal(s"Invalid string for Variant. Expecting contig:pos:ref:alt1,alt2 -- found `$str'.")
+      fatal(s"Invalid string for Variant. Expecting contig:pos:ref:alt1,alt2 -- found '$str'.")
 
     val contig = elts.take(size - 3).mkString(":")
     (Locus(contig, elts(size - 3).toInt, rg), elts(size - 2) +: elts(size - 1).split(","))
-  }
-
-  def variantID(contig: String, start: Int, alleles: IndexedSeq[String]): String = {
-    require(alleles.length >= 2)
-    s"$contig:$start:${alleles(0)}:${alleles.tail.mkString(",")}"
-  }
-
-  def nGenotypes(nAlleles: Int): Int = {
-    require(nAlleles > 0, s"called nGenotypes with invalid number of alternates: $nAlleles")
-    nAlleles * (nAlleles + 1) / 2
   }
 
   def locusAllelesToString(locus: Locus, alleles: IndexedSeq[String]): String =
     s"$locus:${ alleles(0) }:${ alleles.tail.mkString(",") }"
 
   def minRep(locus: Locus, alleles: IndexedSeq[String]): (Locus, IndexedSeq[String]) = {
+    if (alleles.isEmpty)
+      fatal(s"min_rep: expect at least one allele, found no alleles")
+    if (alleles.contains(null))
+      fatal(s"min_rep: found null allele at locus $locus")
+
     val ref = alleles(0)
 
     val altAlleles = alleles.tail
@@ -68,7 +63,7 @@ object VariantMethods {
         assert(ns < ref.length - ne && alts.forall(x => ns < x.length - ne))
         (Locus(locus.contig, locus.position + ns),
           ref.substring(ns, ref.length - ne) +:
-          altAlleles.map(a => if (a == "*") a else a.substring(ns, a.length - ne)).toArray)
+            altAlleles.map(a => if (a == "*") a else a.substring(ns, a.length - ne)).toArray)
       }
     }
   }

@@ -315,6 +315,32 @@ Multiple Phenotypes
             patterns of missingness. Approach #2 will do two passes over the data while Approaches #1 and #3 will
             do one pass over the data and compute the regression statistics for each phenotype simultaneously.
 
+Using Variants (SNPs) as Covariates
++++++++++++++++++++++++++++++++++++
+
+:**tags**: sample genotypes covariate
+
+:**description**: Use sample genotype dosage at specific variant(s) as covariates in regression routines.
+
+:**code**:
+
+    Create a sample annotation from the genotype dosage for each variant of
+    interest by combining the filter and collect aggregators:
+
+    >>> mt_annot = mt.annotate_cols(
+    ...     snp1 = hl.agg.filter(hl.parse_variant('20:13714384:A:C') == mt.row_key,
+    ...                          hl.agg.collect(mt.GT.n_alt_alleles()))[0],
+    ...     snp2 = hl.agg.filter(hl.parse_variant('20:17479730:T:C') == mt.row_key,
+    ...                          hl.agg.collect(mt.GT.n_alt_alleles()))[0])
+
+    Run the GWAS with :func:`.linear_regression_rows` using variant dosages as covariates:
+
+    >>> gwas = hl.linear_regression_rows(  # doctest: +SKIP
+    ...     x=mt_annot.GT.n_alt_alleles(),
+    ...     y=mt_annot.pheno.blood_pressure,
+    ...     covariates=[1, mt_annot.pheno.age, mt_annot.snp1, mt_annot.snp2])
+
+:**dependencies**: :func:`.linear_regression_rows`, :func:`.aggregators.collect`, :func:`.parse_variant`, :func:`.variant_str`
 
 Stratified by Group
 +++++++++++++++++++
@@ -382,8 +408,8 @@ Stratified by Group
 PLINK Conversions
 ~~~~~~~~~~~~~~~~~
 
-Polygenic Risk Score Calculation
-................................
+Polygenic Score Calculation
+...........................
 
 :**plink**:
 

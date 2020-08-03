@@ -2,46 +2,44 @@ package is.hail.methods
 
 import breeze.linalg._
 import breeze.numerics.sqrt
+import is.hail.HailContext
 import is.hail.annotations._
 import is.hail.expr.ir.functions.MatrixToTableFunction
-import is.hail.expr.ir.{MatrixValue, TableValue}
-import is.hail.expr.types._
-import is.hail.expr.types.physical.PStruct
-import is.hail.expr.types.virtual.{TArray, TFloat64, TInt32, TStruct}
-import is.hail.rvd.RVDType
+import is.hail.expr.ir.{ExecuteContext, MatrixValue, TableValue}
+import is.hail.types._
+import is.hail.types.physical.PStruct
+import is.hail.types.virtual.{TArray, TFloat64, TInt32, TStruct}
 import is.hail.stats._
 import is.hail.utils._
 import net.sourceforge.jdistlib.T
 
 case class LinearRegressionRowsSingle(
-  yFields: Array[String],
+  yFields: Seq[String],
   xField: String,
-  covFields: Array[String],
+  covFields: Seq[String],
   rowBlockSize: Int,
-  passThrough: Array[String]) extends MatrixToTableFunction {
+  passThrough: Seq[String]) extends MatrixToTableFunction {
 
-  override def typeInfo(childType: MatrixType, childRVDType: RVDType): (TableType, RVDType) = {
+  override def typ(childType: MatrixType): TableType = {
     val passThroughType = TStruct(passThrough.map(f => f -> childType.rowType.field(f).typ): _*)
     val schema = TStruct(
-      ("n", TInt32()),
-      ("sum_x", TFloat64()),
-      ("y_transpose_x", TArray(TFloat64())),
-      ("beta", TArray(TFloat64())),
-      ("standard_error", TArray(TFloat64())),
-      ("t_stat", TArray(TFloat64())),
-      ("p_value", TArray(TFloat64())))
-    val tt = TableType(
+      ("n", TInt32),
+      ("sum_x", TFloat64),
+      ("y_transpose_x", TArray(TFloat64)),
+      ("beta", TArray(TFloat64)),
+      ("standard_error", TArray(TFloat64)),
+      ("t_stat", TArray(TFloat64)),
+      ("p_value", TArray(TFloat64)))
+    TableType(
       childType.rowKeyStruct ++ passThroughType ++ schema,
       childType.rowKey,
-      TStruct())
-
-    tt -> tt.canonicalRVDType
+      TStruct.empty)
   }
 
   def preservesPartitionCounts: Boolean = true
 
-  def execute(mv: MatrixValue): TableValue = {
-    val (y, cov, completeColIdx) = RegressionUtils.getPhenosCovCompleteSamples(mv, yFields, covFields)
+  def execute(ctx: ExecuteContext, mv: MatrixValue): TableValue = {
+    val (y, cov, completeColIdx) = RegressionUtils.getPhenosCovCompleteSamples(mv, yFields.toArray, covFields.toArray)
 
     val n = y.rows // n_complete_samples
     val k = cov.cols // nCovariates
@@ -62,29 +60,31 @@ case class LinearRegressionRowsSingle(
 
     val Qty = Qt * y
 
-    val sc = mv.sparkContext
-    val completeColIdxBc = sc.broadcast(completeColIdx)
-    val yBc = sc.broadcast(y)
-    val QtBc = sc.broadcast(Qt)
-    val QtyBc = sc.broadcast(Qty)
-    val yypBc = sc.broadcast(y.t(*, ::).map(r => r dot r) - Qty.t(*, ::).map(r => r dot r))
+    val backend = HailContext.backend
+    val completeColIdxBc = backend.broadcast(completeColIdx)
+    val yBc = backend.broadcast(y)
+    val QtBc = backend.broadcast(Qt)
+    val QtyBc = backend.broadcast(Qty)
+    val yypBc = backend.broadcast(y.t(*, ::).map(r => r dot r) - Qty.t(*, ::).map(r => r dot r))
 
     val fullRowType = mv.rvd.rowPType
     val entryArrayType = MatrixType.getEntryArrayType(fullRowType)
     val entryType = entryArrayType.elementType.asInstanceOf[PStruct]
-    assert(entryType.field(xField).typ.virtualType.isOfType(TFloat64()))
+    assert(entryType.field(xField).typ.virtualType == TFloat64)
 
     val entryArrayIdx = MatrixType.getEntriesIndex(fullRowType)
     val fieldIdx = entryType.fieldIdx(xField)
 
-    val (tableType, rvdType) = typeInfo(mv.typ, mv.rvd.typ)
+    val tableType = typ(mv.typ)
+    val rvdType = tableType.canonicalRVDType
+
     val copiedFieldIndices = (mv.typ.rowKey ++ passThrough).map(fullRowType.fieldIdx(_)).toArray
     val nDependentVariables = yFields.length
 
-    val newRVD = mv.rvd.boundary.mapPartitions(
-      rvdType, { (ctx, it) =>
+    val newRVD = mv.rvd.mapPartitionsWithContext(
+      rvdType) { (consumerCtx, it) =>
+        val producerCtx = consumerCtx.freshContext
         val rvb = new RegionValueBuilder()
-        val rv2 = RegionValue()
 
         val missingCompleteCols = new ArrayBuilder[Int]
         val data = new Array[Double](n * rowBlockSize)
@@ -92,18 +92,19 @@ case class LinearRegressionRowsSingle(
         val blockWRVs = new Array[WritableRegionValue](rowBlockSize)
         var i = 0
         while (i < rowBlockSize) {
-          blockWRVs(i) = WritableRegionValue(fullRowType, ctx.freshRegion)
+          blockWRVs(i) = WritableRegionValue(fullRowType, producerCtx.freshRegion())
           i += 1
         }
 
-        it.trueGroupedIterator(rowBlockSize)
+        it(producerCtx).trueGroupedIterator(rowBlockSize)
           .flatMap { git =>
             var i = 0
             while (git.hasNext) {
-              val rv = git.next()
+              val ptr = git.next()
               RegressionUtils.setMeanImputedDoubles(data, i * n, completeColIdxBc.value, missingCompleteCols,
-                rv, fullRowType, entryArrayType, entryType, entryArrayIdx, fieldIdx)
-              blockWRVs(i).set(rv)
+                ptr, fullRowType, entryArrayType, entryType, entryArrayIdx, fieldIdx)
+              blockWRVs(i).set(ptr, true)
+              producerCtx.region.clear()
               i += 1
             }
             val blockLength = i
@@ -161,45 +162,44 @@ case class LinearRegressionRowsSingle(
               addSlice(p)
 
               rvb.endStruct()
-              rv2.set(wrv.region, rvb.end())
-              rv2
+
+              producerCtx.region.addReferenceTo(wrv.region)
+              rvb.end()
             }
           }
-      })
-    TableValue(tableType, BroadcastRow.empty(sc), newRVD)
+      }
+    TableValue(ctx, tableType, BroadcastRow.empty(ctx), newRVD)
   }
 }
 
 case class LinearRegressionRowsChained(
-  yFields: Array[Array[String]],
+  yFields: Seq[Seq[String]],
   xField: String,
-  covFields: Array[String],
+  covFields: Seq[String],
   rowBlockSize: Int,
-  passThrough: Array[String]) extends MatrixToTableFunction {
+  passThrough: Seq[String]) extends MatrixToTableFunction {
 
-  override def typeInfo(childType: MatrixType, childRVDType: RVDType): (TableType, RVDType) = {
+  override def typ(childType: MatrixType): TableType = {
     val passThroughType = TStruct(passThrough.map(f => f -> childType.rowType.field(f).typ): _*)
     val chainedSchema = TStruct(
-      ("n", TArray(TInt32())),
-      ("sum_x", TArray(TFloat64())),
-      ("y_transpose_x", TArray(TArray(TFloat64()))),
-      ("beta", TArray(TArray(TFloat64()))),
-      ("standard_error", TArray(TArray(TFloat64()))),
-      ("t_stat", TArray(TArray(TFloat64()))),
-      ("p_value", TArray(TArray(TFloat64()))))
-    val tt = TableType(
+      ("n", TArray(TInt32)),
+      ("sum_x", TArray(TFloat64)),
+      ("y_transpose_x", TArray(TArray(TFloat64))),
+      ("beta", TArray(TArray(TFloat64))),
+      ("standard_error", TArray(TArray(TFloat64))),
+      ("t_stat", TArray(TArray(TFloat64))),
+      ("p_value", TArray(TArray(TFloat64))))
+    TableType(
       childType.rowKeyStruct ++ passThroughType ++ chainedSchema,
       childType.rowKey,
-      TStruct())
-
-    tt -> tt.canonicalRVDType
+      TStruct.empty)
   }
 
   def preservesPartitionCounts: Boolean = true
 
-  def execute(mv: MatrixValue): TableValue = {
+  def execute(ctx: ExecuteContext, mv: MatrixValue): TableValue = {
 
-    val localData = yFields.map(RegressionUtils.getPhenosCovCompleteSamples(mv, _, covFields))
+    val localData = yFields.map(y => RegressionUtils.getPhenosCovCompleteSamples(mv, y.toArray, covFields.toArray))
 
     val k = covFields.length // nCovariates
     val bcData = localData.zipWithIndex.map { case ((y, cov, completeColIdx), i) =>
@@ -222,26 +222,26 @@ case class LinearRegressionRowsChained(
       ChainedLinregInput(n, y, completeColIdx, Qt, Qty, yyp, d)
     }
 
-    val sc = mv.sparkContext
-    val bc = sc.broadcast(bcData)
+    val bc = HailContext.backend.broadcast(bcData)
     val nGroups = bcData.length
 
     val fullRowType = mv.rvd.rowPType
     val entryArrayType = MatrixType.getEntryArrayType(fullRowType)
     val entryType = entryArrayType.elementType.asInstanceOf[PStruct]
-    assert(entryType.field(xField).typ.virtualType.isOfType(TFloat64()))
-    assert(entryType.field(xField).typ.virtualType.isOfType(TFloat64()))
+    assert(entryType.field(xField).typ.virtualType == TFloat64)
+    assert(entryType.field(xField).typ.virtualType == TFloat64)
 
     val entryArrayIdx = MatrixType.getEntriesIndex(fullRowType)
     val fieldIdx = entryType.fieldIdx(xField)
 
-    val (tableType, rvdType) = typeInfo(mv.typ, mv.rvd.typ)
+    val tableType = typ(mv.typ)
+    val rvdType = tableType.canonicalRVDType
     val copiedFieldIndices = (mv.typ.rowKey ++ passThrough).map(fullRowType.fieldIdx(_)).toArray
 
-    val newRVD = mv.rvd.boundary.mapPartitions(
-      rvdType, { (ctx, it) =>
+    val newRVD = mv.rvd.mapPartitionsWithContext(
+      rvdType) { (consumerCtx, it) =>
+        val producerCtx = consumerCtx.freshContext
         val rvb = new RegionValueBuilder()
-        val rv2 = RegionValue()
 
         val inputData = bc.value
         val builder = new ArrayBuilder[Int]
@@ -250,22 +250,23 @@ case class LinearRegressionRowsChained(
         val blockWRVs = new Array[WritableRegionValue](rowBlockSize)
         var i = 0
         while (i < rowBlockSize) {
-          blockWRVs(i) = WritableRegionValue(fullRowType, ctx.freshRegion)
+          blockWRVs(i) = WritableRegionValue(fullRowType, producerCtx.freshRegion())
           i += 1
         }
 
-        it.trueGroupedIterator(rowBlockSize)
+        it(producerCtx).trueGroupedIterator(rowBlockSize)
           .flatMap { git =>
             var i = 0
             while (git.hasNext) {
-              val rv = git.next()
+              val ptr = git.next()
               var j = 0
               while (j < nGroups) {
                 RegressionUtils.setMeanImputedDoubles(data(j), i * inputData(j).n, inputData(j).completeColIndex, builder,
-                  rv, fullRowType, entryArrayType, entryType, entryArrayIdx, fieldIdx)
+                  ptr, fullRowType, entryArrayType, entryType, entryArrayIdx, fieldIdx)
                 j += 1
               }
-              blockWRVs(i).set(rv)
+              blockWRVs(i).set(ptr, true)
+              producerCtx.region.clear()
               i += 1
             }
             val blockLength = i
@@ -350,12 +351,13 @@ case class LinearRegressionRowsChained(
               rvb.endArray()
 
               rvb.endStruct()
-              rv2.set(wrv.region, rvb.end())
-              rv2
+
+              producerCtx.region.addReferenceTo(wrv.region)
+              rvb.end()
             }
           }
-      })
-    TableValue(tableType, BroadcastRow.empty(sc), newRVD)
+      }
+    TableValue(ctx, tableType, BroadcastRow.empty(ctx), newRVD)
   }
 }
 

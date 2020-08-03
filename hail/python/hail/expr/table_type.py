@@ -1,7 +1,9 @@
-from hail.typecheck import *
+import pprint
+from hail.typecheck import typecheck_method, sequenceof
 from hail.utils.java import escape_parsable
 from hail.expr.types import dtype, tstruct
 from hail.utils.java import jiterable_to_list
+
 
 class ttable(object):
     @staticmethod
@@ -43,29 +45,29 @@ class ttable(object):
         return f'table {{global: {self.global_type}, row: {self.row_type}, row_key: [{self._key_str()}]}}'
 
     def pretty(self, indent=0, increment=4):
-        l = []
-        l.append(' ' * indent)
-        l.append('table {\n')
+        b = []
+        b.append(' ' * indent)
+        b.append('table {\n')
         indent += increment
-        
-        l.append(' ' * indent)
-        l.append('global: ')
-        self.global_type._pretty(l, indent, increment)
-        l.append(',\n')
-        
-        l.append(' ' * indent)
-        l.append('row: ')
-        self.row_type._pretty(l, indent, increment)
-        l.append(',\n')
-        
-        l.append(' ' * indent)
-        l.append(f'row_key: [{self._key_str()}]\n')
+
+        b.append(' ' * indent)
+        b.append('global: ')
+        self.global_type._pretty(b, indent, increment)
+        b.append(',\n')
+
+        b.append(' ' * indent)
+        b.append('row: ')
+        self.row_type._pretty(b, indent, increment)
+        b.append(',\n')
+
+        b.append(' ' * indent)
+        b.append(f'row_key: [{self._key_str()}]\n')
 
         indent -= increment
-        l.append(' ' * indent)
-        l.append('}')
-        
-        return ''.join(l)
+        b.append(' ' * indent)
+        b.append('}')
+
+        return ''.join(b)
 
     @property
     def key_type(self):
@@ -80,15 +82,18 @@ class ttable(object):
                       self.row_type._rename(row_map),
                       [row_map.get(k, k) for k in self.row_key])
 
-    def row_env(self):
-        return {'global': self.global_type,
-                'row': self.row_type}
+    def row_env(self, default_value=None):
+        if default_value is None:
+            return {'global': self.global_type, 'row': self.row_type}
+        else:
+            return {'global': default_value, 'row': default_value}
 
-    def global_env(self):
-        return {'global': self.global_type}
+    def global_env(self, default_value=None):
+        if default_value is None:
+            return {'global': self.global_type}
+        else:
+            return {'global': default_value}
 
-
-import pprint
 
 _old_printer = pprint.PrettyPrinter
 

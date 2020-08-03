@@ -18,6 +18,8 @@ final class ArrayBuilder[@specialized T](initialCapacity: Int)(implicit tct: Cla
 
   def isEmpty: Boolean = size_ == 0
 
+  def nonEmpty: Boolean = size_ > 0
+
   def apply(i: Int): T = {
     require(i >= 0 && i < size)
     b(i)
@@ -41,7 +43,15 @@ final class ArrayBuilder[@specialized T](initialCapacity: Int)(implicit tct: Cla
     size_ = 0
   }
 
-  def +=(x: T) {
+  def clearAndResize(): Unit = {
+    size_ = 0
+    if (b.length > initialCapacity)
+      b = new Array[T](initialCapacity)
+  }
+
+  def +=(x: T): Unit = push(x)
+
+  def push(x: T) {
     ensureCapacity(size_ + 1)
     b(size_) = x
     size_ += 1
@@ -71,10 +81,37 @@ final class ArrayBuilder[@specialized T](initialCapacity: Int)(implicit tct: Cla
     b(size_ - 1)
   }
 
+  def top: T = last
+
+  def pop(): T = {
+    size_ -= 1
+    b(size)
+  }
+
+  def appendFrom(ab2: ArrayBuilder[T]): Unit = {
+    ensureCapacity(size_ + ab2.size_)
+    System.arraycopy(ab2.b, 0, b, size_, ab2.size_)
+    size_ = size_ + ab2.size_
+  }
+
+  def setSizeUninitialized(size: Int): Unit = {
+    ensureCapacity(size)
+    size_ = size
+  }
+
   override def clone(): ArrayBuilder[T] = {
     val ab = new ArrayBuilder[T]()
     ab.b = b.clone()
     ab.size_ = size_
     ab
+  }
+
+  def clearAndSetMem(obj: T): Unit = {
+    clear()
+    var i = 0
+    while (i < b.length) {
+      b(i) = obj
+      i += 1
+    }
   }
 }

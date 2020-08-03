@@ -2,22 +2,21 @@ package is.hail.linalg
 
 
 import breeze.linalg.{*, diag, DenseMatrix => BDM, DenseVector => BDV}
-import is.hail.{SparkSuite, TestUtils}
 import is.hail.check.Arbitrary._
-import is.hail.check.Prop._
 import is.hail.check.Gen._
+import is.hail.check.Prop._
 import is.hail.check._
+import is.hail.expr.ir.{CompileAndEvaluate, GetField, TableCollect, TableLiteral}
+import is.hail.types.virtual.{TFloat64, TInt64, TStruct}
 import is.hail.linalg.BlockMatrix.ops._
-import is.hail.expr.types._
-import is.hail.expr.types.virtual.{TFloat64Optional, TInt64Optional, TStruct}
-import is.hail.table.Table
 import is.hail.utils._
+import is.hail.{HailSuite, TestUtils}
 import org.apache.spark.sql.Row
 import org.testng.annotations.Test
 
 import scala.language.implicitConversions
 
-class BlockMatrixSuite extends SparkSuite {
+class BlockMatrixSuite extends HailSuite {
 
   // row major
   def toLM(nRows: Int, nCols: Int, data: Array[Double]): BDM[Double] =
@@ -33,14 +32,14 @@ class BlockMatrixSuite extends SparkSuite {
     val n = rows.length
     val m = if (n == 0) 0 else rows(0).length
 
-    BlockMatrix.fromBreezeMatrix(sc, new BDM[Double](m, n, rows.flatten.toArray).t, blockSize)
+    BlockMatrix.fromBreezeMatrix(new BDM[Double](m, n, rows.flatten.toArray).t, blockSize)
   }
 
   def toBM(lm: BDM[Double]): BlockMatrix =
     toBM(lm, BlockMatrix.defaultBlockSize)
 
   def toBM(lm: BDM[Double], blockSize: Int): BlockMatrix =
-    BlockMatrix.fromBreezeMatrix(sc, lm, blockSize)
+    BlockMatrix.fromBreezeMatrix(lm, blockSize)
 
   private val defaultBlockSize = choose(1, 1 << 6)
   private val defaultDims = nonEmptySquareOfAreaAtMostSize
@@ -71,7 +70,7 @@ class BlockMatrixSuite extends SparkSuite {
 
   def twoMultipliableBlockMatrices(element: Gen[Double] = defaultElement): Gen[(BlockMatrix, BlockMatrix)] = for {
     Array(nRows, innerDim, nCols) <- nonEmptyNCubeOfVolumeAtMostSize(3)
-    blockSize <- interestingPosInt.map(math.pow(_, 1.0 / 3.0).toInt)
+    blockSize <- interestingPosInt.filter(_ > 3) // 1 or 2 cause large numbers of partitions, leading to slow tests
     l <- blockMatrixGen(const(blockSize), const(nRows -> innerDim), element)
     r <- blockMatrixGen(const(blockSize), const(innerDim -> nCols), element)
   } yield (l, r)
@@ -359,13 +358,10 @@ class BlockMatrixSuite extends SparkSuite {
 
   @Test
   def fromLocalTest() {
-    forAll(denseMatrix[Double]()) { lm =>
-      assert(lm === BlockMatrix.fromBreezeMatrix(sc, lm, lm.rows + 1).toBreezeMatrix())
-      assert(lm === BlockMatrix.fromBreezeMatrix(sc, lm, lm.rows).toBreezeMatrix())
-      if (lm.rows > 1) {
-        assert(lm === BlockMatrix.fromBreezeMatrix(sc, lm, lm.rows - 1).toBreezeMatrix())
-        assert(lm === BlockMatrix.fromBreezeMatrix(sc, lm, math.sqrt(lm.rows).toInt).toBreezeMatrix())
-      }
+    forAll(denseMatrix[Double]().flatMap { m =>
+      Gen.zip(Gen.const(m), Gen.choose(math.sqrt(m.rows).toInt, m.rows + 16))
+    }) { case (lm, blockSize) =>
+      assert(lm === BlockMatrix.fromBreezeMatrix(lm, blockSize).toBreezeMatrix())
       true
     }.check()
   }
@@ -378,13 +374,13 @@ class BlockMatrixSuite extends SparkSuite {
       9, 10, 11, 12,
       13, 14, 15, 16))
 
-    val fname = tmpDir.createTempFile("test")
-    m.write(fname)
-    assert(m.toBreezeMatrix() == BlockMatrix.read(hc, fname).toBreezeMatrix())
+    val fname = ctx.createTmpPath("test")
+    m.write(ctx, fname)
+    assert(m.toBreezeMatrix() == BlockMatrix.read(fs, fname).toBreezeMatrix())
 
-    val fname2 = tmpDir.createTempFile("test2")
-    m.write(fname2, forceRowMajor = true)
-    assert(m.toBreezeMatrix() == BlockMatrix.read(hc, fname2).toBreezeMatrix())
+    val fname2 = ctx.createTmpPath("test2")
+    m.write(ctx, fname2, forceRowMajor = true)
+    assert(m.toBreezeMatrix() == BlockMatrix.read(fs, fname2).toBreezeMatrix())
   }
 
   @Test
@@ -395,21 +391,21 @@ class BlockMatrixSuite extends SparkSuite {
       9, 10, 11, 12,
       13, 14, 15, 16))
 
-    val fname = tmpDir.createTempFile("test")
-    m.T.write(fname)
-    assert(m.T.toBreezeMatrix() == BlockMatrix.read(hc, fname).toBreezeMatrix())
+    val fname = ctx.createTmpPath("test")
+    m.T.write(ctx, fname)
+    assert(m.T.toBreezeMatrix() == BlockMatrix.read(fs, fname).toBreezeMatrix())
 
-    val fname2 = tmpDir.createTempFile("test2")
-    m.T.write(fname2, forceRowMajor = true)
-    assert(m.T.toBreezeMatrix() == BlockMatrix.read(hc, fname2).toBreezeMatrix())
+    val fname2 = ctx.createTmpPath("test2")
+    m.T.write(ctx, fname2, forceRowMajor = true)
+    assert(m.T.toBreezeMatrix() == BlockMatrix.read(fs, fname2).toBreezeMatrix())
   }
 
   @Test
   def readWriteIdentityRandom() {
     forAll(blockMatrixGen()) { (m: BlockMatrix) =>
-      val fname = tmpDir.createTempFile("test")
-      m.write(fname)
-      assert(sameDoubleMatrixNaNEqualsNaN(m.toBreezeMatrix(), BlockMatrix.read(hc, fname).toBreezeMatrix()))
+      val fname = ctx.createTmpPath("test")
+      m.write(ctx, fname)
+      assert(sameDoubleMatrixNaNEqualsNaN(m.toBreezeMatrix(), BlockMatrix.read(fs, fname).toBreezeMatrix()))
       true
     }.check()
   }
@@ -601,7 +597,7 @@ class BlockMatrixSuite extends SparkSuite {
 
     for {blockSize <- Seq(1, 2, 3, 5, 10, 11)
     } {
-      val bm = BlockMatrix.fromBreezeMatrix(sc, lm, blockSize)
+      val bm = BlockMatrix.fromBreezeMatrix(lm, blockSize)
       for {keep <- Seq(
         Array(0),
         Array(1),
@@ -625,7 +621,7 @@ class BlockMatrixSuite extends SparkSuite {
 
     for {blockSize <- Seq(2, 3)
     } {
-      val bm = BlockMatrix.fromBreezeMatrix(sc, lm, blockSize).transpose()
+      val bm = BlockMatrix.fromBreezeMatrix(lm, blockSize).transpose()
       for {keep <- Seq(
         Array(0),
         Array(1, 4, 5, 7, 8),
@@ -645,7 +641,7 @@ class BlockMatrixSuite extends SparkSuite {
 
     for {blockSize <- Seq(2, 3)
     } {
-      val bm = BlockMatrix.fromBreezeMatrix(sc, lm, blockSize)
+      val bm = BlockMatrix.fromBreezeMatrix(lm, blockSize)
       for {keep <- Seq(
         Array(0),
         Array(1, 4, 5, 7, 8),
@@ -665,7 +661,7 @@ class BlockMatrixSuite extends SparkSuite {
 
     for {blockSize <- Seq(1, 2, 3, 5, 10, 11)
     } {
-      val bm = BlockMatrix.fromBreezeMatrix(sc, lm, blockSize)
+      val bm = BlockMatrix.fromBreezeMatrix(lm, blockSize)
       for {keep <- Seq(
         Array(0),
         Array(1),
@@ -688,7 +684,7 @@ class BlockMatrixSuite extends SparkSuite {
 
     for {blockSize <- Seq(1, 2, 3, 5, 10, 11)
     } {
-      val bm = BlockMatrix.fromBreezeMatrix(sc, lm, blockSize)
+      val bm = BlockMatrix.fromBreezeMatrix(lm, blockSize)
       for {
         keepRows <- Seq(
           Array(1),
@@ -712,25 +708,25 @@ class BlockMatrixSuite extends SparkSuite {
     val lm = new BDM[Double](10, 10, (0 until 100).map(_.toDouble).toArray)
 
     for {blockSize <- Seq(1, 2, 3, 5, 10, 11)} {
-      val fname = tmpDir.createTempFile("test")
-      lm.writeBlockMatrix(hc, fname, blockSize)
-      assert(lm === BlockMatrix.read(hc, fname).toBreezeMatrix())
+      val fname = ctx.createTmpPath("test")
+      lm.writeBlockMatrix(fs, fname, blockSize)
+      assert(lm === BlockMatrix.read(fs, fname).toBreezeMatrix())
     }
   }
 
   @Test
   def randomTest() {
-    var lm1 = BlockMatrix.random(hc, 5, 10, 2, seed = 1, gaussian = false).toBreezeMatrix()
-    var lm2 = BlockMatrix.random(hc, 5, 10, 2, seed = 1, gaussian = false).toBreezeMatrix()
-    var lm3 = BlockMatrix.random(hc, 5, 10, 2, seed = 2, gaussian = false).toBreezeMatrix()
+    var lm1 = BlockMatrix.random(5, 10, 2, seed = 1, gaussian = false).toBreezeMatrix()
+    var lm2 = BlockMatrix.random(5, 10, 2, seed = 1, gaussian = false).toBreezeMatrix()
+    var lm3 = BlockMatrix.random(5, 10, 2, seed = 2, gaussian = false).toBreezeMatrix()
 
     assert(lm1 === lm2)
     assert(lm1 !== lm3)
     assert(lm1.data.forall(x => x >= 0 && x <= 1))
 
-    lm1 = BlockMatrix.random(hc, 5, 10, 2, seed = 1, gaussian = true).toBreezeMatrix()
-    lm2 = BlockMatrix.random(hc, 5, 10, 2, seed = 1, gaussian = true).toBreezeMatrix()
-    lm3 = BlockMatrix.random(hc, 5, 10, 2, seed = 2, gaussian = true).toBreezeMatrix()
+    lm1 = BlockMatrix.random(5, 10, 2, seed = 1, gaussian = true).toBreezeMatrix()
+    lm2 = BlockMatrix.random(5, 10, 2, seed = 1, gaussian = true).toBreezeMatrix()
+    lm3 = BlockMatrix.random(5, 10, 2, seed = 2, gaussian = true).toBreezeMatrix()
 
     assert(lm1 === lm2)
     assert(lm1 !== lm3)
@@ -741,14 +737,16 @@ class BlockMatrixSuite extends SparkSuite {
     val data = (0 until 90).map(_.toDouble).toArray
     val lm = new BDM[Double](9, 10, data)
     val expectedEntries = data.map(x => ((x % 9).toLong, (x / 9).toLong, x)).toSet
-    val expectedSignature = TStruct("i" -> TInt64Optional, "j" -> TInt64Optional, "entry" -> TFloat64Optional)
+    val expectedSignature = TStruct("i" -> TInt64, "j" -> TInt64, "entry" -> TFloat64)
 
     for {blockSize <- Seq(1, 4, 10)} {
-      val entriesTable = toBM(lm, blockSize).entriesTable(hc)
-      val entries = entriesTable.collect().map(row => (row.get(0), row.get(1), row.get(2))).toSet
+      val entriesLiteral = TableLiteral(toBM(lm, blockSize).entriesTable(ctx))
+      assert(entriesLiteral.typ.rowType == expectedSignature)
+      val rows = CompileAndEvaluate[IndexedSeq[Row]](ctx,
+        GetField(TableCollect(entriesLiteral), "rows"))
+      val entries = rows.map(row => (row.get(0), row.get(1), row.get(2))).toSet
       // block size affects order of rows in table, but sets will be the same
       assert(entries === expectedEntries)
-      assert(entriesTable.signature === expectedSignature)
     }
   }
 
@@ -758,10 +756,11 @@ class BlockMatrixSuite extends SparkSuite {
     val lm = new BDM[Double](5, 10, data)
     val bm = toBM(lm, blockSize = 2)
 
-    val expected = bm
+    val rows = CompileAndEvaluate[IndexedSeq[Row]](ctx, GetField(TableCollect(TableLiteral(bm
       .filterBlocks(Array(0, 1, 6))
-      .entriesTable(hc)
-      .collect()
+      .entriesTable(ctx))),
+      "rows"))
+    val expected = rows
       .sortBy(r => (r.get(0).asInstanceOf[Long], r.get(1).asInstanceOf[Long]))
       .map(r => r.get(2).asInstanceOf[Double])
 
@@ -771,7 +770,7 @@ class BlockMatrixSuite extends SparkSuite {
   @Test
   def testPowSqrt(): Unit = {
     val lm = new BDM[Double](2, 3, Array(0.0, 1.0, 4.0, 9.0, 16.0, 25.0))
-    val bm = BlockMatrix.fromBreezeMatrix(sc, lm, blockSize = 2)
+    val bm = BlockMatrix.fromBreezeMatrix(lm, blockSize = 2)
     val expected = new BDM[Double](2, 3, Array(0.0, 1.0, 2.0, 3.0, 4.0, 5.0))
     
     TestUtils.assertMatrixEqualityDouble(bm.pow(0.0).toBreezeMatrix(), BDM.fill(2, 3)(1.0))
@@ -781,6 +780,41 @@ class BlockMatrixSuite extends SparkSuite {
   
   def filteredEquals(bm1: BlockMatrix, bm2: BlockMatrix): Boolean =
     bm1.blocks.collect() sameElements bm2.blocks.collect()
+
+  @Test
+  def testSparseFilterEdges(): Unit = {
+    val lm = new BDM[Double](12, 12, (0 to 143).map(_.toDouble).toArray)
+    val bm = toBM(lm, blockSize = 5)
+
+    val onlyEight = bm.filterBlocks(Array(8)) // Bottom right corner block
+    val onlyEightRowEleven = onlyEight.filterRows(Array(11)).toBreezeMatrix()
+    val onlyEightColEleven = onlyEight.filterCols(Array(11)).toBreezeMatrix()
+    val onlyEightCornerFour = onlyEight.filter(Array(10, 11), Array(10, 11)).toBreezeMatrix()
+
+    assert(onlyEightRowEleven.toArray sameElements Array(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 131, 143).map(_.toDouble))
+    assert(onlyEightColEleven.toArray sameElements Array(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 142, 143).map(_.toDouble))
+    assert(onlyEightCornerFour == new BDM[Double](2, 2, Array(130.0, 131.0, 142.0, 143.0)))
+  }
+
+  @Test
+  def testSparseTransposeMaybeBlocks(): Unit = {
+    val lm = new BDM[Double](9, 12, (0 to 107).map(_.toDouble).toArray)
+    val bm = toBM(lm, blockSize = 3)
+    val sparse = bm.filterBand(0, 0, true)
+    assert(sparse.transpose().gp.partitionIndexToBlockIndex.get.toIndexedSeq == IndexedSeq(0, 5, 10))
+  }
+
+  @Test
+  def filterRowsRectangleSum(): Unit = {
+    val nRows = 10
+    val nCols = 50
+    val bm = BlockMatrix.fill(nRows, nCols, 2, 1)
+    val banded = bm.filterBand(0, 0, false)
+    val rowFilt = banded.filterRows((0L until nRows.toLong by 2L).toArray)
+    val summed = rowFilt.rowSum().toBreezeMatrix().toArray
+    val expected = Array.tabulate(nRows)(x => if (x % 2 == 0) 2.0 else 0) ++ Array.tabulate(nCols - nRows)(x => 0.0)
+    assert(summed sameElements expected)
+  }
 
   @Test
   def testFilterBlocks() {
@@ -859,15 +893,15 @@ class BlockMatrixSuite extends SparkSuite {
 
       assert(flm === fbm.toIndexedRowMatrix().toHailBlockMatrix().toBreezeMatrix())
       
-      val fname = tmpDir.createTempFile("test")
-      fbm.write(fname, forceRowMajor = true)
+      val fname = ctx.createTmpPath("test")
+      fbm.write(ctx, fname, forceRowMajor = true)
       
-      assert(RowMatrix.readBlockMatrix(hc, fname, Some(3)).toBreezeMatrix() === flm)
+      assert(RowMatrix.readBlockMatrix(fs, fname, 3).toBreezeMatrix() === flm)
 
-      assert(filteredEquals(fbm, BlockMatrix.read(hc, fname)))
+      assert(filteredEquals(fbm, BlockMatrix.read(fs, fname)))
     }
   }
-  
+
   @Test
   def testSparseBlockMatrixMathAndFilter() {
     val lm = toLM(4, 4, Array(
@@ -884,7 +918,8 @@ class BlockMatrixSuite extends SparkSuite {
       Array(1, 3),
       Array(2, 3),
       Array(1, 2, 3),
-      Array(0, 1, 2, 3))
+      Array(0, 1, 2, 3)
+    )
 
     val lm_zero = BDM.zeros[Double](2, 2)
 
@@ -904,11 +939,12 @@ class BlockMatrixSuite extends SparkSuite {
         
     // test transpose, diagonal, math ops, filter ops
     for { keep <- keepArray } {
+      println(s"Test says keep block: ${keep.toIndexedSeq}")
       val fbm = bm.filterBlocks(keep)
       val flm = filterBlocks(keep)
 
       assert(filteredEquals(fbm.transpose().transpose(), fbm))
-      
+
       assert(filteredEquals(
         fbm.transpose(), bm.transpose().filterBlocks(keep.map(transposeBI).sorted)))
 
@@ -916,7 +952,7 @@ class BlockMatrixSuite extends SparkSuite {
 
       assert(filteredEquals(+fbm, +bm.filterBlocks(keep)))
       assert(filteredEquals(-fbm, -bm.filterBlocks(keep)))
-      
+
       assert(filteredEquals(fbm + fbm, (bm + bm).filterBlocks(keep)))
       assert(filteredEquals(fbm - fbm, (bm - bm).filterBlocks(keep)))
       assert(filteredEquals(fbm * fbm, (bm * bm).filterBlocks(keep)))
@@ -926,13 +962,13 @@ class BlockMatrixSuite extends SparkSuite {
 
       assert(filteredEquals(fbm.colVectorMul(v), bm.colVectorMul(v).filterBlocks(keep)))
       assert(filteredEquals(fbm.colVectorDiv(v), bm.colVectorDiv(v).filterBlocks(keep)))
-      
+
       assert(filteredEquals(fbm * 2, (bm * 2).filterBlocks(keep)))
       assert(filteredEquals(fbm / 2, (bm / 2).filterBlocks(keep)))
-      
+
       assert(filteredEquals(fbm.sqrt(), bm.sqrt().filterBlocks(keep)))
       assert(filteredEquals(fbm.pow(3), bm.pow(3).filterBlocks(keep)))
-      
+
       assert(fbm.dot(fbm).toBreezeMatrix() === flm * flm)
 
       // densifying ops
@@ -944,7 +980,7 @@ class BlockMatrixSuite extends SparkSuite {
       assert(fbm.rowVectorAdd(v).toBreezeMatrix() === flm(*, ::) + BDV(v))
       assert(fbm.rowVectorSub(v).toBreezeMatrix() === flm(*, ::) - BDV(v))
       assert(fbm.reverseRowVectorSub(v).toBreezeMatrix() === -(flm(*, ::) - BDV(v)))
-      
+
       assert(fbm.colVectorAdd(v).toBreezeMatrix() === flm(::, *) + BDV(v))
       assert(fbm.colVectorSub(v).toBreezeMatrix() === flm(::, *) - BDV(v))
       assert(fbm.reverseColVectorSub(v).toBreezeMatrix() === -(flm(::, *) - BDV(v)))

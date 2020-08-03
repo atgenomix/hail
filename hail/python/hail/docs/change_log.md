@@ -1,6 +1,993 @@
 # Change Log
 
-## 0.2.10
+## Frequently Asked Questions
+
+### With a version like 0.x, is Hail ready for use in publications?
+
+Yes. The [semantic versioning standard](https://semver.org) uses 0.x (development) versions to
+refer to software that is either "buggy" or "partial". While we don't view
+Hail as particularly buggy (especially compared to one-off untested
+scripts pervasive in bioinformatics!), Hail 0.2 is a partial realization
+of a larger vision.
+
+### What stability is guaranteed?
+
+We do not intentionally break back-compatibility of interfaces or file
+formats. This means that a script developed to run on Hail 0.2.5 should
+continue to work in every subsequent release within the 0.2 major version.
+**The exception to this rule is experimental functionality, denoted as
+such in the reference documentation, which may change at any time**.
+
+Please note that **forward compatibility should not be expected, especially
+relating to file formats**: this means that it may not be possible to use
+an earlier version of Hail to read files written in a later version.
+
+## Version 0.2.53
+
+Released 2020-07-30
+
+### Bug fixes
+
+- (hail#9173) Use less confusing column key behavior in MT.show.
+- (hail#9172) Add a missing Python dependency to Hail: google-cloud-storage.
+- (hail#9170) Change Hail tree aggregate depth logic to correctly respect the
+  branching factor set in `hl.init`.
+
+---
+
+## Version 0.2.52
+
+Released 2020-07-29
+
+### Bug fixes
+
+- (hail#8944)(hail#9169) Fixed crash (error 134 or SIGSEGV) in `MatrixTable.annotate_cols`, `hl.sample_qc`, and more.
+
+---
+
+## Version 0.2.51
+
+Released 2020-07-28
+
+### Bug fixes
+
+- (hail#9161) Fix bug that prevented concatenating ndarrays that are fields of a table.
+- (hail#9152) Fix bounds in NDArray slicing.
+- (hail#9161) Fix bugs calculating *row_id* in `hl.import_matrix_table`.
+
+---
+
+## Version 0.2.50
+
+Released 2020-07-23
+
+### Bug fixes
+
+- (hail#9114) CHANGELOG: Fixed crash when using repeated calls to `hl.filter_intervals`.
+
+### New features
+
+- (hail#9101) Add `hl.nd.{concat, hstack, vstack}` to concatenate ndarrays.
+- (hail#9105) Add `hl.nd.{eye, identity}` to create identity matrix ndarrays.
+- (hail#9093) Add `hl.nd.inv` to invert ndarrays.
+- (hail#9063) Add `BlockMatrix.tree_matmul` to improve matrix multiply performance with a large inner dimension.
+
+---
+
+## Version 0.2.49
+
+Released 2020-07-08
+
+### Bug fixes
+
+- (hail#9058) Fixed memory leak affecting `Table.aggregate`, `MatrixTable.annotate_cols` aggregations, and `hl.sample_qc`.
+
+---
+
+## Version 0.2.48
+
+Released 2020-07-07
+
+### Bug fixes
+
+- (hail#9029) Fix crash when using `hl.agg.linreg` with no aggregated data records.
+- (hail#9028) Fixed memory leak affecting `Table.annotate` with scans, `hl.experimental.densify`, and `Table.group_by` / `aggregate`.
+- (hail#8978) Fixed aggregation behavior of `MatrixTable.{group_rows_by, group_cols_by}` to skip filtered entries.
+
+---
+
+## Version 0.2.47
+
+Released 2020-06-23
+
+### Bug fixes
+
+- (hail#9009) Fix memory leak when counting per-partition. This caused excessive memory use in `BlockMatrix.write_from_entry_expr`, and likely in many other places.
+- (hail#9006) Fix memory leak in `hl.export_bgen`. 
+- (hail#9001) Fix double close error that showed up on Azure Cloud. 
+
+## Version 0.2.46
+
+Released 2020-06-17
+
+### Site
+- (hail#8955) Natural language documentation search
+
+### Bug fixes
+- (hail#8981) Fix BlockMatrix OOM triggered by the MatrixWriteBlockMatrix WriteBlocksRDD method
+
+---
+
+## Version 0.2.45
+
+Release 2020-06-15
+
+### Bug fixes
+
+- (hail#8948) Fix integer overflow error when reading files >2G with
+  `hl.import_plink`.
+- (hail#8903) Fix Python type annotations for empty collection constructors and
+  `hl.shuffle`.
+- (hail#8942) Refactored VCF combiner to support other GVCF schemas.
+- (hail#8941) Fixed `hl.import_plink` with multiple data partitions.
+
+### hailctl dataproc
+
+- (hail#8946) Fix bug when a user specifies packages in `hailctl dataproc start`
+  that are also dependencies of the Hail package.
+- (hail#8939) Support tuples in `hailctl dataproc describe`.
+
+---
+
+## Version 0.2.44
+
+Release 2020-06-06
+
+### New Features
+
+- (hail#8914) `hl.export_vcf` can now export tables as sites-only VCFs.
+- (hail#8894) Added `hl.shuffle` function to randomly permute arrays.
+- (hail#8854) Add `composable` option to parallel text export for use with `gsutil compose`.
+
+### Bug fixes
+
+- (hail#8883) Fix an issue related to failures in pipelines with `force_bgz=True`.
+
+### Performance
+
+- (hail#8887) Substantially improve the performance of `hl.experimental.import_gtf`.
+
+---
+
+## Version 0.2.43
+
+Released 2020-05-28
+
+### Bug fixes
+
+- (hail#8867) Fix a major correctness bug ocurring when calling BlockMatrix.transpose on sparse, non-symmetric BlockMatrices.
+- (hail#8876) Fixed "ChannelClosedException: null" in `{Table, MatrixTable}.write`.
+
+---
+
+## Version 0.2.42
+
+Released 2020-05-27
+
+### New Features
+
+- (hail#8822) Add optional non-centrality parameter to `hl.pchisqtail`.
+- (hail#8861) Add `contig_recoding` option to `hl.experimental.run_combiner`.
+
+### Bug fixes
+
+- (hail#8863) Fixes VCF combiner to successfully import GVCFs with alleles called as <NON_REF>.
+- (hail#8845) Fixed issue where accessing an element of an ndarray in a call to Table.transmute would fail.
+- (hail#8855) Fix crash in `filter_intervals`.
+
+---
+
+## Version 0.2.41
+
+Released 2020-05-15
+
+### Bug fixes
+
+- (hail#8799)(hail#8786) Fix ArrayIndexOutOfBoundsException seen in pipelines that reuse a tuple value.
+
+### hailctl dataproc
+
+- (hail#8790) Use configured compute zone as default for `hailctl dataproc connect` and `hailctl dataproc modify`.
+
+---
+
+## Version 0.2.40
+
+Released 2020-05-12
+
+### VCF Combiner
+
+ - (hail#8706) Add option to key by both locus and alleles for final output.
+
+### Bug fixes
+
+ - (hail#8729) Fix assertion error in `Table.group_by(...).aggregate(...)`
+ - (hail#8708) Fix assertion error in reading tables and matrix tables with `_intervals` option.
+ - (hail#8756) Fix return type of `LocusExpression.window` to use locus's reference genome instead of default RG.
+
+---
+
+## Version 0.2.39
+
+Released 2020-04-29
+
+### Bug fixes
+
+- (hail#8615) Fix contig ordering in the CanFam3 (dog) reference genome.
+- (hail#8622) Fix bug that causes inscrutable JVM Bytecode errors.
+- (hail#8645) Ease unnecessarily strict assertion that caused errors when
+  aggregating by key (e.g. `hl.experimental.spread`).
+- (hail#8621) `hl.nd.array` now supports arrays with no elements
+  (e.g. `hl.nd.array([]).reshape((0, 5))`) and, consequently, matmul with an
+  inner dimension of zero.
+
+### New features
+
+- (hail#8571) `hl.init(skip_logging_configuration=True)` will skip configuration
+  of Log4j. Users may use this to configure their own logging.
+- (hail#8588) Users who manually build Python wheels will experience less
+  unnecessary output when doing so.
+- (hail#8572) Add `hl.parse_json` which converts a string containing JSON into a
+  Hail object.
+
+### Performance Improvements
+
+- (hail#8535) Increase speed of `import_vcf`.
+- (hail#8618) Increase speed of Jupyter Notebook file listing and Notebook
+  creation when buckets contain many objects.
+- (hail#8613) `hl.experimental.export_entries_by_col` stages files for improved
+  reliability and performance.
+
+### Documentation
+- (hail#8619) Improve installation documentation to suggest better performing
+  LAPACK and BLAS libraries.
+- (hail#8647) Clarify that a LAPACK or BLAS library is a *requirement* for a
+  complete Hail installation.
+- (hail#8654) Add link to document describing the creation of a Microsoft Azure
+  HDInsight Hail cluster.
+
+---
+
+## Version 0.2.38
+
+Released 2020-04-21
+
+### Critical Linreg Aggregator Correctness Bug
+
+- (hail#8575) Fixed a correctness bug in the linear regression aggregator. This was introduced in version 0.2.29.
+See https://discuss.hail.is/t/possible-incorrect-linreg-aggregator-results-in-0-2-29-0-2-37/1375 for more details.
+
+### Performance improvements
+- (hail#8558) Make `hl.experimental.export_entries_by_col` more fault tolerant.
+
+----
+
+## Version 0.2.37
+
+Released 2020-04-14
+
+### Bug fixes
+
+- (hail#8487) Fix incorrect handling of badly formatted data for `hl.gp_dosage`.
+- (hail#8497) Fix handling of missingness for `hl.hamming`.
+- (hail#8537) Fix compile-time errror.
+- (hail#8539) Fix compiler error in `Table.multi_way_zip_join`.
+- (hail#8488) Fix `hl.agg.call_stats` to appropriately throw an error for badly-formatted calls.
+
+### New features
+
+- (hail#8327) Attempting to write to the same file being read from in a pipeline will now throw an error instead of corrupting data.
+
+---
+
+## Version 0.2.36
+
+Released 2020-04-06
+
+### Critical Memory Management Bug Fix
+
+- (hail#8463) Reverted a change (separate to the bug in 0.2.34) that led to a memory leak in version 0.2.35.
+
+### Bug fixes
+- (hail#8371) Fix runtime error in joins leading to "Cannot set required field missing" error message.
+- (hail#8436) Fix compiler bug leading to possibly-invalid generated code.
+
+---
+
+## Version 0.2.35
+
+Released 2020-04-02
+
+### Critical Memory Management Bug Fix
+
+- (hail#8412) Fixed a serious per-partition memory leak that causes certain pipelines to run out of memory unexpectedly. Please update from 0.2.34.
+
+### New features
+
+- (hail#8404) Added "CanFam3" (a reference genome for dogs) as a bundled reference genome.
+
+### Bug fixes
+
+- (hail#8420) Fixed a bug where `hl.binom_test`'s `"lower"` and `"upper"` alternative options were reversed.
+- (hail#8377) Fixed "inconsistent agg or scan environments" error.
+- (hail#8322) Fixed bug where `aggregate_rows` did not interact with `hl.agg.array_agg` correctly.
+
+### Performance Improvements
+
+- (hail#8413) Improves internal region memory management, decreasing JVM overhead.
+- (hail#8383) Significantly improve GVCF import speed.
+- (hail#8358) Fixed memory leak in `hl.experimental.export_entries_by_col`.
+- (hail#8326) Codegen infrastructure improvement resulting in ~3% overall speedup.
+
+### hailctl dataproc
+
+- (hail#8399) Enable spark speculation by default.
+- (hail#8340) Add new Australia region to `--vep`.
+- (hail#8347) Support all GCP machine types as potential master machines.
+
+---
+
+## Version 0.2.34
+
+Released 2020-03-12
+
+### New features
+
+- (hail#8233) `StringExpression.matches` can now take a hail `StringExpression`, as opposed to only regular python strings.
+- (hail#8198) Improved matrix multiplication interoperation between hail `NDArrayExpression` and numpy.
+
+### Bug fixes
+
+- (hail#8279) Fix a bug where `hl.agg.approx_cdf` failed inside of a `group_cols_by`.
+- (hail#8275) Fix bad error message coming from `mt.make_table()` when keys are missing.
+- (hail#8274) Fix memory leak in `hl.export_bgen`.
+- (hail#8273) Fix segfault caused by `hl.agg.downsample` inside of an `array_agg` or `group_by`.
+
+### hailctl dataproc
+
+- (hail#8253) `hailctl dataproc` now supports new flags `--requester-pays-allow-all` and `--requester-pays-allow-buckets`. This will configure your hail installation to be able to read from requester pays buckets. The charges for reading from these buckets will be billed to the project that the cluster is created in.
+- (hail#8268) The data sources for VEP have been moved to `gs://hail-us-vep`, `gs://hail-eu-vep`, and `gs://hail-uk-vep`, which are requester-pays buckets in Google Cloud. `hailctl dataproc` will automatically infer which of these buckets you should pull data from based on the region your cluster is spun up in. If you are in none of those regions, please contact us on discuss.hail.is.
+
+---
+
+
+## Version 0.2.33
+
+Released 2020-02-27
+
+### New features
+
+- (hail#8173) Added new method `hl.zeros`.
+
+### Bug fixes
+
+- (hail#8153) Fixed complier bug causing `MatchError` in `import_bgen`.
+- (hail#8123) Fixed an issue with multiple Python HailContexts running on the same cluster.
+- (hail#8150) Fixed an issue where output from VEP about failures was not reported in error message.
+- (hail#8152) Fixed an issue where the row count of a MatrixTable coming from `import_matrix_table` was incorrect.
+- (hail#8175) Fixed a bug where `persist` did not actually do anything.
+
+### `hailctl dataproc`
+
+- (hail#8079) Using `connect` to open the jupyter notebook browser will no longer crash if your project contains requester-pays buckets.
+
+---
+
+## Version 0.2.32
+
+Released 2020-02-07
+
+### Critical performance regression fix
+
+- (hail#7989) Fixed performance regression leading to a large slowdown when `hl.variant_qc` was run after filtering columns.
+
+### Performance
+
+- (hail#7962) Improved performance of `hl.pc_relate`.
+- (hail#8032) Drastically improve performance of pipelines calling `hl.variant_qc` and `hl.sample_qc` iteratively.
+- (hail#8037) Improve performance of NDArray matrix multiply by using native linear algebra libraries.
+
+### Bug fixes
+
+- (hail#7976) Fixed divide-by-zero error in `hl.concordance` with no overlapping rows or cols.
+- (hail#7965) Fixed optimizer error leading to crashes caused by `MatrixTable.union_rows`.
+- (hail#8035) Fix compiler bug in `Table.multi_way_zip_join`.
+- (hail#8021) Fix bug in computing shape after `BlockMatrix.filter`.
+- (hail#7986) Fix error in NDArray matrix/vector multiply.
+
+### New features
+
+- (hail#8007) Add `hl.nd.diagonal` function.
+
+### Cheat sheets
+
+ - (hail#7940) Added cheat sheet for MatrixTables.
+ - (hail#7963) Improved Table sheet sheet.
+
+---
+
+## Version 0.2.31
+
+Released 2020-01-22
+
+### New features
+
+- (hail#7787) Added transition/transversion information to `hl.summarize_variants`.
+- (hail#7792) Add Python stack trace to array index out of bounds errors in Hail pipelines.
+- (hail#7832) Add `spark_conf` argument to `hl.init`, permitting configuration of Spark runtime for a Hail session.
+- (hail#7823) Added datetime functions `hl.experimental.strptime` and `hl.experimental.strftime`.
+- (hail#7888) Added `hl.nd.array` constructor from nested standard arrays.
+
+### File size
+
+- (hail#7923) Fixed compression problem since 0.2.23 resulting in larger-than-expected matrix table files for datasets with few entry fields (e.g. GT-only datasets).
+
+### Performance
+
+- (hail#7867) Fix performance regression leading to extra scans of data when `order_by` and `key_by` appeared close together.
+- (hail#7901) Fix performance regression leading to extra scans of data when `group_by/aggregate` and `key_by` appeared close together.
+- (hail#7830) Improve performance of array arithmetic.
+
+### Bug fixes
+
+- (hail#7922) Fix still-not-well-understood serialization error about ApproxCDFCombiner.
+- (hail#7906) Fix optimizer error by relaxing unnecessary assertion.
+- (hail#7788) Fix possible memory leak in `ht.tail` and `ht.head`.
+- (hail#7796) Fix bug in ingesting numpy arrays not in row-major orientation.
+
+---
+
+## Version 0.2.30
+
+Released 2019-12-20
+
+### Performance
+- (hail#7771) Fixed extreme performance regression in scans.
+- (hail#7764) Fixed `mt.entry_field.take` performance regression.
+
+### New features
+- (hail#7614) Added experimental support for loops with `hl.experimental.loop`.
+
+### Miscellaneous
+- (hail#7745) Changed `export_vcf` to only use scientific notation when necessary.
+
+---
+
+## Version 0.2.29
+
+Released 2019-12-17
+
+### Bug fixes
+- (hail#7229) Fixed `hl.maximal_independent_set` tie breaker functionality.
+- (hail#7732) Fixed incompatibility with old files leading to incorrect data read when filtering intervals after `read_matrix_table`.
+- (hail#7642) Fixed crash when constant-folding functions that throw errors.
+- (hail#7611) Fixed `hl.hadoop_ls` to handle glob patterns correctly.
+- (hail#7653) Fixed crash in `ld_prune` by unfiltering missing GTs.
+
+### Performance improvements
+- (hail#7719) Generate more efficient IR for `Table.flatten`.
+- (hail#7740) Method wrapping large let bindings to keep method size down.
+
+### New features
+- (hail#7686) Added `comment` argument to `import_matrix_table`, allowing lines with certain prefixes to be ignored.
+- (hail#7688) Added experimental support for `NDArrayExpression`s in new `hl.nd` module.
+- (hail#7608) `hl.grep` now has a `show` argument that allows users to either print the results (default) or return a dictionary of the results.
+
+### `hailctl dataproc`
+- (hail#7717) Throw error when mispelling arguments instead of silently quitting.
+
+---
+
+## Version 0.2.28
+
+Released 2019-11-22
+
+### Critical correctness bug fix
+- (hail#7588) Fixes a bug where filtering old matrix tables in newer versions of hail did not work as expected. Please update from 0.2.27.
+
+### Bug fixes
+- (hail#7571) Don't set GQ to missing if PL is missing in `split_multi_hts`.
+- (hail#7577) Fixed an optimizer bug.
+
+### New Features
+- (hail#7561) Added `hl.plot.visualize_missingness()` to plot missingness patterns for MatrixTables.
+- (hail#7575) Added `hl.version()` to quickly check hail version.
+
+### `hailctl dataproc`
+- (hail#7586) `hailctl dataproc` now supports `--gcloud_configuration` option.
+
+### Documentation
+- (hail#7570) Hail has a cheatsheet for Tables now.
+
+---
+
+## Version 0.2.27
+
+Released 2019-11-15
+
+### New Features
+
+- (hail#7379) Add `delimiter` argument to `hl.import_matrix_table`
+- (hail#7389) Add `force` and `force_bgz` arguments to `hl.experimental.import_gtf`
+- (hail#7386)(hail#7394) Add `{Table, MatrixTable}.tail`.
+- (hail#7467) Added `hl.if_else` as an alias for `hl.cond`; deprecated `hl.cond`.
+- (hail#7453) Add `hl.parse_int{32, 64}` and `hl.parse_float{32, 64}`, which can parse strings to numbers and return missing on failure.
+- (hail#7475) Add `row_join_type` argument to `MatrixTable.union_cols` to support outer joins on rows.
+
+### Bug fixes
+
+- (hail#7479)(hail#7368)(hail#7402) Fix optimizer bugs.
+- (hail#7506) Updated to latest htsjdk to resolve VCF parsing problems.
+
+### `hailctl dataproc`
+
+- (hail#7460) The Spark monitor widget now automatically collapses after a job completes.
+
+---
+
+## Version 0.2.26
+
+Released 2019-10-24
+
+### New Features
+- (hail#7325) Add `string.reverse` function.
+- (hail#7328) Add `string.translate` function.
+- (hail#7344) Add `hl.reverse_complement` function.
+- (hail#7306) Teach the VCF combiner to handle allele specific (`AS_*`) fields.
+- (hail#7346) Add `hl.agg.approx_median` function.
+
+### Bug Fixes
+- (hail#7361) Fix `AD` calculation in `sparse_split_multi`.
+
+### Performance Improvements
+- (hail#7355) Improve performance of IR copying.
+
+## Version 0.2.25
+
+Released 2019-10-14
+
+### New features
+- (hail#7240) Add interactive schema widget to `{MatrixTable, Table}.describe`. Use this by passing the argument `widget=True`.
+- (hail#7250) `{Table, MatrixTable, Expression}.summarize()` now summarizes elements of collections (arrays, sets, dicts).
+- (hail#7271) Improve `hl.plot.qq` by increasing point size, adding the unscaled p-value to hover data, and printing lambda-GC on the plot.
+- (hail#7280) Add HTML output for `{Table, MatrixTable, Expression}.summarize()`.
+- (hail#7294) Add HTML output for `hl.summarize_variants()`.
+
+### Bug fixes
+- (hail#7200) Fix VCF parsing with missingness inside arrays of floating-point values in the FORMAT field.
+- (hail#7219) Fix crash due to invalid optimizer rule.
+
+### Performance improvements
+- (hail#7187) Dramatically improve performance of chained `BlockMatrix` multiplies without checkpoints in between.
+- (hail#7195)(hail#7194) Improve performance of `group[_rows]_by` / `aggregate`.
+- (hail#7201) Permit code generation of larger aggregation pipelines.
+
+---
+
+## Version 0.2.24
+
+Released 2019-10-03
+
+### `hailctl dataproc`
+- (hail#7185) Resolve issue in dependencies that led to a Jupyter update breaking cluster creation.
+
+### New features
+- (hail#7071) Add `permit_shuffle` flag to `hl.{split_multi, split_multi_hts}` to allow processing of datasets with both multiallelics and duplciate loci.
+- (hail#7121) Add `hl.contig_length` function.
+- (hail#7130) Add `window` method on `LocusExpression`, which creates an interval around a locus.
+- (hail#7172) Permit `hl.init(sc=sc)` with pip-installed packages, given the right configuration options.
+
+### Bug fixes
+- (hail#7070) Fix unintentionally strict type error in `MatrixTable.union_rows`.
+- (hail#7170) Fix issues created downstream of `BlockMatrix.T`.
+- (hail#7146) Fix bad handling of edge cases in `BlockMatrix.filter`.
+- (hail#7182) Fix problem parsing VCFs where lines end in an INFO field of type flag.
+
+---
+
+## Version 0.2.23
+
+Released 2019-09-23
+
+### `hailctl dataproc`
+- (hail#7087) Added back progress bar to notebooks, with links to the correct Spark UI url.
+- (hail#7104) Increased disk requested when using `--vep` to address the "colony collapse" cluster error mode.
+
+### Bug fixes
+- (hail#7066) Fixed generated code when methods from multiple reference genomes appear together.
+- (hail#7077) Fixed crash in `hl.agg.group_by`.
+
+### New features
+- (hail#7009) Introduced analysis pass in Python that mostly obviates the `hl.bind` and `hl.rbind` operators; idiomatic Python that generates Hail expressions will perform much better.
+- (hail#7076) Improved memory management in generated code, add additional log statements about allocated memory to improve debugging.
+- (hail#7085) Warn only once about schema mismatches during JSON import (used in VEP, Nirvana, and sometimes `import_table`.
+- (hail#7106) `hl.agg.call_stats` can now accept a number of alleles for its `alleles` parameter, useful when dealing with biallelic calls without the alleles array at hand.
+
+### Performance
+- (hail#7086) Improved performance of JSON import.
+- (hail#6981) Improved performance of Hail min/max/mean operators. Improved performance of `split_multi_hts` by an additional 33%.
+- (hail#7082)(hail#7096)(hail#7098) Improved performance of large pipelines involving many `annotate` calls.
+
+---
+
+## Version 0.2.22
+
+Released 2019-09-12
+
+### New features
+- (hail#7013) Added `contig_recoding` to `import_bed` and `import_locus_intervals`.
+
+### Performance
+- (hail#6969) Improved performance of `hl.agg.mean`, `hl.agg.stats`, and `hl.agg.corr`.
+- (hail#6987) Improved performance of `import_matrix_table`.
+- (hail#7033)(hail#7049) Various improvements leading to overall 10-15%
+  improvement.
+
+### `hailctl dataproc`
+- (hail#7003) Pass through extra arguments for `hailctl dataproc list` and
+  `hailctl dataproc stop`.
+
+---
+
+## Version 0.2.21
+
+Released 2019-09-03
+
+### Bug fixes
+- (hail#6945) Fixed `expand_types` to preserve ordering by key, also affects
+    `to_pandas` and `to_spark`.
+- (hail#6958) Fixed stack overflow errors when counting the result of a `Table.union`.
+
+### New features
+- (hail#6856) Teach `hl.agg.counter` to weigh each value differently.
+- (hail#6903) Teach `hl.range` to treat a single argument as `0..N`.
+- (hail#6903) Teach `BlockMatrix` how to `checkpoint`.
+
+### Performance
+- (hail#6895) Improved performance of `hl.import_bgen(...).count()`.
+- (hail#6948) Fixed performance bug in `BlockMatrix` filtering functions.
+- (hail#6943) Improved scaling of `Table.union`.
+- (hail#6980) Reduced compute time for `split_multi_hts` by as much as 40%.
+
+### `hailctl dataproc`
+- (hail#6904) Added `--dry-run` option to `submit`.
+- (hail#6951) Fixed `--max-idle` and `--max-age` arguments to `start`.
+- (hail#6919) Added `--update-hail-version` to `modify`.
+
+---
+
+## Version 0.2.20
+
+Released 2019-08-19
+
+### Critical memory management fix
+
+- (hail#6824) Fixed memory management inside `annotate_cols` with
+  aggregations. This was causing memory leaks and segfaults.
+
+### Bug fixes
+- (hail#6769) Fixed non-functional `hl.lambda_gc` method.
+- (hail#6847) Fixed bug in handling of NaN in `hl.agg.min` and `hl.agg.max`.
+  These will now properly ignore NaN (the intended semantics). Note that
+  `hl.min` and `hl.max` propagate NaN; use `hl.nanmin` and  `hl.nanmax`
+  to ignore NaN.
+
+### New features
+- (hail#6847) Added `hl.nanmin` and `hl.nanmax` functions.
+
+-----
+
+## Version 0.2.19
+
+Released 2019-08-01
+
+### Critical performance bug fix
+
+- (hail#6629) Fixed a critical performance bug introduced in (hail#6266).
+  This bug led to long hang times when reading in Hail tables and matrix
+  tables **written in version 0.2.18**.
+
+### Bug fixes
+- (hail#6757) Fixed correctness bug in optimizations applied to the
+  combination of `Table.order_by` with `hl.desc` arguments and `show()`,
+  leading to tables sorted in ascending, not descending order.
+- (hail#6770) Fixed assertion error caused by `Table.expand_types()`,
+  which was used by `Table.to_spark` and `Table.to_pandas`.
+
+### Performance Improvements
+
+- (hail#6666) Slightly improve performance of `hl.pca` and
+  `hl.hwe_normalized_pca`.
+- (hail#6669) Improve performance of `hl.split_multi` and
+  `hl.split_multi_hts`.
+- (hail#6644) Optimize core code generation primitives, leading to
+  across-the-board performance improvements.
+- (hail#6775) Fixed a major performance problem related to reading block
+  matrices.
+
+### `hailctl dataproc`
+
+- (hail#6760) Fixed the address pointed at by `ui`  in `connect`, after
+  Google changed proxy settings that rendered the UI URL incorrect. Also
+  added new address `hist/spark-history`.
+
+-----
+
+## Version 0.2.18
+
+Released 2019-07-12
+
+### Critical performance bug fix
+
+- (hail#6605) Resolved code generation issue leading a performance
+  regression of 1-3 orders of magnitude in Hail pipelines using
+  constant strings or literals. This includes almost every pipeline!
+  **This issue has exists in versions 0.2.15, 0.2.16, and 0.2.17, and
+  any users on those versions should update as soon as possible.**
+
+### Bug fixes
+
+- (hail#6598) Fixed code generated by `MatrixTable.unfilter_entries` to
+  improve performance. This will slightly improve the performance of
+  `hwe_normalized_pca` and relatedness computation methods, which use
+  `unfilter_entries` internally.
+
+-----
+
+## Version 0.2.17
+
+Released 2019-07-10
+
+### New features
+
+- (hail#6349) Added `compression` parameter to `export_block_matrices`, which can
+  be `'gz'` or `'bgz'`.
+- (hail#6405) When a matrix table has string column-keys, `matrixtable.show` uses
+  the column key as the column name.
+- (hail#6345) Added an improved scan implementation, which reduces the memory
+  load on master.
+- (hail#6462) Added `export_bgen` method.
+- (hail#6473) Improved performance of `hl.agg.array_sum` by about 50%.
+- (hail#6498) Added method `hl.lambda_gc` to calculate the genomic control inflation factor.
+- (hail#6456) Dramatically improved performance of pipelines containing long chains of calls to
+  `Table.annotate`, or `MatrixTable` equivalents.
+- (hail#6506) Improved the performance of the generated code for the `Table.annotate(**thing)`
+  pattern.
+
+### Bug fixes
+
+- (hail#6404) Added `n_rows` and `n_cols` parameters to `Expression.show` for
+  consistency with other `show` methods.
+- (hail#6408)(hail#6419) Fixed an issue where the `filter_intervals` optimization
+  could make scans return incorrect results.
+- (hail#6459)(hail#6458) Fixed rare correctness bug in the `filter_intervals`
+  optimization which could result too many rows being kept.
+- (hail#6496) Fixed html output of `show` methods to truncate long field
+  contents.
+- (hail#6478) Fixed the broken documentation for the experimental `approx_cdf`
+  and `approx_quantiles` aggregators.
+- (hail#6504) Fix `Table.show` collecting data twice while running in Jupyter notebooks.
+- (hail#6571) Fixed the message printed in `hl.concordance` to print the number of overlapping
+  samples, not the full list of overlapping sample IDs.
+- (hail#6583) Fixed `hl.plot.manhattan` for non-default reference genomes.
+
+### Experimental
+
+- (hail#6488) Exposed `table.multi_way_zip_join`. This takes a list of tables of
+  identical types, and zips them together into one table.
+
+-----
+
+## Version 0.2.16
+
+Released 2019-06-19
+
+### `hailctl`
+
+- (hail#6357) Accommodated Google Dataproc bug causing cluster creation failures.
+
+### Bug fixes
+
+- (hail#6378) Fixed problem in how `entry_float_type` was being handled in `import_vcf`.
+
+-----
+
+## Version 0.2.15
+
+Released 2019-06-14
+
+After some infrastructural changes to our development process, we should be
+getting back to frequent releases.
+
+### `hailctl`
+
+Starting in 0.2.15, `pip` installations of Hail come bundled with a command-
+line tool, `hailctl`. This tool subsumes the functionality of `cloudtools`,
+which is now deprecated. See the
+[release thread on the forum](https://discuss.hail.is/t/new-command-line-utility-hailctl/981)
+for more information.
+
+### New features
+
+- (hail#5932)(hail#6115) `hl.import_bed` abd `hl.import_locus_intervals` now
+  accept keyword arguments to pass through to `hl.import_table`, which is used
+  internally. This permits parameters like `min_partitions` to be set.
+- (hail#5980) Added `log` option to `hl.plot.histogram2d`.
+- (hail#5937) Added `all_matches` parameter to `Table.index` and
+  `MatrixTable.index_{rows, cols, entries}`, which produces an array of all
+  rows in the indexed object matching the index key. This makes it possible to,
+  for example, annotate all intervals overlapping a locus.
+- (hail#5913) Added functionality that makes arrays of structs easier to work
+  with.
+- (hail#6089) Added HTML output to `Expression.show` when running in a notebook.
+- (hail#6172) `hl.split_multi_hts` now uses the original `GQ` value if the `PL`
+  is missing.
+- (hail#6123) Added `hl.binary_search` to search sorted numeric arrays.
+- (hail#6224) Moved implementation of `hl.concordance` from backend to Python.
+  Performance directly from `read()` is slightly worse, but inside larger
+  pipelines this function will be optimized much better than before, and it
+  will benefit improvements to general infrastructure.
+- (hail#6214) Updated Hail Python dependencies.
+- (hail#5979) Added optimizer pass to rewrite filter expressions on keys as
+  interval filters where possible, leading to massive speedups for point queries.
+  See the [blog post](https://discuss.hail.is/t/new-optimizer-pass-that-extracts-point-queries-and-interval-filters/979)
+  for examples.
+
+### Bug fixes
+
+- (hail#5895) Fixed crash caused by `-0.0` floating-point values in `hl.agg.hist`.
+- (hail#6013) Turned off feature in HTSJDK that caused crashes in `hl.import_vcf`
+  due to header fields being overwritten with different types, if the field had
+  a different type than the type in the VCF 4.2 spec.
+- (hail#6117) Fixed problem causing `Table.flatten()` to be quadratic in the size
+  of the schema.
+- (hail#6228)(hail#5993) Fixed `MatrixTable.union_rows()` to join distinct keys
+  on the right, preventing an unintentional cartesian product.
+- (hail#6235) Fixed an issue related to aggregation inside `MatrixTable.filter_cols`.
+- (hail#6226) Restored lost behavior where `Table.show(x < 0)` shows the entire table.
+- (hail#6267) Fixed cryptic crashes related to `hl.split_multi` and `MatrixTable.entries()`
+  with duplicate row keys.
+
+-----
+
+## Version 0.2.14
+
+Released 2019-04-24
+
+A back-incompatible patch update to PySpark, 2.4.2, has broken fresh pip
+installs of Hail 0.2.13. To fix this, either *downgrade* PySpark to 2.4.1 or
+upgrade to the latest version of Hail.
+
+### New features
+
+- (hail#5915) Added `hl.cite_hail` and `hl.cite_hail_bibtex` functions to
+  generate appropriate citations.
+- (hail#5872) Fixed `hl.init` when the `idempotent` parameter is `True`.
+
+-----
+
+## Version 0.2.13
+
+Released 2019-04-18
+
+Hail is now using Spark 2.4.x by default. If you build hail from source, you
+will need to acquire this version of Spark and update your build invocations
+accordingly.
+
+### New features
+
+- (hail#5828) Remove dependency on htsjdk for VCF INFO parsing, enabling
+  faster import of some VCFs.
+- (hail#5860) Improve performance of some column annotation pipelines.
+- (hail#5858) Add `unify` option to `Table.union` which allows unification of
+  tables with different fields or field orderings.
+- (hail#5799) `mt.entries()` is four times faster.
+- (hail#5756) Hail now uses Spark 2.4.x by default.
+- (hail#5677) `MatrixTable` now also supports `show`.
+- (hail#5793)(hail#5701) Add `array.index(x)` which find the first index of
+  `array` whose value is equal to `x`.
+- (hail#5790) Add `array.head()` which returns the first element of the array,
+  or missing if the array is empty.
+- (hail#5690) Improve performance of `ld_matrix`.
+- (hail#5743) `mt.compute_entry_filter_stats` computes statistics about the number
+  of filtered entries in a matrix table.
+- (hail#5758) failure to parse an interval will now produce a much more detailed
+  error message.
+- (hail#5723) `hl.import_matrix_table` can now import a matrix table with no
+  columns.
+- (hail#5724) `hl.rand_norm2d` samples from a two dimensional random normal.
+
+### Bug fixes
+
+- (hail#5885) Fix `Table.to_spark` in the presence of fields of tuples.
+- (hail#5882)(hail#5886) Fix `BlockMatrix` conversion methods to correctly
+  handle filtered entries.
+- (hail#5884)(hail#4874) Fix longstanding crash when reading Hail data files
+  under certain conditions.
+- (hail#5855)(hail#5786) Fix `hl.mendel_errors` incorrectly reporting children counts in
+  the presence of entry filtering.
+- (hail#5830)(hail#5835) Fix Nirvana support
+- (hail#5773) Fix `hl.sample_qc` to use correct number of total rows when
+  calculating call rate.
+- (hail#5763)(hail#5764) Fix `hl.agg.array_agg` to work inside
+  `mt.annotate_rows` and similar functions.
+- (hail#5770) Hail now uses the correct unicode string encoding which resolves a
+  number of issues when a Table or MatrixTable has a key field containing
+  unicode characters.
+- (hail#5692) When `keyed` is `True`, `hl.maximal_independent_set` now does not
+  produce duplicates.
+- (hail#5725) Docs now consistently refer to `hl.agg` not `agg`.
+- (hail#5730)(hail#5782) Taught `import_bgen` to optimize its `variants` argument.
+
+### Experimental
+
+- (hail#5732) The `hl.agg.approx_quantiles` aggregate computes an approximation
+  of the quantiles of an expression.
+- (hail#5693)(hail#5396) `Table._multi_way_zip_join` now correctly handles keys
+  that have been truncated.
+
+-----
+
+## Version 0.2.12
+
+Released 2019-03-28
+
+### New features
+
+- (hail#5614) Add support for multiple missing values in `hl.import_table`.
+- (hail#5666) Produce HTML table output for `Table.show()` when running in Jupyter notebook.
+
+### Bug fixes
+
+- (hail#5603)(hail#5697) Fixed issue where `min_partitions` on `hl.import_table` was non-functional.
+- (hail#5611) Fix `hl.nirvana` crash.
+
+### Experimental
+
+- (hail#5524) Add `summarize` functions to Table, MatrixTable, and Expression.
+- (hail#5570) Add `hl.agg.approx_cdf` aggregator for approximate density calculation.
+- (hail#5571) Add `log` parameter to `hl.plot.histogram`.
+- (hail#5601) Add `hl.plot.joint_plot`, extend functionality of `hl.plot.scatter`.
+- (hail#5608) Add LD score simulation framework.
+- (hail#5628) Add `hl.experimental.full_outer_join_mt` for full outer joins on `MatrixTable`s.
+
+-----
+
+## Version 0.2.11
+
+Released 2019-03-06
+
+### New features
+
+- (hail#5374) Add default arguments to `hl.add_sequence` for running on GCP.
+- (hail#5481) Added `sample_cols` method to `MatrixTable`.
+- (hail#5501) Exposed `MatrixTable.unfilter_entries`. See `filter_entries` documentation for more information.
+- (hail#5480) Added `n_cols` argument to `MatrixTable.head`.
+- (hail#5529) Added `Table.{semi_join, anti_join}` and `MatrixTable.{semi_join_rows, semi_join_cols, anti_join_rows, anti_join_cols}`.
+- (hail#5528) Added `{MatrixTable, Table}.checkpoint` methods as wrappers around `write` / `read_{matrix_table, table}`.
+
+### Bug fixes
+
+- (hail#5416) Resolved issue wherein VEP and certain regressions were recomputed on each use, rather than once.
+- (hail#5419) Resolved issue with `import_vcf` `force_bgz` and file size checks.
+- (hail#5427) Resolved issue with `Table.show` and dictionary field types.
+- (hail#5468) Resolved ordering problem with `Expression.show` on key fields that are not the first key.
+- (hail#5492) Fixed `hl.agg.collect` crashing when collecting `float32` values.
+- (hail#5525) Fixed `hl.trio_matrix` crashing when `complete_trios` is `False`.
+
+-----
+
+## Version 0.2.10
 
 Released 2019-02-15
 
@@ -28,7 +1015,7 @@ Released 2019-02-15
 
 -----
 
-## 0.2.9
+## Version 0.2.9
 
 Released 2019-01-30
 
@@ -36,7 +1023,7 @@ Released 2019-01-30
 
  - (hail#5149) Added bitwise transformation functions: `hl.bit_{and, or, xor, not, lshift, rshift}`.
  - (hail#5154) Added `hl.rbind` function, which is similar to `hl.bind` but expects a function as the last argument instead of the first.
- 
+
 ### Performance improvements
 
  - (hail#5107) Hail's Python interface generates tighter intermediate code, which should result in moderate performance improvements in many pipelines.
@@ -50,17 +1037,17 @@ Released 2019-01-30
  - (hail#5173) Fix bug causing `Table.show` to throw an error when the table is empty (since 0.2.8).
  - (hail#5210) Fix bug causing `Table.show` to always print types, regardless of `types` argument (since 0.2.8).
  - (hail#5211) Fix bug causing `MatrixTable.make_table` to unintentionally discard non-key row fields (since 0.2.8).
- 
+
 -----
 
-## 0.2.8
+## Version 0.2.8
 
 Released 2019-01-15
 
 ### New features
 
  - (hail#5072) Added multi-phenotype option to `hl.logistic_regression_rows`
- - (hail#5077) Added support for importing VCF floating-point FORMAT fields as `float32` as well as `float64`. 
+ - (hail#5077) Added support for importing VCF floating-point FORMAT fields as `float32` as well as `float64`.
 
 ### Performance improvements
 
@@ -75,7 +1062,7 @@ Released 2019-01-15
 
 -----
 
-## 0.2.7
+## Version 0.2.7
 
 Released 2019-01-03
 
@@ -89,7 +1076,7 @@ Released 2019-01-03
 
 -----
 
-## 0.2.6
+## Version 0.2.6
 
 Released 2018-12-17
 
@@ -98,7 +1085,7 @@ Released 2018-12-17
  - (hail#4962) Expanded comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) to support expressions of every type.
  - (hail#4927) Expanded functionality of `Table.order_by` to support ordering by arbitrary expressions, instead of just top-level fields.
  - (hail#4926) Expanded default GRCh38 contig recoding behavior in `import_plink`.
-  
+
 ### Performance improvements
 
  - (hail#4952) Resolved lingering issues related to (hail#4909).
@@ -109,10 +1096,10 @@ Released 2018-12-17
  - (hail#4857) Fixed bug in maximal_independent_set appearing when nodes were named something other than `i` and `j`.
  - (hail#4932) Fixed possible error in `export_plink` related to tolerance of writer process failure.
  - (hail#4920) Fixed bad error message in `Table.order_by`.
- 
+
 -----
 
-## 0.2.5 
+## Version 0.2.5
 
 Released 2018-12-07
 
@@ -120,12 +1107,12 @@ Released 2018-12-07
 
  - (hail#4845) The [or_error](https://hail.is/docs/0.2/functions/core.html#hail.expr.builders.CaseBuilder.or_error) method in `hl.case` and `hl.switch` statements now takes a string expression rather than a string literal, allowing more informative messages for errors and assertions.
  - (hail#4865) We use this new `or_error` functionality in methods that require biallelic variants to include an offending variant in the error message.
- - (hail#4820) Added [hl.reversed](https://hail.is/docs/0.2/functions/collections.html?highlight=reversed#hail.expr.functions.reversed) for reversing arrays and strings.
- - (hail#4895) Added `include_strand` option to the [hl.liftover](https://hail.is/docs/0.2/functions/genetics.html?highlight=liftover#hail.expr.functions.liftover) function.
+ - (hail#4820) Added [hl.reversed](https://hail.is/docs/0.2/functions/collections.html#hail.expr.functions.reversed) for reversing arrays and strings.
+ - (hail#4895) Added `include_strand` option to the [hl.liftover](https://hail.is/docs/0.2/functions/genetics.html#hail.expr.functions.liftover) function.
 
 
 ### Performance improvements
- 
+
  - (hail#4907)(hail#4911) Addressed one aspect of bad scaling in enormous literal values (triggered by a list of 300,000 sample IDs) related to logging.
  - (hail#4909)(hail#4914) Fixed a check in Table/MatrixTable initialization that scaled O(n^2) with the total number of fields.
 
@@ -139,7 +1126,7 @@ Released 2018-12-07
 
 -----
 
-## 0.2.4: Beginning of history!
+## Version 0.2.4: Beginning of history!
 
 We didn't start manually curating information about user-facing changes until version 0.2.4.
 

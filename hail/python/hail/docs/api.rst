@@ -34,12 +34,13 @@ Modules
     aggregators <aggregators>
     scans <scans>
     methods <methods/index>
+    nd <nd/index>
     utils <utils/index>
     linalg <linalg/index>
     stats <stats/index>
     genetics <genetics/index>
     plot <plot>
-    experimental <experimental>
+    experimental <experimental/index>
 
 Top-Level Functions
 ~~~~~~~~~~~~~~~~~~~
@@ -50,7 +51,5 @@ Top-Level Functions
 .. autofunction:: hail.default_reference
 .. autofunction:: hail.get_reference
 .. autofunction:: hail.set_global_seed
-.. autofunction:: hail.set_upload_email
-.. autofunction:: hail.enable_pipeline_upload
-.. autofunction:: hail.disable_pipeline_upload
-.. autofunction:: hail.upload_log
+.. autofunction:: hail.citation
+.. autofunction:: hail.version

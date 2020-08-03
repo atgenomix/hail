@@ -3,8 +3,7 @@ package is.hail.stats
 import breeze.linalg._
 import breeze.numerics._
 import is.hail.annotations.RegionValueBuilder
-import is.hail.expr.types._
-import is.hail.expr.types.virtual._
+import is.hail.types.virtual._
 import is.hail.utils.fatal
 
 object LogisticRegressionTest {
@@ -40,10 +39,10 @@ class GLMTestResultWithFit[T <: GLMStats](override val stats: Option[T], private
 
 object WaldTest extends GLMTest {
   val schema: TStruct = TStruct(
-    ("beta", TFloat64()),
-    ("standard_error", TFloat64()),
-    ("z_stat", TFloat64()),
-    ("p_value", TFloat64()),
+    ("beta", TFloat64),
+    ("standard_error", TFloat64),
+    ("z_stat", TFloat64),
+    ("p_value", TFloat64),
     ("fit", GLMFit.schema))
 
   def test(X: DenseMatrix[Double], y: DenseVector[Double], nullFit: GLMFit, link: String): GLMTestResultWithFit[WaldStats] = {
@@ -86,9 +85,9 @@ case class WaldStats(b: DenseVector[Double], se: DenseVector[Double], z: DenseVe
 
 object LikelihoodRatioTest extends GLMTest {
   val schema = TStruct(
-    ("beta", TFloat64()),
-    ("chi_sq_stat", TFloat64()),
-    ("p_value", TFloat64()),
+    ("beta", TFloat64),
+    ("chi_sq_stat", TFloat64),
+    ("p_value", TFloat64),
     ("fit", GLMFit.schema))
 
   def test(X: DenseMatrix[Double], y: DenseVector[Double], nullFit: GLMFit, link: String):
@@ -125,9 +124,9 @@ case class LikelihoodRatioStats(b: DenseVector[Double], chi2: Double, p: Double)
 
 object LogisticFirthTest extends GLMTest {
   val schema = TStruct(
-    ("beta", TFloat64()),
-    ("chi_sq_stat", TFloat64()),
-    ("p_value", TFloat64()),
+    ("beta", TFloat64),
+    ("chi_sq_stat", TFloat64),
+    ("p_value", TFloat64),
     ("fit", GLMFit.schema))
 
   def test(X: DenseMatrix[Double], y: DenseVector[Double], nullFit: GLMFit, link: String):
@@ -172,8 +171,8 @@ case class FirthStats(b: DenseVector[Double], chi2: Double, p: Double) extends G
 
 object LogisticScoreTest extends GLMTest {
   val schema: TStruct = TStruct(
-    ("chi_sq_stat", TFloat64()),
-    ("p_value", TFloat64()))
+    ("chi_sq_stat", TFloat64),
+    ("p_value", TFloat64))
 
 
   def test(X: DenseMatrix[Double], y: DenseVector[Double], nullFit: GLMFit, link: String):
@@ -352,9 +351,9 @@ class LogisticRegressionModel(X: DenseMatrix[Double], y: DenseVector[Double]) ex
 
 object GLMFit {
   val schema: Type = TStruct(
-    ("n_iterations", TInt32()),
-    ("converged", TBoolean()),
-    ("exploded", TBoolean()))
+    ("n_iterations", TInt32),
+    ("converged", TBoolean),
+    ("exploded", TBoolean))
 }
 
 case class GLMFit(

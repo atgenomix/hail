@@ -2,51 +2,51 @@ package is.hail.methods
 
 import java.util
 
-import is.hail.HailContext
 import is.hail.annotations._
-import is.hail.expr.ir.{MatrixValue, TableLiteral, TableValue}
 import is.hail.expr.ir.functions.MatrixToTableFunction
-import is.hail.expr.types._
-import is.hail.expr.types.physical.{PArray, PInt64Required, PStruct}
-import is.hail.expr.types.virtual._
-import is.hail.rvd.{RVD, RVDType}
-import is.hail.table.Table
+import is.hail.expr.ir.{ExecuteContext, MatrixValue, TableValue}
+import is.hail.types._
+import is.hail.types.physical._
+import is.hail.types.virtual._
+import is.hail.rvd.RVD
 import is.hail.utils._
 import is.hail.variant._
 
 object BitPackedVectorView {
   val bpvElementSize: Long = PInt64Required.byteSize
 
-  def rvRowType(locusType: Type, allelesType: Type): PStruct = TStruct("locus" -> locusType, "alleles" -> allelesType,
-    "bpv" -> TArray(TInt64Required), "nSamples" -> TInt32Required, "mean" -> TFloat64(), "centered_length_rec" -> TFloat64()).physicalType
+  def rvRowPType(locusType: PType, allelesType: PType): PStruct =
+    PCanonicalStruct(true,
+      "locus" -> locusType,
+      "alleles" -> allelesType,
+      "bpv" -> PCanonicalArray(PInt64Required),
+      "nSamples" -> PInt32Required,
+      "mean" -> PFloat64(),
+      "centered_length_rec" -> PFloat64())
 }
 
 class BitPackedVectorView(rvRowType: PStruct) {
   val vView = new RegionValueVariant(rvRowType)
 
   // All types are required!
-  private var m: Region = _
   private var bpvOffset: Long = _
   private var bpvLength: Int = _
   private var bpvElementOffset: Long = _
   private var nSamplesOffset: Long = _
   private var meanOffset: Long = _
   private var centeredLengthRecOffset: Long = _
-  private val bpvPType = PArray(PInt64Required)
+  private val bpvPType = PCanonicalArray(PInt64Required)
 
-  def setRegion(mb: Region, offset: Long) {
-    this.m = mb
-    bpvOffset = rvRowType.loadField(m, offset, rvRowType.fieldIdx("bpv"))
-    bpvLength = bpvPType.loadLength(m, bpvOffset)
+  def set(offset: Long) {
+    bpvOffset = rvRowType.loadField(offset, rvRowType.fieldIdx("bpv"))
+    bpvLength = bpvPType.loadLength(bpvOffset)
     bpvElementOffset = bpvPType.elementOffset(bpvOffset, bpvLength, 0)
-    nSamplesOffset = rvRowType.loadField(m, offset, rvRowType.fieldIdx("nSamples"))
-    meanOffset = rvRowType.loadField(m, offset, rvRowType.fieldIdx("mean"))
-    centeredLengthRecOffset = rvRowType.loadField(m, offset, rvRowType.fieldIdx("centered_length_rec"))
+    nSamplesOffset = rvRowType.loadField(offset, rvRowType.fieldIdx("nSamples"))
+    meanOffset = rvRowType.loadField(offset, rvRowType.fieldIdx("mean"))
+    centeredLengthRecOffset = rvRowType.loadField(offset, rvRowType.fieldIdx("centered_length_rec"))
 
-    vView.setRegion(m, offset)
+    vView.set(offset)
   }
-
-  def setRegion(rv: RegionValue): Unit = setRegion(rv.region, rv.offset)
 
   def getContig: String = vView.contig()
 
@@ -56,16 +56,16 @@ class BitPackedVectorView(rvRowType: PStruct) {
     if (idx < 0 || idx >= bpvLength)
       throw new ArrayIndexOutOfBoundsException(idx)
     val packOffset = bpvElementOffset + idx * BitPackedVectorView.bpvElementSize
-    m.loadLong(packOffset)
+    Region.loadLong(packOffset)
   }
 
   def getNPacks: Int = bpvLength
 
-  def getNSamples: Int = m.loadInt(nSamplesOffset)
+  def getNSamples: Int = Region.loadInt(nSamplesOffset)
 
-  def getMean: Double = m.loadDouble(meanOffset)
+  def getMean: Double = Region.loadDouble(meanOffset)
 
-  def getCenteredLengthRec: Double = m.loadDouble(centeredLengthRecOffset)
+  def getCenteredLengthRec: Double = Region.loadDouble(centeredLengthRecOffset)
 }
 
 object LocalLDPrune {
@@ -231,22 +231,22 @@ object LocalLDPrune {
   private def pruneLocal(inputRDD: RVD, r2Threshold: Double, windowSize: Int, queueSize: Option[Int]): RVD = {
     val localRowType = inputRDD.typ.rowType
 
-    inputRDD.mapPartitions(inputRDD.typ, { (ctx, it) =>
+    inputRDD.mapPartitions(inputRDD.typ) { (ctx, it) =>
       val queue = new util.ArrayDeque[RegionValue](queueSize.getOrElse(16))
 
       val bpvv = new BitPackedVectorView(localRowType)
       val bpvvPrev = new BitPackedVectorView(localRowType)
       val rvb = new RegionValueBuilder()
 
-      it.filter { rv =>
-        bpvv.setRegion(rv)
+      it.filter { ptr =>
+        bpvv.set(ptr)
 
         var keepVariant = true
         var done = false
         val qit = queue.descendingIterator()
 
         while (!done && qit.hasNext) {
-          bpvvPrev.setRegion(qit.next())
+          bpvvPrev.set(qit.next().offset)
           if (bpvv.getContig != bpvvPrev.getContig || bpvv.getStart - bpvvPrev.getStart > windowSize)
             done = true
           else {
@@ -259,10 +259,10 @@ object LocalLDPrune {
         }
 
         if (keepVariant) {
-          val r = ctx.freshRegion
+          val r = ctx.freshRegion()
           rvb.set(r)
           rvb.start(localRowType)
-          rvb.addRegionValue(localRowType, rv)
+          rvb.addRegionValue(localRowType, ctx.r, ptr)
           queue.addLast(RegionValue(rvb.region, rvb.end()))
           queueSize.foreach { qs =>
             if (queue.size() > qs) {
@@ -273,14 +273,15 @@ object LocalLDPrune {
 
         keepVariant
       }
-    })
+    }
   }
 
-  def apply(mt: MatrixTable,
+  def apply(ctx: ExecuteContext,
+    mt: MatrixValue,
     callField: String = "GT", r2Threshold: Double = 0.2, windowSize: Int = 1000000, maxQueueSize: Int
-  ): Table = {
+  ): TableValue = {
     val pruner = LocalLDPrune(callField, r2Threshold, windowSize, maxQueueSize)
-    new Table(HailContext.get, TableLiteral(pruner.execute(mt.value)))
+    pruner.execute(ctx, mt)
   }
 }
 
@@ -288,84 +289,80 @@ case class LocalLDPrune(
   callField: String, r2Threshold: Double, windowSize: Int, maxQueueSize: Int
 ) extends MatrixToTableFunction {
 
-  def typeInfo(childType: MatrixType, childRVDType: RVDType): (TableType, RVDType) = {
-    val tableType = TableType(
-      rowType = childType.rowKeyStruct ++ TStruct("mean" -> TFloat64(), "centered_length_rec" -> TFloat64()),
-      key = childType.rowKey, globalType = TStruct.empty())
-    (tableType, tableType.canonicalRVDType)
+  override def typ(childType: MatrixType): TableType = {
+    TableType(
+      rowType = childType.rowKeyStruct ++ TStruct("mean" -> TFloat64, "centered_length_rec" -> TFloat64),
+      key = childType.rowKey, globalType = TStruct.empty)
   }
 
   def preservesPartitionCounts: Boolean = false
 
-  def execute(mv: MatrixValue): TableValue = {
+  def execute(ctx: ExecuteContext, mv: MatrixValue): TableValue = {
     if (maxQueueSize < 1)
-      fatal(s"Maximum queue size must be positive. Found `$maxQueueSize'.")
+      fatal(s"Maximum queue size must be positive. Found '$maxQueueSize'.")
 
     val nSamples = mv.nCols
-    
-    val fullRowType = mv.typ.rvRowType
-    val fullRowPType = fullRowType.physicalType
 
-    val locusIndex = fullRowType.fieldIdx("locus")
-    val allelesIndex = fullRowType.fieldIdx("alleles")
+    val fullRowPType = mv.rvRowPType
 
-    val bpvType = BitPackedVectorView.rvRowType(fullRowType.types(locusIndex), fullRowType.types(allelesIndex))
+    val locusIndex = fullRowPType.fieldIdx("locus")
+    val allelesIndex = fullRowPType.fieldIdx("alleles")
 
-    val typ = mv.rvd.typ
+    val bpvType = BitPackedVectorView.rvRowPType(fullRowPType.types(locusIndex), fullRowPType.types(allelesIndex))
 
-    val (tableType, tableRVDType) = typeInfo(mv.typ, mv.rvd.typ)
+    val tableType = typ(mv.typ)
 
     val standardizedRDD = mv.rvd
-      .mapPartitions(typ.copy(rowType = bpvType))({ it =>
+      .mapPartitions(mv.rvd.typ.copy(rowType = bpvType)){ (ctx, it) =>
         val hcView = new HardCallView(fullRowPType, callField)
         val region = Region()
         val rvb = new RegionValueBuilder(region)
-        val newRV = RegionValue(region)
 
-        it.flatMap { rv =>
-          hcView.setRegion(rv)
+        it.flatMap { ptr =>
+          hcView.set(ptr)
           region.clear()
           rvb.set(region)
           rvb.start(bpvType)
           rvb.startStruct()
-          rvb.addFields(fullRowPType, rv, Array(locusIndex, allelesIndex))
+          rvb.addFields(fullRowPType, ctx.r, ptr, Array(locusIndex, allelesIndex))
 
           val keep = LocalLDPrune.addBitPackedVector(rvb, hcView, nSamples)
 
           if (keep) {
             rvb.endStruct()
-            newRV.setOffset(rvb.end())
-            Some(newRV)
+
+            ctx.region.addReferenceTo(region)
+            Some(rvb.end())
           }
           else
             None
         }
-      })
-    
+      }
+
     val rvdLP = LocalLDPrune.pruneLocal(standardizedRDD, r2Threshold, windowSize, Some(maxQueueSize))
 
     val fieldIndicesToAdd = Array("locus", "alleles", "mean", "centered_length_rec")
       .map(field => bpvType.fieldIdx(field))
     val sitesOnly = rvdLP.mapPartitions(
       tableType.canonicalRVDType
-    )({ it =>
+    )({ (ctx, it) =>
       val region = Region()
       val rvb = new RegionValueBuilder(region)
-      val newRV = RegionValue(region)
 
-      it.map { rv =>
+      it.map { ptr =>
         region.clear()
         rvb.set(region)
-        rvb.start(tableType.rowType.physicalType)
+        rvb.start(tableType.canonicalRowPType)
         rvb.startStruct()
-        rvb.addFields(bpvType, rv, fieldIndicesToAdd)
+        rvb.addFields(bpvType, ctx.r, ptr, fieldIndicesToAdd)
         rvb.endStruct()
-        newRV.setOffset(rvb.end())
-        newRV
+
+        ctx.region.addReferenceTo(region)
+        rvb.end()
       }
     })
 
-    TableValue(tableType, BroadcastRow.empty(mv.sparkContext), sitesOnly)
+    TableValue(ctx, tableType, BroadcastRow.empty(ctx), sitesOnly)
   }
 }
 
