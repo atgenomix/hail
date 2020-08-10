@@ -1,4 +1,4 @@
-from .datasets import show_database_detail, init_cursor
+from .datasets import show_database_detail, get_cursor
 
 __all__ = ['show_database_detail',
-           'init_cursor']
+           'get_cursor']
