@@ -1,4 +1,3 @@
-from .datasets import show_database_detail, get_cursor
+from .datasets import execute_sql
 
-__all__ = ['show_database_detail',
-           'get_cursor']
+__all__ = ['execute_sql']
