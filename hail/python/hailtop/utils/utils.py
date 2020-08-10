@@ -1,3 +1,4 @@
+from typing import Callable, TypeVar, Awaitable
 import os
 import errno
 import random
@@ -280,7 +281,7 @@ def is_transient_error(e):
     if isinstance(e, asyncio.TimeoutError):
         return True
     if isinstance(e, aiohttp.client_exceptions.ClientConnectorError):
-        return is_transient_error(e.os_error)
+        return hasattr(e, 'os_error') and is_transient_error(e.os_error)
     if (isinstance(e, OSError)
             and (e.errno == errno.ETIMEDOUT
                  or e.errno == errno.ECONNREFUSED
@@ -333,7 +334,10 @@ def retry_all_errors(msg=None, error_logging_interval=10):
     return _wrapper
 
 
-async def retry_transient_errors(f, *args, **kwargs):
+T = TypeVar('T')  # pylint: disable=invalid-name
+
+
+async def retry_transient_errors(f: Callable[..., Awaitable[T]], *args, **kwargs) -> T:
     delay = 0.1
     errors = 0
     while True:

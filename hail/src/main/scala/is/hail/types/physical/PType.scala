@@ -459,10 +459,8 @@ abstract class PType extends Serializable with Requiredness {
 
   def deepRename(t: Type): PType = this
 
-  def defaultValue: PCode = PCode(this, ir.defaultValue(this))
+  def defaultValue: PCode = PCode(this, is.hail.types.physical.defaultValue(this))
 
-  def copyFromPValue(mb: EmitMethodBuilder[_], region: Value[Region], pv: PCode): PCode =
-    PCode(this, copyFromTypeAndStackValue(mb, region, pv.pt, pv.code))
 
   final def typeCheck(a: Any): Boolean = a == null || _typeCheck(a)
 
