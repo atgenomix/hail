@@ -107,8 +107,6 @@ def import_vcf(sample_name,
 
     if res[0]['reference'] == 38:
         reference_genome = 'GRCh38'
-    else:
-        reference_genome = "default"
 
     reader = ir.MatrixVCFReader(path, call_fields, entry_float_type, header_file,
                                 n_partitions, block_size, min_partitions,
