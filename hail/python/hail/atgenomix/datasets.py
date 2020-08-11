@@ -2,8 +2,8 @@ import os
 import pymysql.cursors
 
 def execute_sql(sql):
-    server = os.environ["RDB_HOST"]
-    user = os.environ["RDB_USER"]
+    server = "{}.mysql.database.azure.com".format(os.environ["RDB_SERVER"])
+    user = "{}@{}".format(os.environ["RDB_USER"],os.environ["RDB_SERVER"])
     passwd = os.environ["RDB_PASSWORD"]
     database = os.environ["RDB_DATABASE"]
     port = os.environ["RDB_PORT"]
