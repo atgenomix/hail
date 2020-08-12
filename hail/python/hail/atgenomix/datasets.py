@@ -1,10 +1,17 @@
 import os
 import pymysql.cursors
+from typing import Optional, Dict, Tuple, Any, List
 from hail.utils.java import Env, FatalError, jindexed_seq_args, warning
 from hail.expr.types import hail_type, tarray, tfloat64, tstr, tint32, tstruct, \
     tcall, tbool, tint64, tfloat32
 from hail.matrixtable import MatrixTable
+from hail.expr.expressions import Expression, StructExpression, \
+    expr_struct, expr_any, expr_bool, analyze, Indices, \
+    construct_reference, construct_expr, extract_refs_by_indices, \
+    ExpressionException, TupleExpression, unify_all
 from hail import ir
+from hail.typecheck import  typecheck, typecheck_method, dictof, anytype, \
+    anyfunc, nullable, sequenceof, oneof, numeric, lazy, enumeration
 
 
 class Query(object):
@@ -39,15 +46,14 @@ def execute_sql(sql):
     return output
 
 
-def append_dict(dictionary, list_res, type_input):
+def append_data(data, list_res, type_input):
     for i in list_res:
         if ".mt" in i["name"]:
-            key = "mt/" + i["last_accessed"].isoformat()
+            data.append(("mt", i["name"], i["last_accessed"].isoformat()))
         else:
-            key = type_input + "/" + i["last_accessed"].isoformat()
-        dictionary[key] = i["name"]
+            data.append((type_input, i["name"], i["last_accessed"].isoformat()))
 
-    return dictionary
+    return data
 
 
 def list_datasets(sample_name=None, type=None):
@@ -56,37 +62,38 @@ def list_datasets(sample_name=None, type=None):
     """
 
     owner_id = os.environ["SEQSLAB_USER"]
-    output = dict()
+    data = []
     if sample_name is None:
         if type is None:
-            append_dict(output, execute_sql(Query.VCF_QUERY.format(owner_id)), "vcf")
-            append_dict(output, execute_sql(Query.BAM_QUERY.format(owner_id)), "bam")
-            append_dict(output, execute_sql(Query.FASTQ_QUERY.format(owner_id)), "fastq")
+            append_data(data, execute_sql(Query.VCF_QUERY.format(owner_id)), "vcf")
+            append_data(data, execute_sql(Query.BAM_QUERY.format(owner_id)), "bam")
+            append_data(data, execute_sql(Query.FASTQ_QUERY.format(owner_id)), "fastq")
         else:
             if type == "vcf":
-                append_dict(output, execute_sql(Query.VCF_QUERY.format(owner_id)), "vcf")
+                append_data(data, execute_sql(Query.VCF_QUERY.format(owner_id)), "vcf")
             elif type == "bam":
-                append_dict(output, execute_sql(Query.BAM_QUERY.format(owner_id)), "bam")
+                append_data(data, execute_sql(Query.BAM_QUERY.format(owner_id)), "bam")
             elif type == "fastq":
-                append_dict(output, execute_sql(Query.FASTQ_QUERY.format(owner_id)), "fastq")
+                append_data(data, execute_sql(Query.FASTQ_QUERY.format(owner_id)), "fastq")
             else:
                 raise NameError("type does not exist")
     else:
         if type is None:
-            append_dict(output, execute_sql(Query.VCF_QUERY_NAME.format(owner_id, sample_name)), "vcf")
-            append_dict(output, execute_sql(Query.BAM_QUERY_NAME.format(owner_id, sample_name)), "bam")
-            append_dict(output, execute_sql(Query.FASTQ_QUERY_NAME.format(owner_id, sample_name)), "fastq")
+            append_data(data, execute_sql(Query.VCF_QUERY_NAME.format(owner_id, sample_name)), "vcf")
+            append_data(data, execute_sql(Query.BAM_QUERY_NAME.format(owner_id, sample_name)), "bam")
+            append_data(data, execute_sql(Query.FASTQ_QUERY_NAME.format(owner_id, sample_name)), "fastq")
         else:
             if type == "vcf":
-                append_dict(output, execute_sql(Query.VCF_QUERY_NAME.format(owner_id, sample_name)), "vcf")
+                append_data(data, execute_sql(Query.VCF_QUERY_NAME.format(owner_id, sample_name)), "vcf")
             elif type == "bam":
-                append_dict(output, execute_sql(Query.BAM_QUERY_NAME.format(owner_id, sample_name)), "bam")
+                append_data(data, execute_sql(Query.BAM_QUERY_NAME.format(owner_id, sample_name)), "bam")
             elif type == "fastq":
-                append_dict(output, execute_sql(Query.FASTQ_QUERY_NAME.format(owner_id, sample_name)), "fastq")
+                append_data(data, execute_sql(Query.FASTQ_QUERY_NAME.format(owner_id, sample_name)), "fastq")
             else:
                 raise NameError("type does not exist")
 
-    return output
+    output_df = spark.createDataFrame(data, ['Type', 'Name', 'Last_Accessed'])
+    return output_df.toPandas()
 
 
 def import_vcf(sample_name,
@@ -142,3 +149,33 @@ def read_matrix_table(sample_name, *, _intervals=None, _filter_intervals=False, 
 
     return MatrixTable(ir.MatrixRead(ir.MatrixNativeReader(path, _intervals, _filter_intervals),
                        _drop_cols, _drop_rows))
+
+
+@typecheck_method(output=str,
+                  overwrite=bool,
+                  stage_locally=bool,
+                  _codec_spec=nullable(str),
+                  _partitions=nullable(expr_any))
+def mt_write(mt,
+             output: str,
+             overwrite: bool = False,
+             stage_locally: bool = False,
+             _codec_spec: Optional[str] = None,
+             _partitions=None):
+
+    path = "/seqslab/usr/{}/notebook/{}".format(os.environ["BLOB_CONTAINER"], output.strip("/"))
+    mt.write(path, overwrite, stage_locally, _codec_spec, _partitions)
+
+
+@typecheck_method(output=str,
+                  overwrite=bool,
+                  stage_locally=bool,
+                  _codec_spec=nullable(str))
+def ht_write(ht,
+             output: str,
+             overwrite=False,
+             stage_locally: bool = False,
+              _codec_spec: Optional[str] = None):
+
+    path = "/seqslab/usr/{}/notebook/{}".format(os.environ["BLOB_CONTAINER"], output.strip("/"))
+    ht.write(path, overwrite, stage_locally, _codec_spec)
