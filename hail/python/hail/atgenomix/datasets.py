@@ -1,5 +1,6 @@
 import os
 import pymysql.cursors
+from hail.utils.java import Env, FatalError, jindexed_seq_args, warning
 from hail.expr.types import hail_type, tarray, tfloat64, tstr, tint32, tstruct, \
     tcall, tbool, tint64, tfloat32
 from hail.matrixtable import MatrixTable
@@ -40,13 +41,20 @@ def execute_sql(sql):
 
 def append_dict(dictionary, list_res, type_input):
     for i in list_res:
-        key = type_input + "/" + i["last_accessed"].isoformat()
+        if ".mt" in i["name"]:
+            key = "mt/" + i["last_accessed"].isoformat()
+        else:
+            key = type_input + "/" + i["last_accessed"].isoformat()
         dictionary[key] = i["name"]
 
     return dictionary
 
 
 def list_datasets(sample_name=None, type=None):
+    """
+    list all datasets in Atgenomix Platforms
+    """
+
     owner_id = os.environ["SEQSLAB_USER"]
     output = dict()
     if sample_name is None:
@@ -98,12 +106,14 @@ def import_vcf(sample_name,
                n_partitions=None,
                block_size=None,
                _partitions=None) -> MatrixTable:
+    """
+    Customized import_vcf function for Atgenomix Users to load directly vcf files from Atgenomix platform.
+    """
 
     owner_id = os.environ["SEQSLAB_USER"]
     res = execute_sql(Query.VCF_QUERY_NAME.format(owner_id, sample_name))
     path = res[0]['uri']
     path = path[path.index("/"):] + "*.vcf.gz"
-    force_bgz = True
 
     if res[0]['reference'] == 38:
         reference_genome = 'GRCh38'
@@ -115,3 +125,20 @@ def import_vcf(sample_name,
                                 _partitions)
     return MatrixTable(ir.MatrixRead(reader, drop_cols=drop_samples))
 
+
+def read_matrix_table(sample_name, *, _intervals=None, _filter_intervals=False, _drop_cols=False,
+                      _drop_rows=False) -> MatrixTable:
+    """
+    Customized read_matrix_table function for Atgenomix Users to load directly mt files from Atgenomix platform.
+    """
+
+    owner_id = os.environ["SEQSLAB_USER"]
+    res = execute_sql(Query.VCF_QUERY_NAME.format(owner_id, sample_name))
+    path = res[0]['uri']
+    path = path[path.index("/"):] + "all.mt"
+
+    for rg_config in Env.backend().load_references_from_dataset(path):
+        hl.ReferenceGenome._from_config(rg_config)
+
+    return MatrixTable(ir.MatrixRead(ir.MatrixNativeReader(path, _intervals, _filter_intervals),
+                       _drop_cols, _drop_rows))
