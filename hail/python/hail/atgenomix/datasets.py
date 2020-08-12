@@ -56,7 +56,7 @@ def append_data(data, list_res, type_input):
     return data
 
 
-def list_datasets(sample_name=None, type=None):
+def list_datasets(spark, sample_name=None, type=None):
     """
     list all datasets in Atgenomix Platforms
     """
