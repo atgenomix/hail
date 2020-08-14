@@ -1,4 +1,5 @@
 import os
+import pandas as pd
 import pymysql.cursors
 from typing import Optional, Dict, Tuple, Any, List
 from hail.utils.java import Env, FatalError, jindexed_seq_args, warning
@@ -92,6 +93,7 @@ def list_datasets(spark, sample_name=None, type=None):
             else:
                 raise NameError("type does not exist")
 
+    pd.set_option("max_colwidth", 1000)
     output_df = spark.createDataFrame(data, ['Type', 'Name', 'Last_Accessed'])
     return output_df.toPandas()
 
@@ -163,7 +165,7 @@ def mt_write(mt,
              _codec_spec: Optional[str] = None,
              _partitions=None):
 
-    path = "/seqslab/usr/{}/notebook/{}".format(os.environ["BLOB_CONTAINER"], output.strip("/"))
+    path = "/seqslab/usr/{}/notebook/{}".format(os.environ["USER_ID"], output.strip("/"))
     mt.write(path, overwrite, stage_locally, _codec_spec, _partitions)
 
 
@@ -177,5 +179,5 @@ def ht_write(ht,
              stage_locally: bool = False,
               _codec_spec: Optional[str] = None):
 
-    path = "/seqslab/usr/{}/notebook/{}".format(os.environ["BLOB_CONTAINER"], output.strip("/"))
+    path = "/seqslab/usr/{}/notebook/{}".format(os.environ["USER_ID"], output.strip("/"))
     ht.write(path, overwrite, stage_locally, _codec_spec)
