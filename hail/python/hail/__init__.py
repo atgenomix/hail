@@ -55,6 +55,7 @@ from .context import (init, stop, spark_context, default_reference,  # noqa: E40
 scan = agg.aggregators.ScanFunctions({name: getattr(agg, name) for name in agg.__all__})
 
 __all__ = [
+    'atgenomix',
     'init',
     'stop',
     'spark_context',
