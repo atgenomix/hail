@@ -11,7 +11,7 @@ from hail.expr.expressions import Expression, StructExpression, \
     construct_reference, construct_expr, extract_refs_by_indices, \
     ExpressionException, TupleExpression, unify_all
 from hail import ir
-from hail.typecheck import  typecheck, typecheck_method, dictof, anytype, \
+from hail.typecheck import typecheck, typecheck_method, dictof, anytype, \
     anyfunc, nullable, sequenceof, oneof, numeric, lazy, enumeration
 
 
