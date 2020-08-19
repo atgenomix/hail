@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 import pymysql.cursors
+from pyspark.sql import SQLContext
 from typing import Optional, Dict, Tuple, Any, List
 from hail.utils.java import Env, FatalError, jindexed_seq_args, warning
 from hail.expr.types import hail_type, tarray, tfloat64, tstr, tint32, tstruct, \
@@ -57,7 +58,7 @@ def append_data(data, list_res, type_input):
     return data
 
 
-def list_datasets(spark, sample_name=None, type=None):
+def list_datasets(sc, sample_name=None, type=None):
     """
     list all datasets in Atgenomix Platforms
     """
@@ -93,8 +94,9 @@ def list_datasets(spark, sample_name=None, type=None):
             else:
                 raise NameError("type does not exist")
 
+    sqlContext = SQLContext(sc)
     pd.set_option("max_colwidth", 1000)
-    output_df = spark.createDataFrame(data, ['Type', 'Name', 'Last_Accessed'])
+    output_df = sqlContext.createDataFrame(data, ['Type', 'Name', 'Last_Accessed'])
     return output_df.toPandas()
 
 
