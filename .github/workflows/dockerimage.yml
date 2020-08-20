@@ -1,0 +1,50 @@
+name: Deploy to docker hub
+
+on:
+  push:
+    branches:
+      - '*'
+env:
+  RC_NAME: atgenomix/hail
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@master
+      - name: Login to docker hub
+        uses: actions-hub/docker/login@master
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Pull cache
+        run: |
+          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+          docker pull ${RC_NAME}:cache
+
+      - name: Build image
+        if: always()
+        run: |
+          docker build --rm --cache-from ${RC_NAME}:cache -t ${RC_NAME} .
+          docker tag ${RC_NAME} ${RC_NAME}:${GITHUB_SHA}
+          docker tag ${RC_NAME} ${RC_NAME}:cache
+          docker tag ${RC_NAME} ${RC_NAME}:latest
+
+      - name: Push Cache to docker registry
+        uses: actions-hub/docker@master
+        if: always()
+        with:
+          args: push ${RC_NAME}:cache
+
+      - name: Push to docker registry
+        uses: actions-hub/docker@master
+        if: always()
+        with:
+          args: push ${RC_NAME}:${GITHUB_SHA}
+
+      - name: Push Latest to docker registry
+        uses: actions-hub/docker@master
+        if: (github.ref == 'refs/heads/azure' || github.ref == 'refs/heads/prod') && success()
+        with:
+          args: push ${RC_NAME}:latest

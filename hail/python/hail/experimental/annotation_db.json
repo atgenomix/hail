@@ -39,16 +39,16 @@
   "url": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3431492/",
   "key_properties": [],
   "versions": [
-    {"url":"gs://hail-datasets-us/datasets/1/gencode.v19.annotation.GRCh37.ht",
+    {"url":"wasbs://mnt-mount@staticbundle.blob.core.windows.net/system/annotation/gencode/gencode.v19.annotation.GRCh37.ht",
      "version": "GRCh37"},
-    {"url":"gs://hail-datasets-us/datasets/1/gencode.v31.annotation.GRCh38.ht",
+    {"url":"wasbs://mnt-mount@staticbundle.blob.core.windows.net/system/annotation/gencode/gencode.v31.annotation.GRCh38.ht",
      "version": "GRCh38"}]},
  "gnomad_lof_metrics":
  {"description": "gnomAD: a resource with the goal of aggregating and harmonizing both exome and genome sequencing data from a wide variety of large-scale sequencing projects.",
   "url": "https://gnomad.broadinstitute.org/",
   "key_properties": ["gene"],
   "versions": [
-    {"url":"gs://hail-datasets-us/datasets/1/gnomad_v2.1.1_lof_metrics_by_gene.ht",
+    {"url":"wasbs://mnt-mount@staticbundle.blob.core.windows.net/system/annotation/gnomad/2.1.1/gnomad_v2.1.1_lof_metrics_by_gene.ht",
      "version": "2.1.1"}]},
  "gnomad_exome_sites":
  {"description": "gnomAD: a resource with the goal of aggregating and harmonizing both exome and genome sequencing data from a wide variety of large-scale sequencing projects.",
@@ -80,32 +80,32 @@
   "url": "https://www.ncbi.nlm.nih.gov/clinvar/",
   "key_properties": ["gene", "unique"],
   "versions": [
-    {"url":"gs://hail-datasets-us/datasets/1/gene_specific_summary_2019-07.txt.gz.ht",
+    {"url":"wasbs://mnt-mount@staticbundle.blob.core.windows.net/system/annotation/clinvar/gene_specific_summary_2019-07.txt.gz.ht",
      "version": "2019-07"}]},
  "clinvar_variant_summary":
  {"description": "Clinvar: aggregates information about genomic variation and its relationship to human health.",
   "url": "https://www.ncbi.nlm.nih.gov/clinvar/",
   "key_properties": [],
   "versions": [
-    {"url":"gs://hail-datasets-us/datasets/1/variant_summary_2019-07.GRCh37.txt.gz.ht",
+    {"url":"wasbs://mnt-mount@staticbundle.blob.core.windows.net/system/annotation/clinvar/variant_summary_2019-07.GRCh37.txt.gz.ht",
      "version": "2019-07-GRCh37"},
-    {"url":"gs://hail-datasets-us/datasets/1/variant_summary_2019-07.GRCh38.txt.gz.ht",
+    {"url":"wasbs://mnt-mount@staticbundle.blob.core.windows.net/system/annotation/clinvar/variant_summary_2019-07.GRCh38.txt.gz.ht",
      "version": "2019-07-GRCh38"}]},
  "dbNSFP_variants":
  {"description": "dbNSFP: a database developed for functional prediction and annotation of all nsSNVs in the human genome.",
   "url": "https://sites.google.com/site/jpopgen/dbNSFP",
   "key_properties": [],
   "versions": [
-    {"url":"gs://hail-datasets-us/datasets/1/dbnsfp4.0a.GRCh37.ht",
+    {"url":"wasbs://mnt-mount@staticbundle.blob.core.windows.net/system/annotation/dbNSFP/dbnsfp4.0a.GRCh37.ht",
      "version": "4.0-GRCh37"},
-    {"url":"gs://hail-datasets-us/datasets/1/dbnsfp4.0a.GRCh38.ht",
+    {"url":"wasbs://mnt-mount@staticbundle.blob.core.windows.net/system/annotation/dbNSFP/dbnsfp4.0a.GRCh38.ht",
      "version": "4.0-GRCh38"}]},
  "dbNSFP_genes":
  {"description": "dbNSFP: a database developed for functional prediction and annotation of all nsSNVs in the human genome.",
   "url": "https://sites.google.com/site/jpopgen/dbNSFP",
   "key_properties": ["gene", "unique"],
   "versions": [
-    {"url":"gs://hail-datasets-us/datasets/1/dbnsfp/dbNSFP4.0_gene.complete.bgz.ht",
+    {"url":"wasbs://mnt-mount@staticbundle.blob.core.windows.net/system/annotation/dbNSFP/dbNSFP4.0_gene.complete.bgz.ht",
      "version": "4.0"}]},
  "gerp_scores":
  {"description": "GERP: identifies constrained elements in multiple alignments by quantifying substitution deficits.",
