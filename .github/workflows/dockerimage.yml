@@ -40,21 +40,6 @@ jobs:
         run: |
           az login --service-principal --username ${{ secrets.AZ_APP_CLIENT_ID }} --password ${{ secrets.AZ_APP_CLIENT_KEY }} --tenant ${{ secrets.AZ_APP_TENANT }}
           az acr login --name atgenomix
-
-      - name: Push Cache to docker registry
-        uses: actions-hub/docker@master
-        if: always()
-        with:
-          args: push ${RC_NAME}:cache
-
-      - name: Push to docker registry
-        uses: actions-hub/docker@master
-        if: always()
-        with:
-          args: push ${RC_NAME}:$NOW
-
-      - name: Push Cache to docker registry
-        uses: actions-hub/docker@master
-        if: always()
-        with:
-          args: push ${RC_NAME}:latest
+          docker push ${RC_NAME}:cache
+          docker push ${RC_NAME}:latest
+          docker push ${RC_NAME}:$NOW
