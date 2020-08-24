@@ -5,31 +5,41 @@ on:
     branches:
       - '*'
 env:
-  RC_NAME: atgenomix/hail
+  RC_NAME: atgenomix.azurecr.io/atgenomix/seqslab_runtime-1.2_ubuntu-16.04_hail-annotation
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@master
-      - name: Login to docker hub
-        uses: actions-hub/docker/login@master
-        env:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Checkout hail code
+        uses: actions/checkout@v2
+        with:
+          path: hail
 
-      - name: Pull cache
+      - name: Checkout runtime code
+        uses: actions/checkout@v2
+        with:
+          ref: annotation
+          repository: AnomeGAP/Seqslab_Runtime
+          token: ${{ secrets.PAT_SEQSLAB_RUNTIME }}
+          path: runtime
+
+      - name: Set current date as env variable
         run: |
-          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
-          docker pull ${RC_NAME}:cache
+          echo "::set-env name=NOW::$(date +'%m%d%H%M')"
+          echo $NOW
 
       - name: Build image
-        if: always()
         run: |
-          docker build --rm --cache-from ${RC_NAME}:cache -t ${RC_NAME} .
-          docker tag ${RC_NAME} ${RC_NAME}:${GITHUB_SHA}
+          docker build --cache-from ${RC_NAME}:cache -t ${RC_NAME} /home/runner/work/hail/hail/runtime/1.2_annotation
+          docker tag ${RC_NAME} ${RC_NAME}:$NOW
           docker tag ${RC_NAME} ${RC_NAME}:cache
           docker tag ${RC_NAME} ${RC_NAME}:latest
+
+      - name: Az Login and Push
+        run: |
+          az login --service-principal --username ${{ secrets.AZ_APP_CLIENT_ID }} --password ${{ secrets.AZ_APP_CLIENT_KEY }} --tenant ${{ secrets.AZ_APP_TENANT }}
+          az acr login --name atgenomix
 
       - name: Push Cache to docker registry
         uses: actions-hub/docker@master
@@ -41,10 +51,10 @@ jobs:
         uses: actions-hub/docker@master
         if: always()
         with:
-          args: push ${RC_NAME}:${GITHUB_SHA}
+          args: push ${RC_NAME}:$NOW
 
-      - name: Push Latest to docker registry
+      - name: Push Cache to docker registry
         uses: actions-hub/docker@master
-        if: (github.ref == 'refs/heads/azure' || github.ref == 'refs/heads/prod') && success()
+        if: always()
         with:
           args: push ${RC_NAME}:latest

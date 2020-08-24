@@ -58,7 +58,7 @@ def append_data(data, list_res, type_input):
     return data
 
 
-def list_datasets(sc, sample_name=None, type=None):
+def list_datasets(sc, type=None, sample_name=None):
     """
     list all datasets in Atgenomix Platforms
     """
@@ -96,6 +96,7 @@ def list_datasets(sc, sample_name=None, type=None):
 
     sqlContext = SQLContext(sc)
     pd.set_option("max_colwidth", 1000)
+    pd.set_option('display.max_columns', None)
     output_df = sqlContext.createDataFrame(data, ['Type', 'Name', 'Last_Accessed'])
     return output_df.toPandas()
 
