@@ -33,6 +33,7 @@ from .matrixtable import MatrixTable, GroupedMatrixTable  # noqa: E402
 from .expr import *  # noqa: F401,F403,E402
 from .genetics import *  # noqa: F401,F403,E402
 from .methods import *  # noqa: F401,F403,E402
+from . import atgenomix
 from . import expr  # noqa: E402
 from . import genetics  # noqa: E402
 from . import methods  # noqa: E402

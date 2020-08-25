@@ -20,9 +20,9 @@ class Query(object):
     VCF_QUERY = "SELECT * FROM core_vcfdataset WHERE owner_id = \"{}\""
     BAM_QUERY = "SELECT * FROM core_bamdataset WHERE owner_id = \"{}\""
     FASTQ_QUERY = "SELECT * FROM core_fastqdataset WHERE owner_id = \"{}\""
-    VCF_QUERY_NAME = "SELECT * FROM core_vcfdataset WHERE owner_id = \"{}\" AND name = \"{}\""
-    BAM_QUERY_NAME = "SELECT * FROM core_bamdataset WHERE owner_id = \"{}\" AND name = \"{}\""
-    FASTQ_QUERY_NAME = "SELECT * FROM core_fastqdataset WHERE owner_id = \"{}\" AND name = \"{}\""
+    VCF_QUERY_NAME = "SELECT * FROM core_vcfdataset WHERE owner_id = \"{}\" AND name LIKE \"%{}%\""
+    BAM_QUERY_NAME = "SELECT * FROM core_bamdataset WHERE owner_id = \"{}\" AND name LIKE \"%{}%\""
+    FASTQ_QUERY_NAME = "SELECT * FROM core_fastqdataset WHERE owner_id = \"{}\" AND name LIKE \"%{}%\""
 
 
 def execute_sql(sql):
@@ -147,7 +147,8 @@ def read_matrix_table(sample_name, *, _intervals=None, _filter_intervals=False, 
     owner_id = os.environ["SEQSLAB_USER"]
     res = execute_sql(Query.VCF_QUERY_NAME.format(owner_id, sample_name))
     path = res[0]['uri']
-    path = path[path.index("/"):] + "all.mt"
+    files = hl.utils.hadoop_ls(path[path.index("/"):])
+    path = files[0]['path']
 
     for rg_config in Env.backend().load_references_from_dataset(path):
         hl.ReferenceGenome._from_config(rg_config)
