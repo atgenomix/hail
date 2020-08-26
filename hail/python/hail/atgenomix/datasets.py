@@ -1,51 +1,33 @@
 import os
+import uuid
+import secrets
 import pandas as pd
-import pymysql.cursors
+from .rdb import *
 from pyspark.sql import SQLContext
 from typing import Optional, Dict, Tuple, Any, List
 from hail.utils.java import Env, FatalError, jindexed_seq_args, warning
 from hail.expr.types import hail_type, tarray, tfloat64, tstr, tint32, tstruct, \
     tcall, tbool, tint64, tfloat32
 from hail.matrixtable import MatrixTable
+from hail.table import Table
 from hail.expr.expressions import Expression, StructExpression, \
     expr_struct, expr_any, expr_bool, analyze, Indices, \
     construct_reference, construct_expr, extract_refs_by_indices, \
     ExpressionException, TupleExpression, unify_all
 from hail import ir
-from hail.typecheck import typecheck, typecheck_method, dictof, anytype, \
-    anyfunc, nullable, sequenceof, oneof, numeric, lazy, enumeration
+from hail.typecheck import typecheck, nullable, oneof, dictof, anytype, \
+    sequenceof, enumeration, sized_tupleof, numeric, table_key_type, char
+from hail.genetics.reference_genome import reference_genome_type
+from hail.methods.misc import require_biallelic, require_row_key_variant, require_row_key_variant_w_struct_locus, require_col_key_str
+import hail as hl
 
 
-class Query(object):
-    VCF_QUERY = "SELECT * FROM core_vcfdataset WHERE owner_id = \"{}\""
-    BAM_QUERY = "SELECT * FROM core_bamdataset WHERE owner_id = \"{}\""
-    FASTQ_QUERY = "SELECT * FROM core_fastqdataset WHERE owner_id = \"{}\""
-    VCF_QUERY_NAME = "SELECT * FROM core_vcfdataset WHERE owner_id = \"{}\" AND name LIKE \"%{}%\""
-    BAM_QUERY_NAME = "SELECT * FROM core_bamdataset WHERE owner_id = \"{}\" AND name LIKE \"%{}%\""
-    FASTQ_QUERY_NAME = "SELECT * FROM core_fastqdataset WHERE owner_id = \"{}\" AND name LIKE \"%{}%\""
-
-
-def execute_sql(sql):
-    server = "{}.mysql.database.azure.com".format(os.environ["RDB_SERVER"])
-    user = "{}@{}".format(os.environ["RDB_USER"], os.environ["RDB_SERVER"])
-    passwd = os.environ["RDB_PASSWORD"]
-    database = os.environ["RDB_DATABASE"]
-    port = os.environ["RDB_PORT"]
-    connection = pymysql.connect(
-        host=server,
-        user=user,
-        password=passwd,
-        db=database,
-        port=int(port),
-        charset="utf8mb4",
-        cursorclass=pymysql.cursors.DictCursor
-    )
-    with connection.cursor() as cursor:
-        cursor.execute(sql)
-        output = cursor.fetchall()
-
-    connection.close()
-    return output
+def name_path_generator(filename):
+    now = datetime.now()
+    uid = uuid.uuid4()
+    full_path = "/seqslab/usr/{}/variant/{}/0/".format(os.environ["SEQSLAB_USER"], uid)
+    full_path_name = full_path + filename.rstrip("/")
+    return now, filename, full_path, full_path_name
 
 
 def append_data(data, list_res, type_input):
@@ -101,6 +83,47 @@ def list_datasets(sc, type=None, sample_name=None):
     return output_df.toPandas()
 
 
+@typecheck(sample_name=str,
+           _intervals=nullable(sequenceof(anytype)),
+           _filter_intervals=bool,
+           _drop_cols=bool,
+           _drop_rows=bool)
+def read_matrix_table(sample_name, *, _intervals=None, _filter_intervals=False, _drop_cols=False,
+                      _drop_rows=False) -> MatrixTable:
+    """
+    Customized read_matrix_table function for Atgenomix Users to load directly mt files from Atgenomix platform.
+    """
+    owner_id = os.environ["SEQSLAB_USER"]
+    res = execute_sql(Query.VCF_QUERY_NAME.format(owner_id, sample_name))
+    path = res[0]['uri']
+    files = hl.utils.hadoop_ls(path[path.index("/"):])
+    path = files[0]['path']
+
+    for rg_config in Env.backend().load_references_from_dataset(path):
+        hl.ReferenceGenome._from_config(rg_config)
+
+    return MatrixTable(ir.MatrixRead(ir.MatrixNativeReader(path, _intervals, _filter_intervals),
+                       _drop_cols, _drop_rows))
+
+
+@typecheck(sample_name=oneof(str, sequenceof(str)),
+           force=bool,
+           force_bgz=bool,
+           header_file=nullable(str),
+           min_partitions=nullable(int),
+           drop_samples=bool,
+           call_fields=oneof(str, sequenceof(str)),
+           reference_genome=nullable(reference_genome_type),
+           contig_recoding=nullable(dictof(str, str)),
+           array_elements_required=bool,
+           skip_invalid_loci=bool,
+           entry_float_type=enumeration(tfloat32, tfloat64),
+           filter=nullable(str),
+           find_replace=nullable(sized_tupleof(str, str)),
+           n_partitions=nullable(int),
+           block_size=nullable(int),
+           # json
+           _partitions=nullable(str))
 def import_vcf(sample_name,
                force=False,
                force_bgz=False,
@@ -119,9 +142,8 @@ def import_vcf(sample_name,
                block_size=None,
                _partitions=None) -> MatrixTable:
     """
-    Customized import_vcf function for Atgenomix Users to load directly vcf files from Atgenomix platform.
+        Customized import_vcf function for Atgenomix Users to load directly vcf files from Atgenomix platform.
     """
-
     owner_id = os.environ["SEQSLAB_USER"]
     res = execute_sql(Query.VCF_QUERY_NAME.format(owner_id, sample_name))
     path = res[0]['uri']
@@ -130,58 +152,55 @@ def import_vcf(sample_name,
     if res[0]['reference'] == 38:
         reference_genome = 'GRCh38'
 
-    reader = ir.MatrixVCFReader(path, call_fields, entry_float_type, header_file,
-                                n_partitions, block_size, min_partitions,
-                                reference_genome, contig_recoding, array_elements_required,
-                                skip_invalid_loci, force_bgz, force, filter, find_replace,
-                                _partitions)
-    return MatrixTable(ir.MatrixRead(reader, drop_cols=drop_samples))
+    return hl.import_vcf(path, force, force_bgz, header_file, min_partitions, drop_samples, call_fields,
+                         reference_genome, contig_recoding, array_elements_required, skip_invalid_loci, entry_float_type,
+                         filter, find_replace, n_partitions, block_size, _partitions)
 
 
-def read_matrix_table(sample_name, *, _intervals=None, _filter_intervals=False, _drop_cols=False,
-                      _drop_rows=False) -> MatrixTable:
+@typecheck(dataset=oneof(MatrixTable, Table),
+           filename=str,
+           append_to_header=nullable(str),
+           parallel=nullable(ir.ExportType.checker),
+           metadata=nullable(dictof(str, dictof(str, dictof(str, str)))))
+def export_vcf(dataset, filename, append_to_header=None, parallel=None, metadata=None):
     """
-    Customized read_matrix_table function for Atgenomix Users to load directly mt files from Atgenomix platform.
+        Customized export_vcf function for Atgenomix Users to save directly vcf files to Atgenomix platform.
     """
+    now, name, full_path, full_path_name = name_path_generator(filename)
+    output = full_path_name
+    hail.export_vcf(dataset, output, append_to_header, parallel, metadata)
 
-    owner_id = os.environ["SEQSLAB_USER"]
-    res = execute_sql(Query.VCF_QUERY_NAME.format(owner_id, sample_name))
-    path = res[0]['uri']
-    files = hl.utils.hadoop_ls(path[path.index("/"):])
-    path = files[0]['path']
-
-    for rg_config in Env.backend().load_references_from_dataset(path):
-        hl.ReferenceGenome._from_config(rg_config)
-
-    return MatrixTable(ir.MatrixRead(ir.MatrixNativeReader(path, _intervals, _filter_intervals),
-                       _drop_cols, _drop_rows))
+    # Update to rdb
+    write_dataset_to_rdb(now, name, uri)
 
 
-@typecheck_method(output=str,
-                  overwrite=bool,
-                  stage_locally=bool,
-                  _codec_spec=nullable(str),
-                  _partitions=nullable(expr_any))
-def mt_write(mt,
-             output: str,
+def mt_write(mt: MatrixTable,
+             filename: str,
              overwrite: bool = False,
              stage_locally: bool = False,
              _codec_spec: Optional[str] = None,
              _partitions=None):
+    """
+        Customized export_vcf function for Atgenomix Users to save directly vcf files to Atgenomix platform.
+    """
 
-    path = "/seqslab/usr/{}/notebook/{}".format(os.environ["USER_ID"], output.strip("/"))
-    mt.write(path, overwrite, stage_locally, _codec_spec, _partitions)
+    # Process users desired output files
+    now, name, full_path, full_path_name = name_path_generator(filename)
+    mt.write(full_path_name, overwrite, stage_locally, _codec_spec, _partitions)
+
+    # Update to rdb
+    write_dataset_to_rdb(now, name, full_path)
 
 
-@typecheck_method(output=str,
-                  overwrite=bool,
-                  stage_locally=bool,
-                  _codec_spec=nullable(str))
-def ht_write(ht,
-             output: str,
+def ht_write(ht: Table,
+             filename: str,
              overwrite=False,
              stage_locally: bool = False,
-              _codec_spec: Optional[str] = None):
+             _codec_spec: Optional[str] = None):
 
-    path = "/seqslab/usr/{}/notebook/{}".format(os.environ["USER_ID"], output.strip("/"))
-    ht.write(path, overwrite, stage_locally, _codec_spec)
+    # Process users desired output files
+    now, name, full_path, full_path_name = name_path_generator(filename)
+    ht.write(full_path_name, overwrite, stage_locally, _codec_spec)
+
+    # Update to rdb
+    write_dataset_to_rdb(now, name, full_path)
