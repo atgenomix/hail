@@ -1,5 +1,6 @@
 import os
 import secrets
+import hail as hl
 import pymysql.cursors
 from datetime import datetime
 

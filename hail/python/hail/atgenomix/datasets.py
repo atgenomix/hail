@@ -1,6 +1,7 @@
 import os
 import uuid
 import secrets
+import hail as hl
 import pandas as pd
 from .rdb import *
 from pyspark.sql import SQLContext
@@ -19,7 +20,6 @@ from hail.typecheck import typecheck, nullable, oneof, dictof, anytype, \
     sequenceof, enumeration, sized_tupleof, numeric, table_key_type, char
 from hail.genetics.reference_genome import reference_genome_type
 from hail.methods.misc import require_biallelic, require_row_key_variant, require_row_key_variant_w_struct_locus, require_col_key_str
-import hail as hl
 
 
 def name_path_generator(filename):
@@ -168,7 +168,7 @@ def export_vcf(dataset, filename, append_to_header=None, parallel=None, metadata
     """
     now, name, full_path, full_path_name = name_path_generator(filename)
     output = full_path_name
-    hail.export_vcf(dataset, output, append_to_header, parallel, metadata)
+    hl.export_vcf(dataset, output, append_to_header, parallel, metadata)
 
     # Update to rdb
     write_dataset_to_rdb(now, name, uri)
