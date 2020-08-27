@@ -17,9 +17,9 @@ class Query(object):
     # INSERT
     IN_VCFDS = "INSERT INTO `core_vcfdataset` (`id`, `name`, `uri`, `sid`, `size`, `last_accessed`, `status`, " \
         "`irb_id`, `reference`, `relation`, `owner_id`) VALUES ('{}', '{}', '{}', '', {}, '{}', 0, '{}', {}, 0, '{}');"
-    IN_BASEDSMEM = "INSERT INTO `core_basedatasetmembers` (`id`, created_at) VALUES ('{}', '{}')"
-    IN_VCFDSMEM = "INSERT INTO `core_vcfdatasetmembers` (basedatasetmembers_ptr_id, user_id, vcfdataset_id) VALUES ('{}', '{}', '{}')"
-    IN_OUTPUTVCFDS = "INSERT INTO `core_outputvcfdataset` (job_id, vcf_id) VALUES ('{}', '{}')"
+    IN_BASEDSMEM = "INSERT INTO `core_basedatasetmembers` (`id`, created_at) VALUES ('{}', '{}');"
+    IN_VCFDSMEM = "INSERT INTO `core_vcfdatasetmembers` (basedatasetmembers_ptr_id, user_id, vcfdataset_id) VALUES ('{}', '{}', '{}');"
+    IN_OUTPUTVCFDS = "INSERT INTO `core_outputvcfdataset` (job_id, vcf_id) VALUES ('{}', '{}');"
 
 
 def get_connection():
@@ -64,9 +64,8 @@ def get_size(path):
 
 def write_dataset_to_rdb(now, name, uri, irb_id="", reference="38"):
     """
-        :param name: output name e.g. output_sample1.mt
-                     By default, it will store to /seqslab/usr/uid/notebook/test_usage/output_sample1.mt
-        :param uri: path to save targeted files e.g. /test_usage
+        :param name: output name e.g. "example.mt"
+        :param uri: path to save targeted files e.g. uri/example.mt
     """
     vcf_uid = secrets.token_hex(16)
     basedatasetmember_uid = secrets.token_hex(16)
@@ -86,18 +85,15 @@ def write_dataset_to_rdb(now, name, uri, irb_id="", reference="38"):
     connection = get_connection()
     with connection.cursor() as cursor:
         cursor.execute(Query.IN_BASEDSMEM.format(basedatasetmember_uid, last_accessed))
-
     connection.commit()
 
     # Generate Record to core_vcfdatasetmembers
     with connection.cursor() as cursor:
         cursor.execute(Query.IN_VCFDSMEM.format(basedatasetmember_uid, owner_id, vcf_uid))
-
     connection.commit()
 
     # Generate Record to core_outputvcfdataset
     with connection.cursor() as cursor:
         cursor.execute(Query.IN_OUTPUTVCFDS.format(os.environ["JOBID"], vcf_uid))
-
     connection.commit()
     connection.close()

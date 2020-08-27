@@ -29,6 +29,12 @@ jobs:
           echo "::set-env name=NOW::$(date +'%m%d%H%M')"
           echo $NOW
 
+      - name: Az Login and Pull
+          run: |
+            az login --service-principal --username ${{ secrets.AZ_APP_CLIENT_ID }} --password ${{ secrets.AZ_APP_CLIENT_KEY }} --tenant ${{ secrets.AZ_APP_TENANT }}
+            az acr login --name atgenomix
+            docker pull ${RC_NAME}:cache
+
       - name: Build image
         run: |
           docker build --cache-from ${RC_NAME}:cache -t ${RC_NAME} /home/runner/work/hail/hail/runtime/1.2_annotation
@@ -36,10 +42,8 @@ jobs:
           docker tag ${RC_NAME} ${RC_NAME}:cache
           docker tag ${RC_NAME} ${RC_NAME}:latest
 
-      - name: Az Login and Push
+      - name: Push cache
         run: |
-          az login --service-principal --username ${{ secrets.AZ_APP_CLIENT_ID }} --password ${{ secrets.AZ_APP_CLIENT_KEY }} --tenant ${{ secrets.AZ_APP_TENANT }}
-          az acr login --name atgenomix
           docker push ${RC_NAME}:cache
           docker push ${RC_NAME}:latest
           docker push ${RC_NAME}:$NOW
