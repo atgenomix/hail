@@ -30,10 +30,10 @@ jobs:
           echo $NOW
 
       - name: Az Login and Pull
-          run: |
-            az login --service-principal --username ${{ secrets.AZ_APP_CLIENT_ID }} --password ${{ secrets.AZ_APP_CLIENT_KEY }} --tenant ${{ secrets.AZ_APP_TENANT }}
-            az acr login --name atgenomix
-            docker pull ${RC_NAME}:cache
+        run: |
+          az login --service-principal --username ${{ secrets.AZ_APP_CLIENT_ID }} --password ${{ secrets.AZ_APP_CLIENT_KEY }} --tenant ${{ secrets.AZ_APP_TENANT }}
+          az acr login --name atgenomix
+          docker pull ${RC_NAME}:cache
 
       - name: Build image
         run: |
