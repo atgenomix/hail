@@ -20,6 +20,7 @@ from hail.typecheck import typecheck, nullable, oneof, dictof, anytype, \
     sequenceof, enumeration, sized_tupleof, numeric, table_key_type, char
 from hail.genetics.reference_genome import reference_genome_type
 from hail.methods.misc import require_biallelic, require_row_key_variant, require_row_key_variant_w_struct_locus, require_col_key_str
+from hail.utils.java import warning
 
 
 def name_path_generator(filename):
@@ -44,7 +45,6 @@ def list_datasets(sc, type=None, sample_name=None):
     """
     list all datasets in Atgenomix Platforms
     """
-
     owner_id = os.environ["SEQSLAB_USER"]
     data = []
     if sample_name is None:
@@ -95,15 +95,19 @@ def read_matrix_table(sample_name, *, _intervals=None, _filter_intervals=False, 
     """
     owner_id = os.environ["SEQSLAB_USER"]
     res = execute_sql(Query.VCF_QUERY_NAME.format(owner_id, sample_name))
-    path = res[0]['uri']
-    files = hl.utils.hadoop_ls(path[path.index("/"):])
-    path = files[0]['path']
+    if len(res) > 1:
+        warning("Found more than 1 dataset. Please specify clearly your name of dataset.")
+        return None
+    else:
+        path = res[0]['uri']
+        files = hl.utils.hadoop_ls(path[path.index("/"):])
+        path = files[0]['path']
 
-    for rg_config in Env.backend().load_references_from_dataset(path):
-        hl.ReferenceGenome._from_config(rg_config)
+        for rg_config in Env.backend().load_references_from_dataset(path):
+            hl.ReferenceGenome._from_config(rg_config)
 
-    return MatrixTable(ir.MatrixRead(ir.MatrixNativeReader(path, _intervals, _filter_intervals),
-                       _drop_cols, _drop_rows))
+        return MatrixTable(ir.MatrixRead(ir.MatrixNativeReader(path, _intervals, _filter_intervals),
+            _drop_cols, _drop_rows))
 
 
 @typecheck(sample_name=oneof(str, sequenceof(str)),
@@ -146,15 +150,19 @@ def import_vcf(sample_name,
     """
     owner_id = os.environ["SEQSLAB_USER"]
     res = execute_sql(Query.VCF_QUERY_NAME.format(owner_id, sample_name))
-    path = res[0]['uri']
-    path = path[path.index("/"):] + "*.vcf.gz"
+    if len(res) > 1:
+        warning("Found more than 1 dataset. Please specify clearly your name of dataset.")
+        return None
+    else:
+        path = res[0]['uri']
+        path = path[path.index("/"):] + "*.vcf.gz"
 
-    if res[0]['reference'] == 38:
-        reference_genome = 'GRCh38'
+        if res[0]['reference'] == 38:
+            reference_genome = 'GRCh38'
 
-    return hl.import_vcf(path, force, force_bgz, header_file, min_partitions, drop_samples, call_fields,
-                         reference_genome, contig_recoding, array_elements_required, skip_invalid_loci, entry_float_type,
-                         filter, find_replace, n_partitions, block_size, _partitions)
+        return hl.import_vcf(path, force, force_bgz, header_file, min_partitions, drop_samples, call_fields,
+                             reference_genome, contig_recoding, array_elements_required, skip_invalid_loci, entry_float_type,
+                             filter, find_replace, n_partitions, block_size, _partitions)
 
 
 @typecheck(dataset=oneof(MatrixTable, Table),
@@ -174,12 +182,12 @@ def export_vcf(dataset, filename, append_to_header=None, parallel=None, metadata
     write_dataset_to_rdb(now, name, uri)
 
 
-def mt_write(mt: MatrixTable,
-             filename: str,
-             overwrite: bool = False,
-             stage_locally: bool = False,
-             _codec_spec: Optional[str] = None,
-             _partitions=None):
+def write_matrix_table(mt: MatrixTable,
+                       filename: str,
+                       overwrite: bool = False,
+                       stage_locally: bool = False,
+                       _codec_spec: Optional[str] = None,
+                       _partitions=None):
     """
         Customized export_vcf function for Atgenomix Users to save directly vcf files to Atgenomix platform.
     """
@@ -192,11 +200,11 @@ def mt_write(mt: MatrixTable,
     write_dataset_to_rdb(now, name, full_path)
 
 
-def ht_write(ht: Table,
-             filename: str,
-             overwrite=False,
-             stage_locally: bool = False,
-             _codec_spec: Optional[str] = None):
+def write_hail_table(ht: Table,
+                     filename: str,
+                     overwrite=False,
+                     stage_locally: bool = False,
+                     _codec_spec: Optional[str] = None):
 
     # Process users desired output files
     now, name, full_path, full_path_name = name_path_generator(filename)

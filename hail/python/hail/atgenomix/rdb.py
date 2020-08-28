@@ -10,9 +10,9 @@ class Query(object):
     VCF_QUERY = "SELECT * FROM core_vcfdataset WHERE owner_id = \"{}\""
     BAM_QUERY = "SELECT * FROM core_bamdataset WHERE owner_id = \"{}\""
     FASTQ_QUERY = "SELECT * FROM core_fastqdataset WHERE owner_id = \"{}\""
-    VCF_QUERY_NAME = "SELECT * FROM core_vcfdataset WHERE owner_id = \"{}\" AND name LIKE \"%{}%\""
-    BAM_QUERY_NAME = "SELECT * FROM core_bamdataset WHERE owner_id = \"{}\" AND name LIKE \"%{}%\""
-    FASTQ_QUERY_NAME = "SELECT * FROM core_fastqdataset WHERE owner_id = \"{}\" AND name LIKE \"%{}%\""
+    VCF_QUERY_NAME = "SELECT * FROM core_vcfdataset WHERE owner_id = \"{}\" AND name LIKE \"{}.%\""
+    BAM_QUERY_NAME = "SELECT * FROM core_bamdataset WHERE owner_id = \"{}\" AND name LIKE \"{}.%\""
+    FASTQ_QUERY_NAME = "SELECT * FROM core_fastqdataset WHERE owner_id = \"{}\" AND name LIKE \"{}.%\""
 
     # INSERT
     IN_VCFDS = "INSERT INTO `core_vcfdataset` (`id`, `name`, `uri`, `sid`, `size`, `last_accessed`, `status`, " \
