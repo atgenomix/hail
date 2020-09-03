@@ -143,6 +143,7 @@ def import_vcf(sample_name,
 
 @typecheck(dataset=oneof(MatrixTable, Table),
            filename=str,
+           partition_num=int,
            append_to_header=nullable(str),
            parallel=nullable(ir.ExportType.checker),
            metadata=nullable(dictof(str, dictof(str, dictof(str, str)))))
@@ -236,6 +237,7 @@ def read_matrix_table(sample_name, *, _intervals=None, _filter_intervals=False, 
         return None
     else:
         path = res[0]['uri'].rstrip("/")
+        path = path[path.index("/"):]
         for rg_config in Env.backend().load_references_from_dataset(path):
             hl.ReferenceGenome._from_config(rg_config)
 
@@ -280,6 +282,7 @@ def read_table(sample_name, *, _intervals=None, _filter_intervals=False) -> Tabl
         return None
     else:
         path = res[0]['uri'].rstrip("/")
+        path = path[path.index("/"):]
         for rg_config in Env.backend().load_references_from_dataset(path):
             hl.ReferenceGenome._from_config(rg_config)
 
