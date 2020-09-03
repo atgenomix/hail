@@ -1,12 +1,15 @@
 import os
+import sys
 import uuid
 import secrets
+import subprocess
 import hail as hl
 import pandas as pd
 from .rdb import *
+from datetime import datetime
 from pyspark.sql import SQLContext
 from typing import Optional, Dict, Tuple, Any, List
-from hail.utils.java import Env, FatalError, jindexed_seq_args, warning
+from hail.utils.java import Env, FatalError, jindexed_seq_args, warning, error
 from hail.expr.types import hail_type, tarray, tfloat64, tstr, tint32, tstruct, \
     tcall, tbool, tint64, tfloat32
 from hail.matrixtable import MatrixTable
@@ -76,38 +79,10 @@ def list_datasets(sc, type=None, sample_name=None):
             else:
                 raise NameError("type does not exist")
 
-    sqlContext = SQLContext(sc)
     pd.set_option("max_colwidth", 1000)
     pd.set_option('display.max_columns', None)
-    output_df = sqlContext.createDataFrame(data, ['Type', 'Name', 'Last_Accessed'])
+    output_df = SQLContext(sc).createDataFrame(data, ['Type', 'Name', 'Last_Accessed'])
     return output_df.toPandas()
-
-
-@typecheck(sample_name=str,
-           _intervals=nullable(sequenceof(anytype)),
-           _filter_intervals=bool,
-           _drop_cols=bool,
-           _drop_rows=bool)
-def read_matrix_table(sample_name, *, _intervals=None, _filter_intervals=False, _drop_cols=False,
-                      _drop_rows=False) -> MatrixTable:
-    """
-    Customized read_matrix_table function for Atgenomix Users to load directly mt files from Atgenomix platform.
-    """
-    owner_id = os.environ["SEQSLAB_USER"]
-    res = execute_sql(Query.VCF_QUERY_NAME.format(owner_id, sample_name))
-    if len(res) > 1:
-        warning("Found more than 1 dataset. Please specify clearly your name of dataset.")
-        return None
-    else:
-        path = res[0]['uri']
-        files = hl.utils.hadoop_ls(path[path.index("/"):])
-        path = files[0]['path']
-
-        for rg_config in Env.backend().load_references_from_dataset(path):
-            hl.ReferenceGenome._from_config(rg_config)
-
-        return MatrixTable(ir.MatrixRead(ir.MatrixNativeReader(path, _intervals, _filter_intervals),
-            _drop_cols, _drop_rows))
 
 
 @typecheck(sample_name=oneof(str, sequenceof(str)),
@@ -146,17 +121,19 @@ def import_vcf(sample_name,
                block_size=None,
                _partitions=None) -> MatrixTable:
     """
-        Customized import_vcf function for Atgenomix Users to load directly vcf files from Atgenomix platform.
+        Customized import_vcf function for Atgenomix Users to load directly .vcf.gz files from Atgenomix platform.
     """
     owner_id = os.environ["SEQSLAB_USER"]
     res = execute_sql(Query.VCF_QUERY_NAME.format(owner_id, sample_name))
     if len(res) > 1:
-        warning("Found more than 1 dataset. Please specify clearly your name of dataset.")
+        error("Found more than 1 dataset. Please specify clearly your name of dataset.")
+        return None
+    elif len(res) == 0:
+        error("Not Found this file in dataset. Please use exact name in dataset.")
         return None
     else:
         path = res[0]['uri']
         path = path[path.index("/"):] + "*.vcf.gz"
-
         if res[0]['reference'] == 38:
             reference_genome = 'GRCh38'
 
@@ -170,16 +147,54 @@ def import_vcf(sample_name,
            append_to_header=nullable(str),
            parallel=nullable(ir.ExportType.checker),
            metadata=nullable(dictof(str, dictof(str, dictof(str, str)))))
-def export_vcf(dataset, filename, append_to_header=None, parallel=None, metadata=None):
+def export_vcf(dataset, filename, partition_num=23, append_to_header=None, parallel='header_per_shard', metadata=None):
     """
         Customized export_vcf function for Atgenomix Users to save directly vcf files to Atgenomix platform.
     """
+    # Generate name and path and make sure file extension as .vcf.bgz
+    if filename.endswith(".bgz") and not filename.endswith(".vcf.bgz"):
+        filename = filename.replace(".bgz", ".vcf.bgz")
+    elif filename.endswith(".gz"):
+        if filename.endswith(".vcf.gz"):
+            filename = filename.replace(".gz", ".bgz")
+        else:
+            filename = filename.replace(".gz", ".vcf.bgz")
+    elif filename.endswith(".vcf"):
+        filename = filename + ".bgz"
+    else:
+        filename = filename + ".vcf.bgz"
+
     now, name, full_path, full_path_name = name_path_generator(filename)
-    output = full_path_name
-    hl.export_vcf(dataset, output, append_to_header, parallel, metadata)
+    full_path_name = full_path.replace("0/", filename)
+
+    # Repartition and save as .bgz
+    dataset_repartition = dataset.repartition(partition_num)
+    hl.export_vcf(dataset_repartition, full_path_name, append_to_header, parallel, metadata)
+
+    # Rename .vcf.bgz to .vcf.gz
+    rename_folder = ["hadoop", "fs", "-mv", full_path_name, full_path.rstrip("/")]
+    pid = subprocess.Popen(
+        rename_folder,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd="/usr/local/hadoop/bin",
+    )
+    pid.communicate()
+    files = hl.utils.hadoop_ls(full_path)
+    for file in files:
+        if ".bgz" in file["path"]:
+            rename_files = ["hadoop", "fs", "-mv", file["path"], file["path"].replace(".bgz", ".vcf.gz")]
+            pid = subprocess.Popen(
+                rename_files,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd="/usr/local/hadoop/bin",
+            )
+            pid.communicate()
 
     # Update to rdb
-    write_dataset_to_rdb(now, name, uri)
+    size = get_size(full_path)
+    write_dataset_to_rdb(now, name_gz, full_path, size)
 
 
 def write_matrix_table(mt: MatrixTable,
@@ -189,15 +204,48 @@ def write_matrix_table(mt: MatrixTable,
                        _codec_spec: Optional[str] = None,
                        _partitions=None):
     """
-        Customized export_vcf function for Atgenomix Users to save directly vcf files to Atgenomix platform.
+        Customized write_matrix_table function for Atgenomix Users to save directly mt files to Atgenomix platform.
     """
+    # Check file extension is .mt or not?
+    if filename.endswith(".mt"):
+        # Process users desired output files
+        now, name, full_path, full_path_name = name_path_generator(filename)
+        mt.write(full_path_name, overwrite, stage_locally, _codec_spec, _partitions)
 
-    # Process users desired output files
-    now, name, full_path, full_path_name = name_path_generator(filename)
-    mt.write(full_path_name, overwrite, stage_locally, _codec_spec, _partitions)
+        # Update to rdb
+        write_dataset_to_rdb(now, name, full_path)
+    else:
+        error("Please use a filename with .mt at the end.")
 
-    # Update to rdb
-    write_dataset_to_rdb(now, name, full_path)
+
+@typecheck(sample_name=str,
+           _intervals=nullable(sequenceof(anytype)),
+           _filter_intervals=bool,
+           _drop_cols=bool,
+           _drop_rows=bool)
+def read_matrix_table(sample_name, *, _intervals=None, _filter_intervals=False, _drop_cols=False,
+                      _drop_rows=False) -> MatrixTable:
+    """
+    Customized read_matrix_table function for Atgenomix Users to load directly mt files from Atgenomix platform.
+    """
+    owner_id = os.environ["SEQSLAB_USER"]
+    res = execute_sql(Query.VCF_QUERY_NAME.format(owner_id, sample_name))
+    if len(res) > 1:
+        error("Found more than 1 dataset. Please specify clearly your name of dataset.")
+        return None
+    elif len(res) == 0:
+        error("Not Found this file in dataset. Please use exact name in dataset.")
+        return None
+    else:
+        path = res[0]['uri']
+        files = hl.utils.hadoop_ls(path[path.index("/"):])
+        path = files[0]['path']
+
+        for rg_config in Env.backend().load_references_from_dataset(path):
+            hl.ReferenceGenome._from_config(rg_config)
+
+        return MatrixTable(ir.MatrixRead(ir.MatrixNativeReader(path, _intervals, _filter_intervals),
+            _drop_cols, _drop_rows))
 
 
 def write_hail_table(ht: Table,
@@ -205,10 +253,16 @@ def write_hail_table(ht: Table,
                      overwrite=False,
                      stage_locally: bool = False,
                      _codec_spec: Optional[str] = None):
+    """
+        Customized write_hail_table function for Atgenomix Users to save directly ht files to Atgenomix platform.
+    """
+    # Check file extension is .ht or not?
+    if filename.endswith(".ht"):
+        # Process users desired output files
+        now, name, full_path, full_path_name = name_path_generator(filename)
+        ht.write(full_path_name, overwrite, stage_locally, _codec_spec)
 
-    # Process users desired output files
-    now, name, full_path, full_path_name = name_path_generator(filename)
-    ht.write(full_path_name, overwrite, stage_locally, _codec_spec)
-
-    # Update to rdb
-    write_dataset_to_rdb(now, name, full_path)
+        # Update to rdb
+        write_dataset_to_rdb(now, name, full_path)
+    else:
+        error("Please use a filename with .ht at the end.")

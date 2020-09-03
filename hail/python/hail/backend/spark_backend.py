@@ -142,9 +142,7 @@ class SparkBackend(Py4JBackend):
                  local, log, quiet, append, min_block_size,
                  branching_factor, tmpdir, local_tmpdir, skip_logging_configuration, optimizer_iterations):
         if pkg_resources.resource_exists(__name__, "hail-all-spark.jar"):
-            sys.stderr.write(__name__)
             hail_jar_path = pkg_resources.resource_filename(__name__, "hail-all-spark.jar")
-            sys.stderr.write(hail_jar_path)
             assert os.path.exists(hail_jar_path), f'{hail_jar_path} does not exist'
             conf = pyspark.SparkConf()
 

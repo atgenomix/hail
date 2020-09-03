@@ -62,7 +62,7 @@ def get_size(path):
     return size
 
 
-def write_dataset_to_rdb(now, name, uri, irb_id="", reference="38"):
+def write_dataset_to_rdb(now, name, uri, irb_id="", reference="38", size=None):
     """
         :param name: output name e.g. "example.mt"
         :param uri: path to save targeted files e.g. uri/example.mt
@@ -71,7 +71,8 @@ def write_dataset_to_rdb(now, name, uri, irb_id="", reference="38"):
     basedatasetmember_uid = secrets.token_hex(16)
 
     # Generate Record to core_vcfdataset Table
-    size = get_size("{}/{}".format(uri, name))
+    if size is None:
+        size = get_size("{}/{}".format(uri, name))
     last_accessed = now.strftime("%Y-%m-%d %H:%M:%S.%f")
     owner_id = os.environ["SEQSLAB_USER"]
     input_uri = "{}{}".format(os.environ["FILESYSTEM"], uri)
