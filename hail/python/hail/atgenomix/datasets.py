@@ -26,12 +26,11 @@ from hail.methods.misc import require_biallelic, require_row_key_variant, requir
 from hail.utils.java import warning
 
 
-def name_path_generator(filename):
+def name_path_generator():
     now = datetime.now()
     uid = uuid.uuid4()
     full_path = "/seqslab/usr/{}/variant/{}/0/".format(os.environ["SEQSLAB_USER"], uid)
-    full_path_name = full_path + filename.rstrip("/")
-    return now, filename, full_path, full_path_name
+    return now, full_path
 
 
 def append_data(data, list_res, type_input):
@@ -164,15 +163,15 @@ def export_vcf(dataset, filename, partition_num=23, append_to_header=None, paral
     else:
         filename = filename + ".vcf.bgz"
 
-    now, name, full_path, full_path_name = name_path_generator(filename)
-    full_path_name = full_path.replace("0/", filename)
+    now, full_path = name_path_generator()
+    full_path_bgz = full_path.replace("0/", filename)
 
     # Repartition and save as .bgz
     dataset_repartition = dataset.repartition(partition_num)
-    hl.export_vcf(dataset_repartition, full_path_name, append_to_header, parallel, metadata)
+    hl.export_vcf(dataset_repartition, full_path_bgz, append_to_header, parallel, metadata)
 
     # Rename .vcf.bgz to .vcf.gz
-    rename_folder = ["hadoop", "fs", "-mv", full_path_name, full_path.rstrip("/")]
+    rename_folder = ["hadoop", "fs", "-mv", full_path_bgz, full_path.rstrip("/")]
     pid = subprocess.Popen(
         rename_folder,
         stdout=subprocess.PIPE,
@@ -180,7 +179,7 @@ def export_vcf(dataset, filename, partition_num=23, append_to_header=None, paral
         cwd="/usr/local/hadoop/bin",
     )
     pid.communicate()
-    files = hl.utils.hadoop_ls(full_path)
+    files = hl.utils.hadoop_ls(full_path.rstrip("/"))
     for file in files:
         if ".bgz" in file["path"]:
             rename_files = ["hadoop", "fs", "-mv", file["path"], file["path"].replace(".bgz", ".vcf.gz")]
@@ -193,8 +192,7 @@ def export_vcf(dataset, filename, partition_num=23, append_to_header=None, paral
             pid.communicate()
 
     # Update to rdb
-    size = get_size(full_path)
-    write_dataset_to_rdb(now, name_gz, full_path, size)
+    write_dataset_to_rdb(now, filename.replace(".bgz", ".gz"), full_path)
 
 
 def write_matrix_table(mt: MatrixTable,
@@ -209,11 +207,11 @@ def write_matrix_table(mt: MatrixTable,
     # Check file extension is .mt or not?
     if filename.endswith(".mt"):
         # Process users desired output files
-        now, name, full_path, full_path_name = name_path_generator(filename)
-        mt.write(full_path_name, overwrite, stage_locally, _codec_spec, _partitions)
+        now, full_path = name_path_generator()
+        mt.write(full_path.rstrip("/"), overwrite, stage_locally, _codec_spec, _partitions)
 
         # Update to rdb
-        write_dataset_to_rdb(now, name, full_path)
+        write_dataset_to_rdb(now, filename, full_path)
     else:
         error("Please use a filename with .mt at the end.")
 
@@ -237,10 +235,7 @@ def read_matrix_table(sample_name, *, _intervals=None, _filter_intervals=False, 
         error("Not Found this file in dataset. Please use exact name in dataset.")
         return None
     else:
-        path = res[0]['uri']
-        files = hl.utils.hadoop_ls(path[path.index("/"):])
-        path = files[0]['path']
-
+        path = res[0]['uri'].rstrip("/")
         for rg_config in Env.backend().load_references_from_dataset(path):
             hl.ReferenceGenome._from_config(rg_config)
 
@@ -259,10 +254,34 @@ def write_hail_table(ht: Table,
     # Check file extension is .ht or not?
     if filename.endswith(".ht"):
         # Process users desired output files
-        now, name, full_path, full_path_name = name_path_generator(filename)
-        ht.write(full_path_name, overwrite, stage_locally, _codec_spec)
+        now, full_path = name_path_generator()
+        ht.write(full_path.rstrip("/"), overwrite, stage_locally, _codec_spec)
 
         # Update to rdb
-        write_dataset_to_rdb(now, name, full_path)
+        write_dataset_to_rdb(now, filename, full_path)
     else:
         error("Please use a filename with .ht at the end.")
+
+
+@typecheck(path=str,
+           _intervals=nullable(sequenceof(anytype)),
+           _filter_intervals=bool)
+def read_table(sample_name, *, _intervals=None, _filter_intervals=False) -> Table:
+    """
+    Customized read_table function for Atgenomix Users to load directly ht files from Atgenomix platform.
+    """
+    owner_id = os.environ["SEQSLAB_USER"]
+    res = execute_sql(Query.VCF_QUERY_NAME.format(owner_id, sample_name))
+    if len(res) > 1:
+        error("Found more than 1 dataset. Please specify clearly your name of dataset.")
+        return None
+    elif len(res) == 0:
+        error("Not Found this file in dataset. Please use exact name in dataset.")
+        return None
+    else:
+        path = res[0]['uri'].rstrip("/")
+        for rg_config in Env.backend().load_references_from_dataset(path):
+            hl.ReferenceGenome._from_config(rg_config)
+
+        tr = ir.TableNativeReader(path, _intervals, _filter_intervals)
+        return Table(ir.TableRead(tr, False))

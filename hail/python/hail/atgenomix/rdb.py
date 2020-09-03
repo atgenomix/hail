@@ -71,8 +71,7 @@ def write_dataset_to_rdb(now, name, uri, irb_id="", reference="38", size=None):
     basedatasetmember_uid = secrets.token_hex(16)
 
     # Generate Record to core_vcfdataset Table
-    if size is None:
-        size = get_size("{}/{}".format(uri, name))
+    size = get_size(uri)
     last_accessed = now.strftime("%Y-%m-%d %H:%M:%S.%f")
     owner_id = os.environ["SEQSLAB_USER"]
     input_uri = "{}{}".format(os.environ["FILESYSTEM"], uri)

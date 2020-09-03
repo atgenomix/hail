@@ -33,17 +33,15 @@ jobs:
         run: |
           az login --service-principal --username ${{ secrets.AZ_APP_CLIENT_ID }} --password ${{ secrets.AZ_APP_CLIENT_KEY }} --tenant ${{ secrets.AZ_APP_TENANT }}
           az acr login --name atgenomix
-          docker pull ${RC_NAME}:cache
+          docker pull ${RC_NAME}:latest
 
       - name: Build image
         run: |
-          docker build --cache-from ${RC_NAME}:cache -t ${RC_NAME} /home/runner/work/hail/hail/runtime/1.2_annotation
+          docker build --cache-from ${RC_NAME}:latest -t ${RC_NAME} /home/runner/work/hail/hail/runtime/1.2_annotation
           docker tag ${RC_NAME} ${RC_NAME}:$NOW
-          docker tag ${RC_NAME} ${RC_NAME}:cache
           docker tag ${RC_NAME} ${RC_NAME}:latest
 
-      - name: Push cache
+      - name: Push image
         run: |
-          docker push ${RC_NAME}:cache
           docker push ${RC_NAME}:latest
           docker push ${RC_NAME}:$NOW
