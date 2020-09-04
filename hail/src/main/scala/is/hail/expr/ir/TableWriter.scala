@@ -122,8 +122,7 @@ case class TableNativeWriter(
 
     val nRows = partitionCounts.sum
     info(s"wrote table with $nRows ${ plural(nRows, "row") } " +
-      s"in ${ partitionCounts.length } ${ plural(partitionCounts.length, "partition") } " +
-      s"to $path")
+      s"in ${ partitionCounts.length } ${ plural(partitionCounts.length, "partition") } ")
   }
 }
 
@@ -260,8 +259,7 @@ class TableSpecHelper(path: String, rowRelPath: String, globalRelPath: String, r
 
     val nRows = partCounts.sum
     if (log) info(s"wrote table with $nRows ${ plural(nRows, "row") } " +
-      s"in ${ partCounts.length } ${ plural(partCounts.length, "partition") } " +
-      s"to $path")
+      s"in ${ partCounts.length } ${ plural(partCounts.length, "partition") } ")
   }
 }
 

@@ -104,7 +104,7 @@ def list_datasets(sc, type=None, sample_name=None):
            _partitions=nullable(str))
 def import_vcf(sample_name,
                force=False,
-               force_bgz=False,
+               force_bgz=True,
                header_file=None,
                min_partitions=None,
                drop_samples=False,

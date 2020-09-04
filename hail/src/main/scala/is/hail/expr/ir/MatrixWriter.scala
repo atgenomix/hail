@@ -269,8 +269,7 @@ class MatrixSpecHelper(path: String, rowRelPath: String, globalRelPath: String, 
     val nRows = partCounts.sum
     info(s"wrote matrix table with $nRows ${ plural(nRows, "row") } " +
       s"and ${ nCols } ${ plural(nCols, "column") } " +
-      s"in ${ partCounts.length } ${ plural(partCounts.length, "partition") } " +
-      s"to $path")
+      s"in ${ partCounts.length } ${ plural(partCounts.length, "partition") } ")
   }
 }
 

@@ -188,8 +188,7 @@ case class MatrixValue(
     val printer: String=>Unit = if (consoleInfo) info else log.info
     printer(s"wrote matrix table with $nRows ${ plural(nRows, "row") } " +
       s"and $nCols ${ plural(nCols, "column") } " +
-      s"in ${ partitionCounts.length } ${ plural(partitionCounts.length, "partition") } " +
-      s"to $path")
+      s"in ${ partitionCounts.length } ${ plural(partitionCounts.length, "partition") } ")
   }
 
   def write(ctx: ExecuteContext,
