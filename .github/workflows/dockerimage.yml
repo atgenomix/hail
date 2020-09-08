@@ -16,14 +16,6 @@ jobs:
         with:
           path: hail
 
-      - name: Checkout runtime code
-        uses: actions/checkout@v2
-        with:
-          ref: annotation
-          repository: AnomeGAP/Seqslab_Runtime
-          token: ${{ secrets.PAT_SEQSLAB_RUNTIME }}
-          path: runtime
-
       - name: Set current date as env variable
         run: |
           echo "::set-env name=NOW::$(date +'%m%d%H%M')"
@@ -33,15 +25,14 @@ jobs:
         run: |
           az login --service-principal --username ${{ secrets.AZ_APP_CLIENT_ID }} --password ${{ secrets.AZ_APP_CLIENT_KEY }} --tenant ${{ secrets.AZ_APP_TENANT }}
           az acr login --name atgenomix
-          docker pull ${RC_NAME}:latest
 
       - name: Build image
         run: |
-          docker build --cache-from ${RC_NAME}:latest -t ${RC_NAME} /home/runner/work/hail/hail/runtime/1.2_annotation
+          docker build --no-cache -t ${RC_NAME} atgenomix
           docker tag ${RC_NAME} ${RC_NAME}:$NOW
           docker tag ${RC_NAME} ${RC_NAME}:latest
 
       - name: Push image
         run: |
-          docker push ${RC_NAME}:latest
           docker push ${RC_NAME}:$NOW
+          docker push ${RC_NAME}:latest

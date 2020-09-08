@@ -22,7 +22,8 @@ repositories {
     mavenCentral()
     jcenter()
     maven { url "https://repository.cloudera.com/artifactory/cloudera-repos/" }
-    maven { url "https://repo.hortonworks.com/content/repositories/releases/" }
+    maven { url "https://nexus-private.hortonworks.com/nexus/repository/maven-central/" }
+    maven { url "https://nexus-private.hortonworks.com/nexus/service/rest/repository/browse/maven-central/" }
     maven { url "https://repo.spring.io/plugins-release/" }
 }
 
