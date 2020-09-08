@@ -145,8 +145,8 @@ def decide_vcf_post_fix(input_path):
     path = input_path[input_path.index("/"):]
     files = hl.utils.hadoop_ls(path.rstrip("/"))
     for file in files:
-        if not file["path"].endsWith("_SUCCESS"):
-            if file["path"].endsWith(".bgz"):
+        if not file["path"].endswith("_SUCCESS"):
+            if file["path"].endswith(".bgz"):
                 return "*.bgz"
             else:
                 return "*.vcf.gz"
