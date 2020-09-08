@@ -1132,7 +1132,7 @@ object LoadVCF {
 
     statuses.foreach { status =>
       val file = status.getPath
-      if (!(file.endsWith(".vcf") || file.endsWith(".vcf.bgz") || file.endsWith(".vcf.gz") || file.endsWith(".bgz"))
+      if (!(file.endsWith(".vcf") || file.endsWith(".vcf.bgz") || file.endsWith(".vcf.gz") || file.endsWith(".bgz")))
         warn(s"expected input file '$file' to end in .vcf[.bgz, .gz]")
       if (file.endsWith(".gz"))
         checkGzippedFile(fs, file, forceGZ, gzAsBGZ)
