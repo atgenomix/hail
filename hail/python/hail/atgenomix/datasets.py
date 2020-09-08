@@ -132,13 +132,24 @@ def import_vcf(sample_name,
         return None
     else:
         path = res[0]['uri']
-        path = path[path.index("/"):] + "*.vcf.gz"
+        path = path[path.index("/"):] + decide_vcf_post_fix(path)
         if res[0]['reference'] == 38:
             reference_genome = 'GRCh38'
 
         return hl.import_vcf(path, force, force_bgz, header_file, min_partitions, drop_samples, call_fields,
                              reference_genome, contig_recoding, array_elements_required, skip_invalid_loci, entry_float_type,
                              filter, find_replace, n_partitions, block_size, _partitions)
+
+
+def decide_vcf_post_fix(input_path):
+    path = input_path[input_path.index("/"):]
+    files = hl.utils.hadoop_ls(path.rstrip("/"))
+    for file in files:
+        if not file["path"].endsWith("_SUCCESS"):
+            if file["path"].endsWith(".bgz"):
+                return "*.bgz"
+            else:
+                return "*.vcf.gz"
 
 
 @typecheck(dataset=oneof(MatrixTable, Table),
@@ -180,20 +191,31 @@ def export_vcf(dataset, filename, partition_num=23, append_to_header=None, paral
         cwd="/usr/local/hadoop/bin",
     )
     pid.communicate()
-    files = hl.utils.hadoop_ls(full_path.rstrip("/"))
-    for file in files:
-        if ".bgz" in file["path"]:
-            rename_files = ["hadoop", "fs", "-mv", file["path"], file["path"].replace(".bgz", ".vcf.gz")]
-            pid = subprocess.Popen(
-                rename_files,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd="/usr/local/hadoop/bin",
-            )
-            pid.communicate()
+
+    # Rename all .bgz files under full_path
+    # files = hl.utils.hadoop_ls(full_path.rstrip("/"))
+    # for file in files:
+    #     if ".bgz" in file["path"]:
+    #         rename_files = ["hadoop", "fs", "-mv", file["path"], file["path"].replace(".bgz", ".vcf.gz")]
+    #         pid = subprocess.Popen(
+    #             rename_files,
+    #             stdout=subprocess.PIPE,
+    #             stderr=subprocess.PIPE,
+    #             cwd="/usr/local/hadoop/bin",
+    #         )
+    #         pid.communicate()
+
+    # Decide reference_genome
+    struct_info = str(dataset_repartition.row)
+    if "GRCh38" in struct_info:
+        reference_genome = 38
+    elif "GRCh37" in struct_info:
+        reference_genome = 19
+    else:
+        reference_genome = 99
 
     # Update to rdb
-    write_dataset_to_rdb(now, filename.replace(".bgz", ".gz"), full_path)
+    write_dataset_to_rdb(now, filename.replace(".bgz", ".gz"), full_path, "", reference_genome)
 
 
 def write_matrix_table(mt: MatrixTable,

@@ -62,7 +62,7 @@ def get_size(path):
     return size
 
 
-def write_dataset_to_rdb(now, name, uri, irb_id="", reference="38", size=None):
+def write_dataset_to_rdb(now, name, uri, irb_id="", reference="38"):
     """
         :param name: output name e.g. "example.mt"
         :param uri: path to save targeted files e.g. uri/example.mt
