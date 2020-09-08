@@ -36,7 +36,7 @@ jobs:
 
       - name: Build image
         run: |
-          docker build --no-cache -t ${RC_NAME} /home/runner/work/hail/hail/runtime/1.2_annotation
+          docker build --no-cache -t ${RC_NAME} /home/runner/work/hail/hail/runtime/1.2_hail_annotation
           docker tag ${RC_NAME} ${RC_NAME}:$NOW
           docker tag ${RC_NAME} ${RC_NAME}:cache
           docker tag ${RC_NAME} ${RC_NAME}:latest
