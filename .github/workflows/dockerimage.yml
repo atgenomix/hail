@@ -11,11 +11,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout hail code
-        uses: actions/checkout@v2
-        with:
-          path: hail
-
+      - uses: actions/checkout@master
       - name: Set current date as env variable
         run: |
           echo "::set-env name=NOW::$(date +'%m%d%H%M')"
