@@ -132,7 +132,7 @@ def import_vcf(sample_name,
         return None
     else:
         path = res[0]['uri']
-        path = path[path.index("/"):] + ".vcf.gz"
+        path = path[path.index("/"):] + "*.vcf.gz"
         if res[0]['reference'] == 38:
             reference_genome = 'GRCh38'
 
