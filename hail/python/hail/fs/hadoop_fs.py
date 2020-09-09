@@ -23,6 +23,9 @@ class HadoopFS(FS):
         else:
             return io.TextIOWrapper(handle, encoding='iso-8859-1')
 
+    def delete(self, src: str, recur: bool):
+        self._jfs.delete(src, recur)
+
     def copy(self, src: str, dest: str):
         self._jfs.copy(src, dest, False)
 

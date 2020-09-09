@@ -21,6 +21,9 @@ class Query(object):
     IN_VCFDSMEM = "INSERT INTO `core_vcfdatasetmembers` (basedatasetmembers_ptr_id, user_id, vcfdataset_id) VALUES ('{}', '{}', '{}');"
     IN_OUTPUTVCFDS = "INSERT INTO `core_outputvcfdataset` (job_id, vcf_id) VALUES ('{}', '{}');"
 
+    # UPDATE
+    VCF_UPDATE_ID = "UPDATE `core_vcfdataset` SET `last_accessed` = CURRENT_TIMESTAMP WHERE `id` = '{}'"
+
 
 def get_connection():
     server = "{}.mysql.database.azure.com".format(os.environ["RDB_SERVER"])
@@ -95,5 +98,13 @@ def write_dataset_to_rdb(now, name, uri, irb_id="", reference="38"):
     # Generate Record to core_outputvcfdataset
     with connection.cursor() as cursor:
         cursor.execute(Query.IN_OUTPUTVCFDS.format(os.environ["JOBID"], vcf_uid))
+    connection.commit()
+    connection.close()
+
+
+def update_last_accessed(vcf_uid):
+    connection = get_connection()
+    with connection.cursor() as cursor:
+        cursor.execute(Query.VCF_UPDATE_ID.format(vcf_uid))
     connection.commit()
     connection.close()

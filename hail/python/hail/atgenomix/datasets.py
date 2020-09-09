@@ -43,7 +43,7 @@ def append_data(data, list_res, type_input):
     return data
 
 
-def list_datasets(sc, type=None, sample_name=None):
+def list_datasets(type=None, sample_name=None):
     """
     list all datasets in Atgenomix Platforms
     """
@@ -132,24 +132,16 @@ def import_vcf(sample_name,
         return None
     else:
         path = res[0]['uri']
-        path = path[path.index("/"):] + decide_vcf_post_fix(path)
+        path = path[path.index("/"):] + ".vcf.gz"
         if res[0]['reference'] == 38:
             reference_genome = 'GRCh38'
+
+        # Update last accessed
+        update_last_accessed(res['id'])
 
         return hl.import_vcf(path, force, force_bgz, header_file, min_partitions, drop_samples, call_fields,
                              reference_genome, contig_recoding, array_elements_required, skip_invalid_loci, entry_float_type,
                              filter, find_replace, n_partitions, block_size, _partitions)
-
-
-def decide_vcf_post_fix(input_path):
-    path = input_path[input_path.index("/"):]
-    files = hl.utils.hadoop_ls(path.rstrip("/"))
-    for file in files:
-        if not file["path"].endswith("_SUCCESS"):
-            if file["path"].endswith(".bgz"):
-                return "*.bgz"
-            else:
-                return "*.vcf.gz"
 
 
 @typecheck(dataset=oneof(MatrixTable, Table),
@@ -193,17 +185,20 @@ def export_vcf(dataset, filename, partition_num=23, append_to_header=None, paral
     pid.communicate()
 
     # Rename all .bgz files under full_path
-    # files = hl.utils.hadoop_ls(full_path.rstrip("/"))
-    # for file in files:
-    #     if ".bgz" in file["path"]:
-    #         rename_files = ["hadoop", "fs", "-mv", file["path"], file["path"].replace(".bgz", ".vcf.gz")]
-    #         pid = subprocess.Popen(
-    #             rename_files,
-    #             stdout=subprocess.PIPE,
-    #             stderr=subprocess.PIPE,
-    #             cwd="/usr/local/hadoop/bin",
-    #         )
-    #         pid.communicate()
+    files = hl.utils.hadoop_ls(full_path.rstrip("/"))
+    for file in files:
+        del file['is_dir']
+
+    files_df = spark.read.json(Env.backend().parallelize(files))
+
+    def rename(row):
+        path = row.path
+        if not ("_SUCCESS" in path):
+            hl.utils.hadoop_copy(path, path.replace(".bgz", ".vcf.gz"))
+            hl.utils.hadoop_delete(path, True)
+        return "rename succeed!"
+
+    files_df.rdd.map(rename).collect()
 
     # Decide reference_genome
     struct_info = str(dataset_repartition.row)
@@ -263,6 +258,9 @@ def read_matrix_table(sample_name, *, _intervals=None, _filter_intervals=False, 
         for rg_config in Env.backend().load_references_from_dataset(path):
             hl.ReferenceGenome._from_config(rg_config)
 
+        # Update last accessed
+        update_last_accessed(res['id'])
+
         return MatrixTable(ir.MatrixRead(ir.MatrixNativeReader(path, _intervals, _filter_intervals),
             _drop_cols, _drop_rows))
 
@@ -307,6 +305,9 @@ def read_table(sample_name, *, _intervals=None, _filter_intervals=False) -> Tabl
         path = path[path.index("/"):]
         for rg_config in Env.backend().load_references_from_dataset(path):
             hl.ReferenceGenome._from_config(rg_config)
+
+        # Update last accessed
+        update_last_accessed(res['id'])
 
         tr = ir.TableNativeReader(path, _intervals, _filter_intervals)
         return Table(ir.TableRead(tr, False))

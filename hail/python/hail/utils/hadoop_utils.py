@@ -243,3 +243,10 @@ def copy_log(path: str) -> None:
     path: :obj:`str`
     """
     Env.fs().copy_log(path)
+
+
+def hadoop_delete(path: str):
+    """Attempt to delete a file through hadoop-API
+
+    """
+    Env.fs().delete(path, True)
