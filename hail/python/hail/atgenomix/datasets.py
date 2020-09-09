@@ -137,7 +137,7 @@ def import_vcf(sample_name,
             reference_genome = 'GRCh38'
 
         # Update last accessed
-        update_last_accessed(res['id'])
+        update_last_accessed(res[0]['id'])
 
         return hl.import_vcf(path, force, force_bgz, header_file, min_partitions, drop_samples, call_fields,
                              reference_genome, contig_recoding, array_elements_required, skip_invalid_loci, entry_float_type,
@@ -259,7 +259,7 @@ def read_matrix_table(sample_name, *, _intervals=None, _filter_intervals=False, 
             hl.ReferenceGenome._from_config(rg_config)
 
         # Update last accessed
-        update_last_accessed(res['id'])
+        update_last_accessed(res[0]['id'])
 
         return MatrixTable(ir.MatrixRead(ir.MatrixNativeReader(path, _intervals, _filter_intervals),
             _drop_cols, _drop_rows))
@@ -307,7 +307,7 @@ def read_table(sample_name, *, _intervals=None, _filter_intervals=False) -> Tabl
             hl.ReferenceGenome._from_config(rg_config)
 
         # Update last accessed
-        update_last_accessed(res['id'])
+        update_last_accessed(res[0]['id'])
 
         tr = ir.TableNativeReader(path, _intervals, _filter_intervals)
         return Table(ir.TableRead(tr, False))
