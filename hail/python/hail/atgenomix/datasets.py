@@ -189,7 +189,8 @@ def export_vcf(dataset, filename, partition_num=23, append_to_header=None, paral
     for file in files:
         del file['is_dir']
 
-    files_df = spark.read.json(Env.backend().parallelize(files))
+    backend = Env.backend()
+    files_df = backend._spark_session.read.json(backend.sc.parallelize(files))
 
     def rename(row):
         path = row.path
