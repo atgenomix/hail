@@ -172,6 +172,20 @@ def export_vcf(dataset, filename, partition_num=23, append_to_header=None, paral
 
     # Repartition and save as .bgz
     dataset_repartition = dataset.repartition(partition_num)
+
+    # Decide reference_genome
+    struct_info = str(dataset_repartition.row)
+    if "GRCh38" in struct_info:
+        reference_genome = 38
+    elif "GRCh37" in struct_info:
+        reference_genome = 19
+    else:
+        reference_genome = 99
+
+    # Update to rdb
+    write_dataset_to_rdb(now, filename.replace(".bgz", ".gz"), full_path, "", reference_genome)
+
+    # Export to dataset
     hl.export_vcf(dataset_repartition, full_path_bgz, append_to_header, parallel, metadata)
 
     # Rename .vcf.bgz to .vcf.gz
@@ -201,19 +215,6 @@ def export_vcf(dataset, filename, partition_num=23, append_to_header=None, paral
 
     files_df.rdd.map(rename).collect()
 
-    # Decide reference_genome
-    struct_info = str(dataset_repartition.row)
-    if "GRCh38" in struct_info:
-        reference_genome = 38
-    elif "GRCh37" in struct_info:
-        reference_genome = 19
-    else:
-        reference_genome = 99
-
-    # Update to rdb
-    write_dataset_to_rdb(now, filename.replace(".bgz", ".gz"), full_path, "", reference_genome)
-
-
 def write_matrix_table(mt: MatrixTable,
                        filename: str,
                        overwrite: bool = False,
@@ -227,10 +228,12 @@ def write_matrix_table(mt: MatrixTable,
     if filename.endswith(".mt"):
         # Process users desired output files
         now, full_path = name_path_generator()
-        mt.write(full_path.rstrip("/"), overwrite, stage_locally, _codec_spec, _partitions)
 
         # Update to rdb
         write_dataset_to_rdb(now, filename, full_path)
+
+        # Write Matrix Table
+        mt.write(full_path.rstrip("/"), overwrite, stage_locally, _codec_spec, _partitions)
     else:
         error("Please use a filename with .mt at the end.")
 
@@ -278,10 +281,12 @@ def write_hail_table(ht: Table,
     if filename.endswith(".ht"):
         # Process users desired output files
         now, full_path = name_path_generator()
-        ht.write(full_path.rstrip("/"), overwrite, stage_locally, _codec_spec)
 
         # Update to rdb
         write_dataset_to_rdb(now, filename, full_path)
+
+        # Write Hail Table
+        ht.write(full_path.rstrip("/"), overwrite, stage_locally, _codec_spec)
     else:
         error("Please use a filename with .ht at the end.")
 
