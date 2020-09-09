@@ -196,7 +196,7 @@ def export_vcf(dataset, filename, partition_num=23, append_to_header=None, paral
         path = row.path
         if not ("_SUCCESS" in path):
             hl.utils.hadoop_copy(path, path.replace(".bgz", ".vcf.gz"))
-            hl.utils.hadoop_delete(path, True)
+            hl.utils.hadoop_delete(path)
         return "rename succeed!"
 
     files_df.rdd.map(rename).collect()
