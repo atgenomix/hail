@@ -22,7 +22,8 @@ class Query(object):
     IN_OUTPUTVCFDS = "INSERT INTO `core_outputvcfdataset` (job_id, vcf_id) VALUES ('{}', '{}');"
 
     # UPDATE
-    VCF_UPDATE_ID = "UPDATE `core_vcfdataset` SET `last_accessed` = CURRENT_TIMESTAMP WHERE `id` = '{}'"
+    VCF_UPDATE_LAST_ACCESSED = "UPDATE `core_vcfdataset` SET `last_accessed` = CURRENT_TIMESTAMP WHERE `id` = '{}'"
+    VCF_UPDATE_SIZE = "UPDATE `core_vcfdataset` SET `size` = {} WHERE `id` = '{}'"
 
 
 def get_connection():
@@ -74,7 +75,7 @@ def write_dataset_to_rdb(now, name, uri, irb_id="", reference="38"):
     basedatasetmember_uid = secrets.token_hex(16)
 
     # Generate Record to core_vcfdataset Table
-    size = get_size(uri)
+    size = 0
     last_accessed = now.strftime("%Y-%m-%d %H:%M:%S.%f")
     owner_id = os.environ["SEQSLAB_USER"]
     input_uri = "{}{}".format(os.environ["FILESYSTEM"], uri)
@@ -100,11 +101,21 @@ def write_dataset_to_rdb(now, name, uri, irb_id="", reference="38"):
         cursor.execute(Query.IN_OUTPUTVCFDS.format(os.environ["JOBID"], vcf_uid))
     connection.commit()
     connection.close()
+    return vcf_uid
 
 
 def update_last_accessed(vcf_uid):
     connection = get_connection()
     with connection.cursor() as cursor:
-        cursor.execute(Query.VCF_UPDATE_ID.format(vcf_uid))
+        cursor.execute(Query.VCF_UPDATE_LAST_ACCESSED.format(vcf_uid))
+    connection.commit()
+    connection.close()
+
+
+def update_size(vcf_uid, uri):
+    size = get_size(uri)
+    connection = get_connection()
+    with connection.cursor() as cursor:
+        cursor.execute(Query.VCF_UPDATE_SIZE.format(size, vcf_uid))
     connection.commit()
     connection.close()

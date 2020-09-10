@@ -182,8 +182,8 @@ def export_vcf(dataset, filename, partition_num=23, append_to_header=None, paral
     else:
         reference_genome = 99
 
-    # Update to rdb
-    write_dataset_to_rdb(now, filename.replace(".bgz", ".gz"), full_path, "", reference_genome)
+    # Create to rdb
+    vcf_uid = write_dataset_to_rdb(now, filename.replace(".bgz", ".gz"), full_path, "", reference_genome)
 
     # Export to dataset
     hl.export_vcf(dataset_repartition, full_path_bgz, append_to_header, parallel, metadata)
@@ -214,6 +214,9 @@ def export_vcf(dataset, filename, partition_num=23, append_to_header=None, paral
         return "rename succeed!"
 
     files_df.rdd.map(rename).collect()
+    
+    # Update Size to RDB
+    update_size(vcf_uid, full_path)
 
 def write_matrix_table(mt: MatrixTable,
                        filename: str,
@@ -229,11 +232,14 @@ def write_matrix_table(mt: MatrixTable,
         # Process users desired output files
         now, full_path = name_path_generator()
 
-        # Update to rdb
-        write_dataset_to_rdb(now, filename, full_path)
+        # Create to rdb
+        vcf_uid = write_dataset_to_rdb(now, filename, full_path)
 
         # Write Matrix Table
         mt.write(full_path.rstrip("/"), overwrite, stage_locally, _codec_spec, _partitions)
+
+        # Update Size to RDB
+        update_size(vcf_uid, full_path)
     else:
         error("Please use a filename with .mt at the end.")
 
@@ -282,11 +288,14 @@ def write_hail_table(ht: Table,
         # Process users desired output files
         now, full_path = name_path_generator()
 
-        # Update to rdb
-        write_dataset_to_rdb(now, filename, full_path)
+        # Create to rdb
+        vcf_uid = write_dataset_to_rdb(now, filename, full_path)
 
         # Write Hail Table
         ht.write(full_path.rstrip("/"), overwrite, stage_locally, _codec_spec)
+
+        # Update Size to RDB
+        update_size(vcf_uid, full_path)
     else:
         error("Please use a filename with .ht at the end.")
 
