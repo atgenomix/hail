@@ -361,6 +361,7 @@ def publish_track(name, matrix_table):
         stderr=subprocess.PIPE,
         cwd="/tmp",
     )
+    pid0_log = pid0.communicate()
 
     # Create .tbi for the specific vcf file
     cmd_create_tbi = [
@@ -375,6 +376,7 @@ def publish_track(name, matrix_table):
         stderr=subprocess.PIPE,
         cwd="/usr/local/bin",
     )
+    pid1_log = pid1.communicate()
 
     default_fs = Env.backend().sc._jsc.hadoopConfiguration().get("fs.defaultFS")
     directory_path = "{}/seqslab/custom_db/{}".format(default_fs, reference_genome)
@@ -387,12 +389,14 @@ def publish_track(name, matrix_table):
         "-p",
         directory_path
     ]
-    pid2 = subprocess.Popen(
+    pid2_1 = subprocess.Popen(
         cmd_hadoop_mkdir,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd="/usr/local/hadoop/bin/",
     )
+    pid2_1_log = pid2_1.communicate()
+
     # hadoop put .vcf.gz and .vcf.gz.tbi under /seqslab/custom_db
     cmd_put_file2hadoop = [
         "hadoop",
@@ -402,12 +406,13 @@ def publish_track(name, matrix_table):
         filename_tbi,
         directory_path
     ]
-    pid2 = subprocess.Popen(
+    pid2_2 = subprocess.Popen(
         cmd_put_file2hadoop,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd="/usr/local/hadoop/bin/",
     )
+    pid2_2_log = pid2_2.communicate()
 
     # Remove files locally
     cmd_remove_files = [
