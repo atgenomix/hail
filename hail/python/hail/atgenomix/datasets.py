@@ -132,7 +132,7 @@ def import_vcf(sample_name,
         return None
     else:
         path = res[0]['uri']
-        path = path[path.index("/"):] + "*.vcf.gz"
+        path = path[path.index("/"):] + ("*.vcf.gz" if path[path.index("/"):].endswith("/") else + "/*.vcf.gz")
         if res[0]['reference'] == 38:
             reference_genome = 'GRCh38'
 
@@ -218,6 +218,7 @@ def export_vcf(dataset, filename, partition_num=23, append_to_header=None, paral
     # Update Size to RDB
     update_size(vcf_uid, full_path)
 
+
 def write_matrix_table(mt: MatrixTable,
                        filename: str,
                        overwrite: bool = False,
@@ -275,7 +276,7 @@ def read_matrix_table(sample_name, *, _intervals=None, _filter_intervals=False, 
             _drop_cols, _drop_rows))
 
 
-def write_hail_table(ht: Table,
+def write_table(ht: Table,
                      filename: str,
                      overwrite=False,
                      stage_locally: bool = False,
@@ -326,3 +327,97 @@ def read_table(sample_name, *, _intervals=None, _filter_intervals=False) -> Tabl
 
         tr = ir.TableNativeReader(path, _intervals, _filter_intervals)
         return Table(ir.TableRead(tr, False))
+
+
+def publish_track(name, matrix_table):
+    """
+    Publish a matrix_table (vcf) to /seqslab/custom_db/reference_genome
+    """
+    # Decide reference_genome
+    struct_info = str(matrix_table.row)
+    if "GRCh38" in struct_info:
+        reference_genome = str(38)
+    elif "GRCh37" in struct_info:
+        reference_genome = str(19)
+    else:
+        reference_genome = str(99)
+
+    # Export matrix_table locally
+    filename_bgz = "/tmp/{}.vcf.bgz".format(name)
+    filename_gz = "/tmp/{}.vcf.gz".format(name)
+    filename_tbi = "/tmp/{}.vcf.gz.tbi".format(name)
+    path = "file://{}".format(filename_bgz)
+    hl.export_vcf(matrix_table, path)
+
+    # Rename bgz to gz
+    cmd_rename_vcf_bgz2gz = [
+        "mv",
+        filename_bgz,
+        filename_gz
+    ]
+    pid0 = subprocess.Popen(
+        cmd_rename_vcf_bgz2gz,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd="/tmp",
+    )
+
+    # Create .tbi for the specific vcf file
+    cmd_create_tbi = [
+        "tabix",
+        "-p",
+        "vcf",
+        filename_gz
+    ]
+    pid1 = subprocess.Popen(
+        cmd_create_tbi,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd="/usr/local/bin",
+    )
+
+    default_fs = Env.backend().sc._jsc.hadoopConfiguration().get("fs.defaultFS")
+    directory_path = "{}/seqslab/custom_db/{}".format(default_fs, reference_genome)
+
+    # mkdir recursively for directory_path
+    cmd_hadoop_mkdir = [
+        "hadoop",
+        "fs",
+        "-mkdir",
+        "-p",
+        directory_path
+    ]
+    pid2 = subprocess.Popen(
+        cmd_hadoop_mkdir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd="/usr/local/hadoop/bin/",
+    )
+    # hadoop put .vcf.gz and .vcf.gz.tbi under /seqslab/custom_db
+    cmd_put_file2hadoop = [
+        "hadoop",
+        "fs",
+        "-put",
+        filename_gz,
+        filename_tbi,
+        directory_path
+    ]
+    pid2 = subprocess.Popen(
+        cmd_put_file2hadoop,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd="/usr/local/hadoop/bin/",
+    )
+
+    # Remove files locally
+    cmd_remove_files = [
+        "rm",
+        filename_gz,
+        filename_tbi
+    ]
+    pid3 = subprocess.Popen(
+        cmd_remove_files,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd="/tmp",
+    )
