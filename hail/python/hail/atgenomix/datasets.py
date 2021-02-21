@@ -207,7 +207,7 @@ def export_vcf(dataset, filename, partition_num=23, append_to_header=None, paral
     files_df = backend._spark_session.read.json(backend.sc.parallelize(files))
 
     def rename(row):
-        path = row.path
+        path = eval(row._corrupt_record)['path']
         if not ("_SUCCESS" in path):
             hl.utils.hadoop_copy(path, path.replace(".bgz", ".vcf.gz"))
             hl.utils.hadoop_delete(path)
